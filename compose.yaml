@@ -1,0 +1,64 @@
+# sonora — container stack.
+#
+#   podman compose up -d --build      # build + start on http://127.0.0.1:8130
+#   podman compose logs -f            # follow logs
+#   podman compose down               # stop (data stays in ./data)
+#
+# The port is the same 8130 the dev server uses, so every URL, bookmark and
+# tunnel config that works against `npm start` works unchanged against this.
+
+services:
+  sonora:
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: localhost/sonora:latest
+    container_name: sonora
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Inside the container the server must listen on all interfaces, not the
+      # loopback default, or the published port has nothing behind it.
+      HOST: 0.0.0.0
+      PORT: "8130"
+      # The bgutil PO-token provider runs as its own container on the host
+      # (port 4416). 127.0.0.1 inside a container is the container itself.
+      SONORA_POT_PROVIDER: http://host.containers.internal:4416
+      # yt-dlp 2026.x solves YouTube's JS challenges with a runtime. Config
+      # auto-detects a deno install under $HOME, which does not exist in this
+      # image, so point it at the node binary that is already here.
+      SONORA_JS_RUNTIME: node:/usr/local/bin/node
+    ports:
+      # Same address and port as dev: loopback only, fronted by the tunnel.
+      # Set SONORA_BIND=0.0.0.0 in .env to expose it on the LAN instead.
+      - "${SONORA_BIND:-127.0.0.1}:8130:8130"
+    volumes:
+      # One directory holds the SQLite db, the materialised cookies.txt and the
+      # audio cache — the same layout as a plain `npm start`, so the container
+      # and the dev server can share it (not simultaneously).
+      - ./data:/app/data
+    extra_hosts:
+      # Needed on older podman releases; harmless where the alias already exists.
+      - "host.containers.internal:host-gateway"
+    dns:
+      # Rootless podman's own forwarder (aardvark-dns) can take seconds to answer
+      # every external name, while a real resolver answers in ~1 ms. Node
+      # resolves per connection, so that cost lands on every thumbnail and on
+      # every yt-dlp lookup. Point the container at a resolver that actually
+      # answers; the public defaults work anywhere. Override in .env if your LAN
+      # gateway is faster, which it usually is:
+      #   SONORA_DNS_1=192.168.1.1
+      #   SONORA_DNS_2=1.1.1.1
+      - "${SONORA_DNS_1:-1.1.1.1}"
+      - "${SONORA_DNS_2:-8.8.8.8}"
+    healthcheck:
+      test: ["CMD", "node", "scripts/healthcheck.js"]
+      interval: 30s
+      timeout: 5s
+      start_period: 25s
+      retries: 3
+    logging:
+      driver: journald
+      options:
+        tag: sonora

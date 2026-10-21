@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 320" width="1280" height="320" role="img" aria-label="sonora — your own music, your own algorithm">
+  <title>sonora — your own music, your own algorithm</title>
+  <desc>A warm charcoal banner with the coral sonora app mark, the wordmark, and a waveform.</desc>
+
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#111215"/>
+      <stop offset="0.55" stop-color="#15130f"/>
+      <stop offset="1" stop-color="#1d1613"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.16" cy="0.46" r="0.42">
+      <stop offset="0" stop-color="#ff997b" stop-opacity="0.20"/>
+      <stop offset="0.6" stop-color="#ff997b" stop-opacity="0.05"/>
+      <stop offset="1" stop-color="#ff997b" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="bar" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#ff997b" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#ff997b" stop-opacity="0.55"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1280" height="320" rx="28" fill="url(#bg)"/>
+  <rect width="1280" height="320" rx="28" fill="url(#glow)"/>
+  <rect x="0.5" y="0.5" width="1279" height="319" rx="27.5" fill="none" stroke="#ffffff" stroke-opacity="0.06"/>
+
+  <!-- decorative waveform, right edge -->
+  <g transform="translate(940 160)" fill="url(#bar)">
+    <rect x="0"    y="-46" width="12" height="92"  rx="6"/>
+    <rect x="30"   y="-78" width="12" height="156" rx="6"/>
+    <rect x="60"   y="-30" width="12" height="60"  rx="6"/>
+    <rect x="90"   y="-102" width="12" height="204" rx="6"/>
+    <rect x="120"  y="-62" width="12" height="124" rx="6"/>
+    <rect x="150"  y="-124" width="12" height="248" rx="6"/>
+    <rect x="180"  y="-20" width="12" height="40"  rx="6"/>
+    <rect x="210"  y="-84" width="12" height="168" rx="6"/>
+    <rect x="240"  y="-50" width="12" height="100" rx="6"/>
+  </g>
+
+  <!-- app mark -->
+  <g>
+    <rect x="80" y="106" width="108" height="108" rx="26" fill="#ff997b"/>
+    <g transform="translate(134 160) scale(2.15) translate(-12 -12)"
+       fill="none" stroke="#241914" stroke-width="2" stroke-linecap="round">
+      <path d="M2 9v6m4-10v14m4-16v18m4-14v10m4-13v16m4-11v6"/>
+    </g>
+  </g>
+
+  <!-- wordmark -->
+  <g font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif">
+    <text x="216" y="170" font-size="92" font-weight="700" letter-spacing="-3.5" fill="#f7f3f0">sonora</text>
+    <text x="220" y="211" font-size="25" font-weight="500" letter-spacing="0.2" fill="#b9b2ab">Your own music, your own algorithm.</text>
+    <text x="220" y="248" font-size="18.5" font-weight="500" letter-spacing="0.6" fill="#ff997b" opacity="0.9">Self-hosted YouTube music · radio · likes · playlists · Listen Together</text>
+  </g>
+</svg>

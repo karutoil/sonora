@@ -1,0 +1,337 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   sonora — notifications (the bell, its panel, and the count badge)
+
+   Loaded after app.css so it can read the tokens but never restyle the app:
+   every selector here is namespaced `.notif-*`, and the only element it touches
+   that it does not own is the app's `.notification-dot`, whose position and
+   colour stay exactly as app.css declares them.
+
+   Shape: a popover anchored under the bell on desktop (a corner notification
+   list belongs under the bell, not over the page), and a bottom sheet on a
+   phone (the same reach-for-the-thumb gesture as the now-playing sheet). Only
+   transform and opacity animate, and everything collapses under
+   prefers-reduced-motion.
+
+   CONTENTS
+   01 bell badge      02 panel shell     03 head & actions
+   04 alerts row      05 list & items    06 empty / skeleton / error
+   07 motion & reduced motion
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── 01 bell badge ──────────────────────────────────────────────────────────
+   The dot stays the app's 6px hook; the count is a pill in the same corner that
+   sits on top of it (same 2px --bg ring, so it reads as the dot grown up). A
+   6px dot cannot say "12", and moving it would break the shell's CSS contract. */
+.notif-badge{
+  position:absolute;
+  top:4px;
+  right:3px;
+  min-width:16px;
+  height:16px;
+  padding:0 4px;
+  border-radius:var(--r-pill);
+  background:var(--accent);
+  color:var(--accent-ink);
+  font-size:10px;
+  font-weight:800;
+  line-height:16px;
+  letter-spacing:-.02em;
+  text-align:center;
+  box-shadow:0 0 0 2px var(--bg);
+  pointer-events:none;
+  animation:notif-badge-in var(--dur-2) var(--ease-spring) both
+}
+.notif-badge[hidden]{display:none}
+
+/* ── 02 panel shell ─────────────────────────────────────────────────────── */
+.notif-panel{
+  position:fixed;
+  top:64px;
+  right:16px;
+  z-index:var(--z-menu);
+  display:flex;
+  flex-direction:column;
+  width:min(360px,calc(100vw - 24px));
+  max-height:min(70vh,540px);
+  border-radius:var(--r-md);
+  border:1px solid var(--line-2);
+  background:rgba(32,33,39,.985);
+  color:var(--white);
+  box-shadow:var(--shadow-3),inset 0 1px rgba(255,255,255,.07);
+  overflow:hidden;
+  transform-origin:top right;
+  animation:notif-pop-in var(--dur-2) var(--ease-out) both
+}
+.notif-panel[hidden]{display:none}
+/* The dialog container is focused so a screen reader announces it and Escape
+   reaches it; a 2px accent ring around a whole sheet reads as an error state,
+   so the container stays quiet and the controls inside carry the rings. */
+.notif-panel:focus,
+.notif-panel:focus-visible{outline:none}
+
+.notif-backdrop{
+  position:fixed;
+  inset:0;
+  z-index:var(--z-overlay);
+  background:rgba(7,7,10,.72);
+  animation:notif-fade-in var(--dur-2) var(--ease-out) both
+}
+.notif-backdrop[hidden]{display:none}
+
+/* ── 03 head & actions ──────────────────────────────────────────────────── */
+.notif-head{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  padding:6px 6px 6px 14px;
+  border-bottom:1px solid var(--line);
+  background:linear-gradient(180deg,rgba(255,255,255,.03),transparent)
+}
+.notif-heading{
+  flex:1 1 auto;
+  min-width:0;
+  margin:0;
+  font-size:14px;
+  font-weight:750;
+  letter-spacing:-.02em;
+  color:var(--white)
+}
+.notif-head-actions{display:flex;align-items:center;gap:2px;flex:0 0 auto}
+
+.notif-icon-btn{
+  display:grid;
+  place-items:center;
+  width:36px;
+  height:36px;
+  border-radius:var(--r-xs);
+  color:var(--muted);
+  transition:background var(--dur-1) var(--ease-out),color var(--dur-1) var(--ease-out),transform var(--dur-1) var(--ease-out)
+}
+.notif-icon-btn svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.notif-icon-btn:hover{background:rgba(255,255,255,.07);color:var(--white)}
+.notif-icon-btn:active{transform:scale(.94)}
+.notif-icon-btn:disabled{opacity:.4;cursor:not-allowed}
+
+.notif-text-btn{
+  height:36px;
+  padding:0 10px;
+  border-radius:var(--r-xs);
+  color:var(--accent-2);
+  font-size:12px;
+  font-weight:700;
+  transition:background var(--dur-1) var(--ease-out),color var(--dur-1) var(--ease-out)
+}
+.notif-text-btn:hover{background:var(--accent-soft);color:var(--accent)}
+.notif-text-btn:disabled{color:var(--soft);opacity:.5;cursor:not-allowed;background:none}
+
+/* ── 04 alerts row ──────────────────────────────────────────────────────── */
+.notif-alerts{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  padding:10px 14px;
+  border-bottom:1px solid var(--line);
+  background:var(--accent-soft)
+}
+.notif-alerts-copy{
+  min-width:0;
+  font-size:11.5px;
+  line-height:1.45;
+  color:var(--text-2)
+}
+.notif-enable{
+  flex:0 0 auto;
+  min-height:32px;
+  padding:0 12px;
+  border-radius:var(--r-pill);
+  border:1px solid var(--accent-line);
+  background:var(--accent-soft);
+  color:var(--accent);
+  font-size:12px;
+  font-weight:750;
+  transition:background var(--dur-1) var(--ease-out),transform var(--dur-1) var(--ease-out)
+}
+.notif-enable:hover{background:rgba(255,153,123,.22)}
+.notif-enable:active{transform:scale(.97)}
+
+.notif-note{
+  margin:0;
+  padding:10px 14px;
+  border-bottom:1px solid var(--line);
+  font-size:11.5px;
+  line-height:1.45;
+  color:var(--muted)
+}
+
+/* ── 05 list & items ────────────────────────────────────────────────────── */
+.notif-body{min-height:0;display:flex;flex-direction:column}
+
+.notif-list{
+  flex:1 1 auto;
+  min-height:0;
+  margin:0;
+  padding:6px;
+  list-style:none;
+  overflow-y:auto;
+  overscroll-behavior:contain;
+  -webkit-overflow-scrolling:touch
+}
+.notif-row{margin:0}
+
+.notif-item{
+  display:grid;
+  grid-template-columns:44px minmax(0,1fr);
+  gap:10px;
+  align-items:center;
+  width:100%;
+  min-height:56px;
+  padding:8px;
+  border-radius:var(--r-sm);
+  color:inherit;
+  text-align:left;
+  transition:background var(--dur-1) var(--ease-out),transform var(--dur-1) var(--ease-out)
+}
+.notif-item:hover{background:rgba(255,255,255,.06)}
+.notif-item:active{transform:scale(.995)}
+.notif-item:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+/* Unread reads as a warm tint, not a badge everywhere: one accent per row is
+   enough, and the dot in the meta line says which rows are new. */
+.notif-item.is-unread{background:var(--accent-soft)}
+.notif-item.is-unread:hover{background:rgba(255,153,123,.19)}
+
+.notif-thumb{
+  display:grid;
+  place-items:center;
+  width:44px;
+  height:44px;
+  border-radius:var(--r-xs);
+  background:var(--card-2);
+  overflow:hidden;
+  box-shadow:inset 0 0 0 1px var(--inset)
+}
+.notif-thumb-img{width:100%;height:100%;object-fit:cover;display:block}
+.notif-thumb-glyph{width:18px;height:18px;fill:none;stroke:var(--soft);stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+
+.notif-copy{display:flex;flex-direction:column;gap:2px;min-width:0}
+.notif-item-title{
+  font-size:13px;
+  font-weight:650;
+  line-height:1.35;
+  color:var(--white);
+  overflow:hidden;
+  display:-webkit-box;
+  -webkit-box-orient:vertical;
+  -webkit-line-clamp:2
+}
+.notif-item-body{
+  font-size:12px;
+  line-height:1.4;
+  color:var(--text-2);
+  overflow:hidden;
+  display:-webkit-box;
+  -webkit-box-orient:vertical;
+  -webkit-line-clamp:1
+}
+.notif-item-meta{
+  display:flex;
+  align-items:center;
+  gap:5px;
+  margin-top:1px;
+  font-size:11px;
+  font-weight:600;
+  color:var(--soft);
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis
+}
+.notif-item-dot{flex:0 0 auto;width:6px;height:6px;border-radius:50%;background:var(--accent)}
+
+/* ── 06 empty / skeleton / error ────────────────────────────────────────── */
+.notif-empty{
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  gap:6px;
+  padding:30px 22px 34px;
+  text-align:center
+}
+.notif-empty-glyph{width:26px;height:26px;margin-bottom:2px;fill:none;stroke:var(--soft);stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+.notif-empty-title{margin:0;font-size:13.5px;font-weight:700;color:var(--text-2)}
+.notif-empty-text{margin:0;max-width:30ch;font-size:12px;line-height:1.5;color:var(--soft)}
+
+.notif-skel{display:flex;flex-direction:column;gap:8px;padding:10px 8px}
+.notif-skel-row{
+  display:block;
+  height:52px;
+  border-radius:var(--r-sm);
+  background:linear-gradient(90deg,var(--card) 0%,var(--card-2) 50%,var(--card) 100%);
+  background-size:220% 100%;
+  animation:notif-shimmer 1.4s linear infinite
+}
+
+.notif-error{display:flex;flex-direction:column;align-items:center;gap:10px;padding:26px 22px 30px;text-align:center}
+.notif-error-text{margin:0;font-size:12.5px;line-height:1.5;color:var(--text-2)}
+
+/* ── 07 motion ──────────────────────────────────────────────────────────── */
+@keyframes notif-pop-in{
+  from{opacity:0;transform:translateY(-6px) scale(.985)}
+  to{opacity:1;transform:none}
+}
+@keyframes notif-pop-out{
+  from{opacity:1;transform:none}
+  to{opacity:0;transform:translateY(-6px) scale(.985)}
+}
+@keyframes notif-sheet-in{
+  from{opacity:0;transform:translateY(26px)}
+  to{opacity:1;transform:none}
+}
+@keyframes notif-sheet-out{
+  from{opacity:1;transform:none}
+  to{opacity:0;transform:translateY(26px)}
+}
+@keyframes notif-fade-in{from{opacity:0}to{opacity:1}}
+@keyframes notif-fade-out{from{opacity:1}to{opacity:0}}
+@keyframes notif-badge-in{from{opacity:0;transform:scale(.6)}to{opacity:1;transform:none}}
+@keyframes notif-shimmer{from{background-position:120% 0}to{background-position:-120% 0}}
+
+.notif-panel.is-closing{animation:notif-pop-out 160ms var(--ease-out) both}
+.notif-backdrop.is-closing{animation:notif-fade-out 160ms var(--ease-out) both}
+
+/* ── phone: a bottom sheet ──────────────────────────────────────────────────
+   The same reach-for-the-thumb shape as the now-playing sheet, and it pays the
+   home-indicator inset so the last row is never under the bar. */
+@media(max-width:650px){
+  .notif-panel{
+    top:auto;
+    right:0;
+    left:0;
+    bottom:0;
+    width:100%;
+    max-height:min(78vh,620px);
+    border-radius:var(--r-lg) var(--r-lg) 0 0;
+    border-bottom:none;
+    padding-bottom:calc(6px + var(--sab,0px));
+    transform-origin:bottom center;
+    animation:notif-sheet-in var(--dur-3) var(--ease-out) both
+  }
+  .notif-panel.is-closing{animation:notif-sheet-out 160ms var(--ease-out) both}
+  /* 44px hit boxes where a thumb is doing the aiming */
+  .notif-icon-btn{width:44px;height:44px}
+  .notif-text-btn{height:44px}
+  .notif-enable{min-height:44px}
+  .notif-head{padding:4px 4px 4px 14px}
+  .notif-item{min-height:60px}
+}
+
+@media (prefers-reduced-motion: reduce){
+  .notif-panel,
+  .notif-panel.is-closing,
+  .notif-backdrop,
+  .notif-backdrop.is-closing,
+  .notif-badge,
+  .notif-skel-row{animation:none!important}
+  .notif-icon-btn,
+  .notif-text-btn,
+  .notif-enable,
+  .notif-item{transition:none!important}
+}

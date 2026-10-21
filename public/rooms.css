@@ -1,0 +1,264 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   sonora — Listen Together
+   ───────────────────────────────────────────────────────────────────────────
+   Everything here is namespaced `.room-*` (plus `.room-pill`), for the same
+   reason pwa.css is: this file styles one feature and must never collide with
+   app.css. Tokens, radii and motion all come from `:root` in app.css — no new
+   values are introduced.
+
+   Two layout rules worth keeping:
+     * the room page is a column on a phone and a two-column "now playing" panel
+       once there is room (≥811px), because the queue is the second thing people
+       look at in a room;
+     * every control is ≥44px on touch layouts, like the rest of the app.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── page ─────────────────────────────────────────────────────────────────── */
+.room-page{display:grid;gap:22px;max-width:1100px;padding-bottom:26px}
+.room-hero{min-height:180px;border-radius:var(--r-lg)}
+
+.room-head{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:14px}
+.room-head-copy{min-width:0}
+.room-title{
+  font-family:'Inter Display','Inter',system-ui,sans-serif;
+  font-size:clamp(22px,4.4vw,32px);font-weight:800;letter-spacing:-.03em;line-height:1.12;
+  margin:5px 0 0;overflow-wrap:anywhere
+}
+.room-actions{display:flex;flex-wrap:wrap;gap:8px}
+.room-actions .secondary-btn{min-height:40px}
+
+.room-badges{display:flex;flex-wrap:wrap;align-items:center;gap:7px;margin-top:11px}
+.room-badge{
+  display:inline-flex;align-items:center;gap:6px;min-height:26px;padding:0 10px;
+  border:1px solid var(--line-2);border-radius:var(--r-pill);
+  background:rgba(255,255,255,.04);color:var(--text-2);
+  font-size:11px;font-weight:650;letter-spacing:.02em;white-space:nowrap
+}
+.room-badge .ico{width:13px;height:13px;color:var(--soft)}
+.room-badge.room-live{color:var(--ok);border-color:rgba(143,217,160,.32);background:var(--ok-soft)}
+.room-badge.room-live b{font-weight:750}
+.room-dot{width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 0 0 currentColor}
+@media (prefers-reduced-motion:no-preference){
+  .room-badge.room-live .room-dot{animation:room-pulse 2.4s var(--ease-out) infinite}
+  @keyframes room-pulse{
+    0%{box-shadow:0 0 0 0 rgba(143,217,160,.5)}
+    70%{box-shadow:0 0 0 7px rgba(143,217,160,0)}
+    100%{box-shadow:0 0 0 0 rgba(143,217,160,0)}
+  }
+}
+/* The sync badge is a measurement, not decoration: it says how far behind or
+   ahead this device actually is. Green must mean measured-safe. */
+.room-badge.room-sync{font-variant-numeric:tabular-nums}
+.room-sync[data-room-sync="good"]{color:var(--ok);border-color:rgba(143,217,160,.3);background:var(--ok-soft)}
+.room-sync[data-room-sync="warn"]{color:var(--warn);border-color:rgba(230,198,130,.32);background:rgba(230,198,130,.12)}
+.room-sync[data-room-sync="bad"]{color:var(--bad);border-color:rgba(255,154,154,.34);background:var(--bad-soft)}
+
+/* ── now playing ──────────────────────────────────────────────────────────── */
+.room-now{
+  display:grid;gap:18px;padding:16px;border:1px solid var(--line);
+  border-radius:var(--r-lg);background:var(--panel);
+  box-shadow:0 1px 0 var(--inset) inset
+}
+.room-art{position:relative;border-radius:var(--r-md);overflow:hidden;aspect-ratio:16/9;background:var(--card)}
+.room-art .cover{width:100%;height:100%;object-fit:cover;border-radius:0}
+.room-art-live{
+  position:absolute;left:12px;bottom:12px;display:flex;align-items:flex-end;gap:3px;
+  height:20px;padding:5px 9px;border-radius:var(--r-pill);
+  background:rgba(13,14,17,.66);backdrop-filter:blur(8px)
+}
+.room-art-live i{width:3px;height:6px;border-radius:2px;background:var(--muted)}
+.room-art-live.is-playing i{background:var(--accent)}
+@media (prefers-reduced-motion:no-preference){
+  .room-art-live.is-playing i{animation:room-eq 900ms var(--ease-spring) infinite alternate}
+  .room-art-live.is-playing i:nth-child(2){animation-delay:.18s}
+  .room-art-live.is-playing i:nth-child(3){animation-delay:.36s}
+  @keyframes room-eq{from{height:5px}to{height:15px}}
+}
+.room-now-body{min-width:0}
+.room-now-body .eyebrow{color:var(--accent)}
+.room-now-body h2{
+  font-size:clamp(19px,3.6vw,26px);font-weight:780;letter-spacing:-.025em;line-height:1.2;
+  margin:7px 0 0;overflow-wrap:anywhere
+}
+.room-byline{margin:6px 0 0;font-size:13px;color:var(--muted);overflow-wrap:anywhere}
+.room-transport{display:flex;align-items:center;gap:12px;margin-top:16px}
+.room-play{
+  display:grid;place-items:center;width:56px;height:56px;border-radius:50%;
+  background:var(--accent);color:var(--accent-ink);box-shadow:var(--shadow-accent);
+  transition:transform var(--dur-1) var(--ease-out),background var(--dur-1) var(--ease-out)
+}
+.room-play:hover{background:var(--accent-2)}
+.room-play:active{transform:scale(.94)}
+.room-play .ico{width:22px;height:22px}
+.room-timebar{margin-top:12px}
+.room-locked{display:flex;align-items:center;gap:8px;margin:16px 0 0;font-size:12.5px;color:var(--muted)}
+.room-locked .ico{width:15px;height:15px;color:var(--soft)}
+
+.room-section-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:11px}
+.room-section-head strong{font-size:13.5px;font-weight:750;letter-spacing:-.01em}
+.room-section-head span{font-size:11.5px;color:var(--soft)}
+
+/* ── people ───────────────────────────────────────────────────────────────── */
+.room-people-row{display:flex;flex-wrap:wrap;gap:8px}
+.room-person{
+  display:inline-flex;align-items:center;gap:8px;min-height:36px;padding:0 12px 0 4px;
+  border:1px solid var(--line);border-radius:var(--r-pill);background:var(--card);
+  font-size:12.5px;color:var(--muted);max-width:100%
+}
+.room-person.is-online{color:var(--text-2);border-color:var(--line-2)}
+.room-person-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.room-avatar{
+  display:grid;place-items:center;flex:none;width:28px;height:28px;border-radius:50%;
+  background:var(--card-3);color:var(--text-2);font-size:11.5px;font-weight:750;
+  box-shadow:0 0 0 2px transparent
+}
+.room-person.is-online .room-avatar{background:var(--accent-soft);color:var(--accent-2)}
+.room-person.is-host .room-avatar{box-shadow:0 0 0 2px var(--accent-line)}
+.room-host-tag{
+  font-size:9px;font-weight:800;letter-spacing:.1em;color:var(--accent-2);
+  border:1px solid var(--accent-line);border-radius:var(--r-pill);padding:1px 6px
+}
+
+/* ── queue ────────────────────────────────────────────────────────────────── */
+.room-queue-list{list-style:none;margin:0;padding:0;display:grid;gap:2px}
+.room-queue-row{display:flex;align-items:center;gap:2px;border-radius:var(--r-sm)}
+.room-queue-row:hover{background:rgba(255,255,255,.045)}
+.room-queue-row.is-current{background:var(--accent-soft)}
+.room-queue-row.is-past .room-queue-btn{opacity:.5}
+.room-queue-btn:disabled{cursor:default}
+.room-queue-row.is-locked .room-queue-btn:not(:disabled){cursor:default}
+.room-queue-btn{
+  display:flex;align-items:center;gap:11px;flex:1;min-width:0;min-height:52px;padding:6px 8px;
+  text-align:left;color:var(--text-2)
+}
+.room-queue-num{
+  display:grid;place-items:center;flex:none;width:22px;color:var(--soft);
+  font-size:11.5px;font-variant-numeric:tabular-nums
+}
+.room-queue-row.is-current .room-queue-num{color:var(--accent)}
+.room-queue-btn .cover{flex:none;width:40px;height:40px;border-radius:var(--r-xs)}
+.room-queue-text{min-width:0;flex:1}
+.room-queue-text strong,
+.room-queue-text span{display:block;width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.room-queue-text strong{font-size:13px;font-weight:650;color:var(--white)}
+.room-queue-text span{margin-top:2px;font-size:11.5px;color:var(--muted)}
+.room-queue-btn .duration{flex:none;font-size:11.5px;color:var(--soft);font-variant-numeric:tabular-nums}
+.room-queue-remove{flex:none;width:40px;height:40px;opacity:0}
+.room-queue-row:hover .room-queue-remove,
+.room-queue-remove:focus-visible{opacity:1}
+.room-empty{margin:0;font-size:12.5px;color:var(--soft);line-height:1.6}
+
+/* ── host settings ────────────────────────────────────────────────────────── */
+.room-host{
+  display:grid;gap:16px;padding:16px;border:1px solid var(--line);
+  border-radius:var(--r-lg);background:var(--panel)
+}
+.room-setting{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px}
+.room-setting strong{font-size:13px;font-weight:700}
+.room-setting p{margin:3px 0 0;font-size:11.5px;color:var(--muted)}
+.room-setting .segmented{flex:none}
+.room-invite{display:grid;gap:10px;padding-top:14px;border-top:1px solid var(--line)}
+.room-invite-form{display:flex;gap:8px}
+.room-invite-form input{flex:1;min-width:0;min-height:44px;font-size:16px}
+.room-invite-form .play-btn{flex:none;min-height:44px}
+.room-suggestions{display:flex;flex-wrap:wrap;gap:7px}
+.room-suggestions .chip.is-done{opacity:.55}
+.room-invite-list{list-style:none;margin:0;padding:0;display:grid;gap:6px}
+.room-invite-list li{
+  display:flex;align-items:center;gap:9px;min-height:40px;padding:4px 6px 4px 4px;
+  border:1px solid var(--line);border-radius:var(--r-sm);background:var(--card);font-size:12.5px
+}
+.room-invite-list li .room-avatar{width:26px;height:26px}
+.room-invite-list li .icon-btn{margin-left:auto;width:36px;height:36px}
+
+/* The create sheet's two questions. A real <fieldset> keeps the radio groups
+   grouped for the keyboard and for a screen reader. */
+.room-choice{border:0;margin:0 0 14px;padding:0;display:grid;gap:7px}
+.room-choice legend{
+  padding:0 0 8px;font-size:10.5px;font-weight:800;letter-spacing:.09em;
+  text-transform:uppercase;color:var(--soft)
+}
+.room-choice label{
+  display:flex;align-items:flex-start;gap:11px;min-height:52px;padding:11px 13px;
+  border:1px solid var(--line-2);border-radius:var(--r-sm);background:var(--card);cursor:pointer
+}
+.room-choice label:hover{background:var(--card-2)}
+.room-choice input{margin-top:3px;flex:none;accent-color:var(--accent);width:16px;height:16px}
+.room-choice span{min-width:0}
+.room-choice strong{display:block;font-size:13px;font-weight:700}
+.room-choice small{display:block;margin-top:3px;font-size:11.5px;line-height:1.5;color:var(--muted)}
+.room-choice label:has(input:checked){border-color:var(--accent-line);background:var(--accent-soft)}
+
+/* ── join gate / ended ────────────────────────────────────────────────────── */
+.room-gate{
+  justify-items:center;text-align:center;padding:34px 22px;gap:12px;
+  border:1px solid var(--line);border-radius:var(--r-lg);background:var(--panel)
+}
+.room-gate-eye{
+  display:grid;place-items:center;width:62px;height:62px;border-radius:50%;
+  background:var(--accent-soft);color:var(--accent)
+}
+.room-gate-eye .ico{width:28px;height:28px}
+.room-gate h1{
+  font-family:'Inter Display','Inter',system-ui,sans-serif;font-size:clamp(20px,4.4vw,26px);
+  font-weight:800;letter-spacing:-.025em;margin:2px 0 0
+}
+.room-gate p{margin:0;max-width:44ch;font-size:13px;line-height:1.65;color:var(--muted)}
+.room-gate-actions{display:flex;flex-wrap:wrap;justify-content:center;gap:9px;margin-top:8px}
+.room-gate .field-hint{color:var(--soft)}
+
+/* ── sheet ────────────────────────────────────────────────────────────────── */
+.room-sheet-people{margin:4px 0 12px}
+.room-link-row{display:flex;gap:8px;margin-bottom:14px}
+.room-link-row input{
+  flex:1;min-width:0;min-height:44px;font-size:16px;font-variant-numeric:tabular-nums;
+  color:var(--muted);text-overflow:ellipsis
+}
+.room-link-row .secondary-btn{flex:none;min-height:44px}
+
+/* ── topbar pill ──────────────────────────────────────────────────────────── */
+.room-pill{
+  display:inline-flex;align-items:center;gap:8px;min-height:36px;padding:0 13px;
+  border:1px solid var(--accent-line);border-radius:var(--r-pill);
+  background:var(--accent-soft);color:var(--accent-2);
+  font-size:12px;font-weight:650;white-space:nowrap;
+  transition:background var(--dur-1) var(--ease-out),transform var(--dur-1) var(--ease-out)
+}
+.room-pill:hover{background:rgba(255,153,123,.2)}
+.room-pill:active{transform:scale(.97)}
+.room-pill-dot{width:7px;height:7px;border-radius:50%;background:currentColor}
+.room-pill[data-state="warn"]{border-color:rgba(230,198,130,.4);background:rgba(230,198,130,.14);color:var(--warn)}
+.room-pill[data-state="bad"],
+.room-pill.is-warn{border-color:rgba(255,154,154,.4);background:var(--bad-soft);color:var(--bad)}
+@media (prefers-reduced-motion:no-preference){
+  .room-pill[data-state="good"] .room-pill-dot{animation:room-pulse 2.4s var(--ease-out) infinite}
+}
+.icon-btn.room-on{color:var(--accent)}
+
+/* ── responsive ───────────────────────────────────────────────────────────── */
+@media (min-width:811px){
+  .room-now{grid-template-columns:minmax(0,340px) minmax(0,1fr);align-items:center;gap:22px}
+  .room-now-body .room-transport{margin-top:20px}
+}
+@media (min-width:1081px){
+  .room-now{grid-template-columns:minmax(0,420px) minmax(0,1fr)}
+}
+@media (max-width:430px){
+  .room-head{align-items:flex-start}
+  .room-actions{width:100%}
+  .room-actions .secondary-btn{flex:1 1 auto;justify-content:center}
+  .room-now{padding:13px}
+  .room-transport{gap:9px}
+  .room-play{width:52px;height:52px}
+  .room-gate{padding:26px 16px}
+  .room-setting .segmented{width:100%}
+  .room-setting .segment{flex:1}
+}
+
+/* ── reduced motion ───────────────────────────────────────────────────────── */
+@media (prefers-reduced-motion:reduce){
+  .room-now *,
+  .room-pill,
+  .room-play,
+  .room-queue-row{transition:none !important;animation:none !important}
+}

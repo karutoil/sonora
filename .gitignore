@@ -1,0 +1,31 @@
+# ─── Dependencies ───────────────────────────────────────────────────────────
+node_modules/
+
+# ─── Secrets — never commit these ───────────────────────────────────────────
+.env
+.env.*
+!.env.example
+cookies.txt
+*.cookies
+*.pem
+*.key
+
+# ─── Runtime state (SQLite database + audio cache) ──────────────────────────
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# ─── Test and scratch output ────────────────────────────────────────────────
+test/.tmp/
+.tmp/
+coverage/
+*.log
+
+# ─── Editors and OS noise ───────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo

@@ -1,0 +1,335 @@
+# Listen Together — shared listening rooms
+
+A room is one authoritative playhead that several people follow. The host
+starts a room from whatever is playing (or from nothing), gets a link, and
+everyone who joins hears the same track at the same position, within a few
+hundred milliseconds.
+
+This document is the contract: the database, the wire format, the sync
+algorithm and the deliberate limits. `docs/ui.md` records how the client
+surfaces it.
+
+---
+
+## The two kinds of link
+
+| visibility | who can join | what the link preview shows |
+| --- | --- | --- |
+| `public` | anyone with the link — **no account needed to listen** | the track, host, listener count and the queue |
+| `private` | the host and accounts the host invited | "a private listening room" and nothing else |
+
+A public room is the one place in sonora where audio does not require an
+account. `/api/stream/:videoId` is a same-origin YouTube proxy behind a session,
+so opening it to "anyone with a link" would turn every room into a public audio
+proxy for the whole internet. Instead a public listener gets a **guest cookie**:
+signed, room-scoped, 6 hours, and domain-separated from the session token so
+neither can stand in for the other. It authorizes exactly this room's state and
+the tracks in *this room's queue* — not an arbitrary video id, not another room,
+and not the member API. That boundary is the whole security model and it is
+pinned by tests.
+
+The cookie is minted with the listener page itself (`GET /l/:code/live`), not
+behind a click. That is what lets the page preload the room's real audio source
+while the visitor reads the track name, so the one tap they make is a plain
+`play()` on a ready element — no second press, and no silent placeholder racing
+a gesture.
+
+A guest is a **listener**: they follow the playhead and cannot move it. A queue
+belongs to the room; the transport belongs to the people in it. "Anyone can
+listen" must not become "anyone can skip the host's song".
+
+A guest can still *see* the queue, and does not have to wait for JavaScript to
+read it: `roomPreview` carries the public room's `queue`, `index`, `positionMs`,
+`control` and `createdAt`, so `/l/<code>/live` is server-rendered with the whole
+running order. That is not a widening of the boundary — every guest may fetch
+the same snapshot from `/api/public/rooms/:code` — it is the same data arriving
+one round trip earlier, which is what makes the page a room rather than a
+player. A private room's preview still carries no track and no queue.
+
+The shareable link is a real path — `/l/<code>` — for the same reason track
+links are `/t/<id>`: a fragment never reaches the server, so a chat crawler
+would only ever see the generic app shell. `/l/<code>` is a server-rendered
+landing page with Open Graph tags. For a public room it leads to
+`/l/<code>/live`, a listener page that needs no account at all; for a private
+one it offers the app, where the normal login and invite apply.
+
+A room code is 10 characters from `23456789abcdefghjkmnpqrstuvwxyz` (no
+`i l o 0 1` to survive being read aloud). It is unguessable at that length;
+join attempts are rate limited anyway.
+
+---
+
+## Authority, not consensus
+
+The server owns the playhead. Clients never publish their position; they send
+**intent** (play, pause, seek here, next) and receive state. That is what makes
+"C" in a room and "C" on another phone mean the same thing.
+
+### The room follows what you play
+
+There is no separate room library to feed. Two commands carry play intent, and
+the ordinary player sends them:
+
+- **`queue-set`** — "this is what I am playing now" — replaces the room's queue
+  and playhead. Pressing Play on a playlist, an album, a station, or clicking a
+  track row in *Up next* does this. It is the whole of "listen together": the
+  room hears what you chose, from the top, together.
+- **`queue-add`** — "add this to what we are playing" — appends one track. This
+  is the collaborative half, and the only transport command a member keeps under
+  host-only control.
+
+Only a *deliberate* play intent calls `roomFollow()`. Rendering, resuming a
+personal session, and applying the room's own state never do — and `roomApplying`
+marks the writes the room made, so a state change cannot echo back as a command
+and make two devices ping-pong the playhead forever.
+
+```
+room state = { queue, index, positionMs, anchorAt, playing }
+position(t) = positionMs + (playing ? t - anchorAt : 0)
+```
+
+`anchorAt` is a server timestamp, so a slow client receives an event that is
+already a little old and computes a correspondingly later position. No lead
+compensation is needed.
+
+**Track end is derived, never stored.** If a known duration exists and
+`position(now) >= duration`, the snapshot reports `ended: true` and
+`playing: false` at `duration`. Any member may then send `next {auto:true}`
+(natural continuation); the server only accepts `auto` when the state really is
+ended, so it cannot be used to skip. A user-initiated skip obeys the room's
+control policy.
+
+### Commands and revision
+
+Every command carries the `rev` the client last saw.
+
+- **Absolute** commands (`play`, `pause`, `seek`, `select`, `queue-add`,
+  `queue-remove`) are applied against current state. The intent does not depend
+  on the old revision, and rebasing is exactly what the user asked for.
+- **Relative** commands (`next`, `prev`) require `rev` to match. Two people
+  pressing next at once must advance once, not twice; the loser gets
+  `409 { error: 'stale', state }` and simply follows the winner.
+- **Auto-advance** (`next {auto:true}`) is accepted when the state is ended, or
+  from the host when it is not (the host's player knows its own end even when
+  the catalogue had no duration for the track).
+
+### Control policy
+
+| `control` | members may |
+| --- | --- |
+| `everyone` (default) | play, pause, seek, next, prev, pick a track, change what is playing (queue-set), add to the queue |
+| `host` | only add to the queue; transport is the host's |
+
+Adding to the queue stays collaborative under `host` control because a queue is
+a suggestion, not an interruption. The host can flip the policy at any time;
+the change is broadcast.
+
+---
+
+## Clock and drift
+
+A room is only as synced as the clocks behind it. On join (and every 60 s, and
+when the tab becomes visible) the client runs three `GET /time` probes and keeps
+the sample with the smallest round trip:
+
+```
+offset = server.now - (t0 + rtt / 2)
+```
+
+Ticks and state events are not used for the offset: a one-way delay would bias
+it forward by the whole delay. They are used for presence and liveness only.
+
+Once the clock agrees, the correction loop runs once a second (and on
+`seeked` / `playing`):
+
+| local drift | action |
+| --- | --- |
+| ≤ 120 ms | nothing (playbackRate back to 1) |
+| 120 ms – 1.25 s | nudge `playbackRate` by up to ±4 % (`1 − clamp(drift/8)`) |
+| > 1.25 s | hard seek |
+
+A track change is applied by loading the track and seeking to the derived
+position (`pendingResumeMs` in `app.js`); the loop waits ~1.2 s for that seek to
+land so it does not fight it. Nudging rather than seeking is what keeps a room
+from sounding like a stutter; the hard seek is the honest fallback when someone
+was asleep, backgrounded, or joined a track late.
+
+Every room seek goes through `seekTo()`, which arms the app's one-shot
+`manualSeek`/`lockSeek` flags. Without that the player's loop-wrap detector
+would read a correction to 0:00 as the end of the track and advance the room.
+
+---
+
+## Presence and lifetime
+
+Presence is the open SSE connection, not a heartbeat table. A subscriber set
+lives in memory; `room_members` is the durable membership and authorization
+record, and `last_seen_at` moves when someone connects. Members who disconnect
+stay members (they can rejoin without an invite), and show as offline. Guests
+have no row at all — for them the connection *is* the presence, which is why an
+idle room with a guest in it is not idle.
+
+### Surviving a restart
+
+Nothing about a live room is in memory. The queue, index, playhead and revision
+are one JSON blob in `rooms.state`; the roster and invites are rows. A restart
+therefore costs exactly the open streams, which reconnect by themselves:
+
+- the client's `EventSource` retries the same URL; the stream's first message is
+always a full `snapshot`, so a reconnect is one message, not a replay protocol;
+- the guest page reloads its state when the tab becomes visible;
+- `positionMs` is stored with `anchorAt`, so a restart in the middle of a track
+  resumes from the stored anchor instead of rewinding.
+
+Housekeeping is the one thing that changes after a restart: rooms idle beyond
+`SONORA_ROOM_HOURS` are pruned at boot, so a restart is also the moment a
+forgotten room is finally collected.
+
+### Coming back to a room
+
+A browser remembers the room it was in (`localStorage`, "where was I" — not
+account state, so it is not on the server). On boot, any page restores that
+room: the pill appears and the shared playhead is followed again. Opening
+`#/room/<code>` explicitly does the same. Only a room that has ended, been
+deleted, or become private for that account clears the memory — a reload is not
+a decision to leave.
+
+A room is deleted when it has been idle (no command, no join, no reconnect) for
+`SONORA_ROOM_HOURS` (12) **and** has no live subscriber, or one hour after the
+host ends it. Housekeeping runs at boot and hourly. Hosting does not need the
+host to be online: the transport keeps working for everyone, and host-only
+actions wait for the host's return.
+
+---
+
+## API
+
+All paths are under `/api/rooms`, authenticated, and JSON except the stream.
+`snapshot` below means the object in the next section.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| POST | `/api/rooms` | create `{visibility, control, track?, queue?}` → snapshot |
+| GET | `/api/rooms` | rooms I host or joined → `{ rooms }` |
+| GET | `/api/rooms/:code` | snapshot; private non-invited → `403 { code:'PRIVATE' }` |
+| POST | `/api/rooms/:code/join` | join (public or invited) → snapshot |
+| POST | `/api/rooms/:code/leave` | leave → `{ ok }` |
+| DELETE | `/api/rooms/:code` | end the room (host) → `{ ok }` |
+| PATCH | `/api/rooms/:code` | `{visibility?, control?}` (host) → snapshot |
+| GET | `/api/rooms/:code/state` | snapshot (the polling fallback) |
+| GET | `/api/rooms/:code/time` | `{ now }` — clock probe |
+| GET | `/api/rooms/:code/events` | SSE: `snapshot`, `state`, `members`, `room`, `tick` |
+| POST | `/api/rooms/:code/command` | `{ type, rev, ... }` → snapshot, or `409 stale` || GET | `/api/rooms/:code/people?q=` | invite candidates (host) → `{ people }` |
+| POST | `/api/rooms/:code/invite` | `{ name }` or `{ userId }` (host) → `{ invites }` |
+| DELETE | `/api/rooms/:code/invite/:userId` | remove an invite (host) → `{ invites }` |
+
+### Public listener API (no account)
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| POST | `/api/public/rooms/:code/guest` | mint the guest cookie → guest snapshot; `403 PRIVATE` |
+| GET | `/api/public/rooms/:code` | guest snapshot |
+| GET | `/api/public/rooms/:code/state` | guest snapshot (polling) |
+| GET | `/api/public/rooms/:code/time` | `{ now }` |
+| GET | `/api/public/rooms/:code/events` | SSE, sanitised: no roster, no roles |
+
+A guest snapshot is the same object with `guest: true`, `members: []` (names
+are not a public-room resource) and a `listeners` count. Every one of these
+routes answers `403 NO_GUEST` without a valid cookie for that room.
+
+### Snapshot
+
+```json
+{
+  "code": "k7m2p9xq4r",
+  "host": { "id": 1, "name": "toil" },
+  "visibility": "public",
+  "control": "everyone",
+  "joined": true,
+  "rev": 7,
+  "now": 1730000000000,
+  "at": 1730000000000,
+  "positionMs": 42310,
+  "playing": true,
+  "ended": false,
+  "index": 2,
+  "queue": [{ "videoId": "…", "title": "…", "channel": "…", "thumb": "…", "durationS": 214 }],
+  "track": { "videoId": "…", "title": "…" },
+  "updatedAt": 1730000000000,
+  "updatedBy": { "id": 1, "name": "toil" },
+  "createdAt": 1730000000000,
+  "link": "/l/k7m2p9xq4r",
+  "guests": 3,
+  "listeners": 5,
+  "members": [{ "id": 1, "name": "toil", "role": "host", "online": true }]
+}
+```
+
+`guests` counts anonymous listeners connected right now (a fact about the hub,
+not a query), `listeners` is everyone with an open stream — signed-in members
+plus guests — which is what the room pages display.
+
+`at` is the server instant at which `positionMs` was true. A client that has
+calibrated its offset computes `positionMs + (serverNow − at)` while playing.
+
+### SSE
+
+`GET /events` sends one `snapshot` immediately (the same object as `/state`,
+including `members`), then:
+
+- `state` — a new snapshot on every command
+- `members` — the roster after a join/leave/connect/disconnect (guests receive
+  the same event with an empty roster and the counts)
+- `room` — after a visibility/control change, when the host ends the room
+  (followed by closing the stream), or to a guest being removed because the room
+  became private (`{ removed: true, reason }`)
+- `tick` — `{"now":…}` every 15 s; a comment line every 15 s on quiet rooms
+
+The stream sets `cache-control: no-cache, no-transform` and
+`x-accel-buffering: no`, and the handler hijacks the reply so Fastify never
+tries to frame it. If the stream cannot be established the client falls back to
+polling `/state` every 3 s.
+
+---
+
+## Deliberate limits
+
+- **50 members** per room (`SONORA_ROOM_MAX_MEMBERS`). Beyond that a room is a
+  broadcast, and the queue/people list stops being useful. Guests are counted
+  against the 200 concurrent streams cap, not against membership.
+- **60 queue entries** — the same window `/api/now` stores. Adding past it
+  replaces nothing; the server refuses and the client says the queue is full.
+- **One queue, no per-listener shuffle.** Shuffle is a personal opinion; a
+  shared playhead has to be the same order for everyone.
+- **No chat.** This is a listening feature; the link lives in whatever chat
+  the group already uses.
+- **No live streams** — they have no end and no finite duration to sync to.
+- **Guests are listeners, not members.** No name, no roster entry, no commands.
+  The count is honest; the identity is the connection.
+- **A room that goes private revokes its guests.** There is no account to
+  remove, so their streams are closed with a reason instead of being left open.
+
+## Configuration
+
+```sh
+SONORA_ROOM_HOURS=12          # idle lifetime, with nobody connected
+SONORA_ROOM_MAX_MEMBERS=50    # hard cap on a room's roster
+```
+
+The guest cookie lives for 6 hours (`GUEST_TTL_MS` in `src/server.js`): long
+enough for an evening, short enough that a shared link does not become standing
+audio access.
+
+## Tests
+
+- `test/rooms.test.js` — HTTP: create/join, the private gate, invites, control
+  policy, revision conflicts, end-of-track, the SSE stream, the clock endpoint,
+  and the guest boundary (queued tracks only, no commands, no roster).
+- `test/rooms-browser.test.js` — real Chromium sessions: two people hear the
+  same second across pause, seek and a track change; a stranger meets the
+  private wall; a guest needs exactly one click, starts at 5% and can move the
+  volume.
+- `test/rooms-idle.test.js` — a room with a live listener is never pruned.
+- `test/listen-page.test.js` — the listener page's running order: server-rendered
+  queue/played/room facts, a host command repainting it in place, the phone
+  layout, and an ended room staying readable.

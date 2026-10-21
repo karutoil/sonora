@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#111215">
+<meta name="color-scheme" content="dark">
+<meta name="description" content="sonora — your own music, your own algorithm. A personal YouTube music player that learns what you like.">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="sonora">
+<meta name="format-detection" content="telephone=no">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icons/icon-192.png" sizes="192x192">
+<link rel="apple-touch-icon" href="/icons/icon-180.png">
+<script>/* --app-h: iOS home-screen chin fix. Keep identical in index.html and offline.html (test/ios-chin.test.js compares them). */
+(function () {
+  // An iOS home-screen web app can report a layout viewport shorter than the
+  // physical screen: WebKit subtracts the safe-area strip, so 100dvh (and
+  // innerHeight) come back 20-59px short while screen.height stays honest. A
+  // shell sized by the short unit stops above the bottom of the screen and the
+  // leftover band reads as a chin.
+  //
+  // So in a standalone app the shell height is published as --app-h: the
+  // measured screen height when the shortfall looks like a safe-area strip,
+  // otherwise 100vh, which is the unit WebKit reports correctly in standalone
+  // (and equals the visible height everywhere else). app.css applies it to the
+  // root chain, .app and the full-screen overlays. In Safari, where the browser
+  // chrome really does own that space, nothing is published and 100dvh stays in
+  // charge.
+  var root = document.documentElement;
+  var standalone = navigator.standalone === true
+    || (window.matchMedia && matchMedia('(display-mode: standalone)').matches);
+  if (!standalone) return;
+  function sync() {
+    var shown = Math.max(
+      window.innerHeight || 0,
+      (window.visualViewport && window.visualViewport.height) || 0
+    );
+    var screenH = (window.screen && screen.height) || 0;
+    // A safe-area strip is at most the two insets plus a few px, so that is the
+    // size of gap that means "chin". Anything bigger is the keyboard, a rotated
+    // or resized window, where screen.height is not the height to fill. env()
+    // can read 0 for the first frames, so keep a floor.
+    var strip = probe('safe-area-inset-top') + probe('safe-area-inset-bottom');
+    var chin = Math.max(120, strip + 40);
+    var gap = screenH - shown;
+    root.style.setProperty('--app-h', gap > 0 && gap <= chin ? screenH + 'px' : '100vh');
+  }
+  function probe(prop) {
+    var d = document.createElement('div');
+    d.style.cssText = 'position:fixed;top:0;left:0;width:0;height:env(' + prop + ',0px)';
+    root.appendChild(d);
+    var h = d.getBoundingClientRect().height;
+    d.remove();
+    return h;
+  }
+  sync();
+  addEventListener('resize', sync);
+  addEventListener('orientationchange', sync);
+  // WebKit can flip the viewport later (backgrounding, the "dock" it does after
+  // any overflow), so re-measure on the events that follow, not just on resize.
+  addEventListener('pageshow', sync);
+  addEventListener('load', sync);
+  document.addEventListener('visibilitychange', sync);
+})();
+</script>
+<link rel="preload" href="/fonts/inter-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/fonts.css">
+<link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/rooms.css">
+<link rel="stylesheet" href="/pwa.css">
+<link rel="stylesheet" href="/notifications.css">
+<title>sonora — music for every version of you</title>
+</head>
+<body>
+<a class="skip-link" href="#page-root">Skip to content</a>
+<div class="sr-only" id="route-announcer" aria-live="polite"></div>
+<svg aria-hidden="true" width="0" height="0" style="position:absolute;pointer-events:none;overflow:hidden">
+<symbol id="i-wave" viewBox="0 0 24 24"><path d="M2 9v6m4-10v14m4-16v18m4-14v10m4-13v16m4-11v6"/></symbol>
+<symbol id="i-home" viewBox="0 0 24 24"><path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z"/><path d="M9 21v-8h6v8"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></symbol>
+<symbol id="i-library" viewBox="0 0 24 24"><rect x="3" y="3" width="4" height="18" rx="1"/><rect x="10" y="3" width="4" height="18" rx="1"/><path d="m17 4 4-1 2 17-4 1z"/></symbol>
+<symbol id="i-radio" viewBox="0 0 24 24"><circle cx="12" cy="15" r="2"/><path d="M7 11a7 7 0 0 0 0 8m10-8a7 7 0 0 1 0 8M4 8a11 11 0 0 0 0 14M20 8a11 11 0 0 1 0 14M5 4l14-3"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7z" stroke-linejoin="round"/></symbol>
+<symbol id="i-pause" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></symbol>
+<symbol id="i-next" viewBox="0 0 24 24"><path d="m4 5 10 7-10 7z"/><path d="M18 5v14"/></symbol>
+<symbol id="i-prev" viewBox="0 0 24 24"><path d="m20 5-10 7 10 7z"/><path d="M6 5v14"/></symbol>
+<symbol id="i-heart" viewBox="0 0 24 24"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8L12 21l8.8-8.6a5.5 5.5 0 0 0 0-7.8z"/></symbol>
+<symbol id="i-thumb-down" viewBox="0 0 24 24"><path d="M17 2h3a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-3M17 2 9.5 2a2 2 0 0 0-2 1.6L6.2 11a2 2 0 0 0 2 2.4H11l-.7 4.1A2.6 2.6 0 0 0 12.9 21L17 13"/></symbol>
+<symbol id="i-shuffle" viewBox="0 0 24 24"><path d="M3 7h3c6 0 6 10 12 10h3m-4-4 4 4-4 4M3 17h3c2 0 3-1 4-3m4-4c1-2 2-3 4-3h3m-4-4 4 4-4 4"/></symbol>
+<symbol id="i-repeat" viewBox="0 0 24 24"><path d="m17 2 4 4-4 4M3 11V9a3 3 0 0 1 3-3h15M7 22l-4-4 4-4m14-1v2a3 3 0 0 1-3 3H3"/></symbol>
+<symbol id="i-volume" viewBox="0 0 24 24"><path d="M4 10h4l5-4v12l-5-4H4zM17 9c2 2 2 4 0 6m3-9c4 4 4 8 0 12"/></symbol>
+<symbol id="i-mute" viewBox="0 0 24 24"><path d="M4 10h4l5-4v12l-5-4H4zM17 9l5 6m0-6-5 6"/></symbol>
+<symbol id="i-queue" viewBox="0 0 24 24"><path d="M4 6h16M4 11h16M4 16h10m4-1 4 3-4 3z"/></symbol>
+<symbol id="i-lyrics" viewBox="0 0 24 24"><path d="M3 5h18v12H9l-6 4zM7 9h10M7 13h7"/></symbol>
+<symbol id="i-device" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="14" rx="2"/><path d="M8 21h8m-4-4v4"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M4 20h4L20 8l-4-4L4 16z"/><path d="m14 6 4 4"/></symbol>
+<symbol id="i-eye-off" viewBox="0 0 24 24"><path d="M10.6 5.2A10.9 10.9 0 0 1 12 5c6.4 0 10 7 10 7a17.7 17.7 0 0 1-3.3 4.1M6.5 6.6A17.4 17.4 0 0 0 2 12s3.6 7 10 7a10.7 10.7 0 0 0 4.3-.9"/><path d="M3 3l18 18"/></symbol>
+<symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="8" r="4"/><path d="m11 11 9 9m-3-3 2-2m-5-1 2-2"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-8 0 1 14h8l1-14"/></symbol>
+<symbol id="i-arrow-right" viewBox="0 0 24 24"><path d="M4 12h15m-6-6 6 6-6 6"/></symbol>
+<symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+<symbol id="i-chevron-left" viewBox="0 0 24 24"><path d="m14 6-6 6 6 6"/></symbol>
+<symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="m10 6 6 6-6 6"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/></symbol>
+<symbol id="i-dots" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><path d="m4 12 5 5L20 6"/></symbol>
+<symbol id="i-close" viewBox="0 0 24 24"><path d="M5 5l14 14M19 5 5 19"/></symbol>
+<symbol id="i-spark" viewBox="0 0 24 24"><path d="m12 2 2.8 7.2L22 12l-7.2 2.8L12 22l-2.8-7.2L2 12l7.2-2.8z"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3 4 6v6c0 5 3.4 8.4 8 9 4.6-.6 8-4 8-9V6z"/><path d="m9 12 2 2 4-4"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+<symbol id="i-headphones" viewBox="0 0 24 24"><path d="M3 14v-2a9 9 0 0 1 18 0v2M3 14v5h5v-7H4a1 1 0 0 0-1 2m18 0v5h-5v-7h4a1 1 0 0 1 1 2"/></symbol>
+<symbol id="i-list" viewBox="0 0 24 24"><path d="M9 6h12M9 12h12M9 18h12M3 6h1M3 12h1M3 18h1"/></symbol>
+<symbol id="i-share" viewBox="0 0 24 24"><path d="M12 15V3m-5 5 5-5 5 5M4 14v6h16v-6"/></symbol>
+<symbol id="i-expand" viewBox="0 0 24 24"><path d="m6 15 6-6 6 6"/></symbol>
+<symbol id="i-lock" viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.6 3.8 5.6 3.8 9s-1.3 6.4-3.8 9c-2.5-2.6-3.8-5.6-3.8-9S9.5 5.6 12 3z"/></symbol>
+</svg>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand" data-page="home"><div class="brand-logo"><svg class="ico" viewBox="0 0 24 24" style="width:22px;height:22px;stroke-width:2.5"><use href="#i-wave"/></svg></div><div class="brand-word">sonora<span class="brand-dot">.</span></div></div>
+    <nav class="nav-group" id="desktop-nav"></nav>
+    <div class="nav-label">Your collection</div>
+    <nav class="nav-group"><button class="nav-btn" id="nav-station" data-page="station"><svg class="ico" viewBox="0 0 24 24"><use href="#i-spark"/></svg><span>Your station</span></button><button class="nav-btn" data-collection="liked"><svg class="ico" viewBox="0 0 24 24"><use href="#i-heart"/></svg><span>Liked songs</span></button><button class="nav-btn" data-collection="recent"><svg class="ico" viewBox="0 0 24 24"><use href="#i-clock"/></svg><span>Recently played</span></button></nav>
+    <div class="nav-label">Your playlists</div>
+    <div class="playlist-links" id="side-playlists"></div>
+    <div class="sidebar-bottom"><button class="create-playlist" data-action="create"><svg class="ico" viewBox="0 0 24 24"><use href="#i-plus"/></svg> Create a playlist</button><div class="sidebar-foot"><div class="small-avatar" id="side-avatar">S</div><div><strong id="side-name">Music listener</strong>Personal account</div><button class="icon-btn" id="side-profile-button" data-action="profile" aria-label="Account menu" aria-haspopup="menu" aria-expanded="false"><svg class="ico sm" viewBox="0 0 24 24"><use href="#i-dots"/></svg></button></div></div>
+  </aside>
+  <main class="main" id="main-scroll"><header class="topbar" id="topbar"><div class="topbar-left"><button class="icon-btn nav-arrow" data-action="back" aria-label="Go back"><svg class="ico" viewBox="0 0 24 24"><use href="#i-chevron-left"/></svg></button><button class="icon-btn nav-arrow" data-action="forward" aria-label="Go forward"><svg class="ico" viewBox="0 0 24 24"><use href="#i-chevron-right"/></svg></button><button class="top-search" data-page="search"><svg class="ico" viewBox="0 0 24 24"><use href="#i-search"/></svg><span>Search artists, songs, moods...</span><kbd>⌘ K</kbd></button></div><div class="topbar-actions"><button class="room-pill" id="room-pill" data-action="room" hidden aria-haspopup="dialog" aria-label="Listen together"><span class="room-pill-dot" aria-hidden="true"></span><span class="room-pill-text">Listen together</span></button><button class="icon-btn" data-action="notifications" title="Notifications" aria-label="Notifications" aria-haspopup="dialog" aria-expanded="false"><svg class="ico" viewBox="0 0 24 24"><use href="#i-bell"/></svg><span class="notification-dot" hidden></span></button><button class="user-button" id="profile-button" data-action="profile" aria-label="Account menu" aria-haspopup="menu" aria-expanded="false"><div class="small-avatar" id="top-avatar">S</div><span id="top-name">My account</span><svg class="ico" viewBox="0 0 24 24"><use href="#i-chevron-down"/></svg></button></div></header><div class="page" id="page-root" tabindex="-1"><div class="page-head"><div><span class="page-overline">&nbsp;</span><div class="sk sk-line w-40 tall"></div></div></div><div class="sk-hero"></div><div class="sk-grid"><div class="sk-card"><div class="sk sk-cover"></div><div class="sk sk-line w-70"></div><div class="sk sk-line w-40"></div></div><div class="sk-card"><div class="sk sk-cover"></div><div class="sk sk-line w-70"></div><div class="sk sk-line w-40"></div></div><div class="sk-card"><div class="sk sk-cover"></div><div class="sk sk-line w-70"></div><div class="sk sk-line w-40"></div></div><div class="sk-card"><div class="sk sk-cover"></div><div class="sk sk-line w-70"></div><div class="sk sk-line w-40"></div></div></div></div></main>
+  <aside class="rail" id="right-rail"><div id="rail-content"></div></aside>
+  <footer class="player" id="player"></footer>
+  <nav class="mobile-nav" id="mobile-nav" aria-label="Main navigation"></nav>
+</div>
+<div class="overlay" id="now-overlay" hidden><div class="now-modal" id="now-content" role="dialog" aria-modal="true" aria-label="Now playing"></div></div>
+<div class="drawer-backdrop" id="drawer-overlay" hidden><aside class="drawer" id="queue-drawer" role="dialog" aria-modal="true" aria-label="Playing queue"></aside></div>
+<div class="overlay" id="form-overlay" hidden><div class="now-modal form-sheet" id="form-content" role="dialog" aria-modal="true" aria-label="Dialog"></div></div>
+<div class="context-menu" id="context-menu" role="menu" hidden></div>
+<div class="profile-popover" id="profile-menu" role="menu" hidden><button data-page="admin" id="profile-admin" role="menuitem" hidden><svg class="ico" viewBox="0 0 24 24"><use href="#i-shield"/></svg> Instance admin</button><button data-page="security" role="menuitem"><svg class="ico" viewBox="0 0 24 24"><use href="#i-key"/></svg> Account &amp; security</button><button data-page="library" role="menuitem"><svg class="ico" viewBox="0 0 24 24"><use href="#i-library"/></svg> Your library</button><button data-action="connect-youtube" id="profile-yt" role="menuitem"><svg class="ico" viewBox="0 0 24 24"><use href="#i-wave"/></svg> Connect YouTube</button><button data-action="create" role="menuitem"><svg class="ico" viewBox="0 0 24 24"><use href="#i-plus"/></svg> Create playlist</button><button data-action="settings" role="menuitem"><svg class="ico" viewBox="0 0 24 24"><use href="#i-spark"/></svg> Settings</button><button data-action="shortcuts" role="menuitem"><svg class="ico" viewBox="0 0 24 24"><use href="#i-list"/></svg> Keyboard shortcuts</button><button data-action="logout" role="menuitem"><svg class="ico" viewBox="0 0 24 24"><use href="#i-close"/></svg> Sign out</button></div>
+<div class="toast" id="toast" role="status" aria-live="polite" hidden><svg class="ico sm" viewBox="0 0 24 24" aria-hidden="true"><use id="toast-icon" href="#i-check"/></svg><span id="toast-text"></span></div>
+
+<div class="overlay auth" id="auth-overlay" hidden>
+  <div class="auth-shell" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+    <section class="auth-pitch" aria-hidden="true">
+      <div class="auth-brand">
+        <div class="brand-logo"><svg class="ico" viewBox="0 0 24 24"><use href="#i-wave"/></svg></div>
+        <span>sonora<span class="brand-dot">.</span></span>
+      </div>
+      <div class="auth-pitch-copy">
+        <h2>Music that<br>learns you<span class="accent">.</span></h2>
+        <p>One library and one station, wherever you listen. No feed, no shuffle politics &mdash; just the next right song.</p>
+      </div>
+      <ul class="auth-points">
+        <li><span class="auth-point-ico"><svg class="ico" viewBox="0 0 24 24"><use href="#i-spark"/></svg></span><div><strong>A station that keeps going</strong><span>Built from what you play through and like, then widened to its neighbours.</span></div></li>
+        <li><span class="auth-point-ico"><svg class="ico" viewBox="0 0 24 24"><use href="#i-device"/></svg></span><div><strong>Your place, on every device</strong><span>Pick up mid-song on the phone where the laptop stopped.</span></div></li>
+        <li><span class="auth-point-ico"><svg class="ico" viewBox="0 0 24 24"><use href="#i-key"/></svg></span><div><strong>Sign in without typing</strong><span>Add a passkey and unlock sonora with your face or fingerprint.</span></div></li>
+      </ul>
+      <div class="auth-eq" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+    </section>
+
+    <section class="auth-panel">
+      <form class="auth-form" id="auth-form" autocomplete="on" novalidate>
+        <header class="auth-head">
+          <span class="auth-overline">Sign in</span>
+          <h1 id="auth-title">Welcome back<span class="accent">.</span></h1>
+          <p id="auth-sub">Your library, your station and your place in the song are waiting.</p>
+        </header>
+
+        <div class="field auth-field">
+          <label for="auth-name">Name</label>
+          <input id="auth-name" name="name" autocomplete="username" autocapitalize="none" spellcheck="false" enterkeyhint="next" placeholder="Your name" required>
+        </div>
+        <div class="field auth-field">
+          <div class="auth-label-row"><label for="auth-pass">Passphrase</label></div>
+          <div class="auth-pass-wrap">
+            <input id="auth-pass" name="passphrase" type="password" autocomplete="current-password" enterkeyhint="go" required>
+            <button class="auth-reveal" type="button" data-action="toggle-pass" aria-label="Show passphrase" aria-pressed="false"><svg class="ico" viewBox="0 0 24 24"><use href="#i-eye"/></svg></button>
+          </div>
+        </div>
+
+        <label class="auth-remember" for="auth-remember">
+          <input type="checkbox" id="auth-remember" name="remember" checked>
+          <span class="auth-remember-box" aria-hidden="true"><svg class="ico" viewBox="0 0 24 24"><use href="#i-check"/></svg></span>
+          <span class="auth-remember-copy"><strong>Remember this device</strong><small id="auth-remember-note">Stay signed in for 30 days. Leave off on shared machines.</small></span>
+        </label>
+
+        <p class="auth-err" id="auth-err" role="alert" aria-live="assertive"></p>
+
+        <button class="play-btn auth-submit" type="submit" id="auth-submit">Sign in</button>
+
+        <div class="auth-or" id="auth-or" hidden><span>or</span></div>
+        <button class="secondary-btn auth-passkey" type="button" id="auth-passkey" data-action="passkey-login" hidden><svg class="ico" viewBox="0 0 24 24"><use href="#i-key"/></svg><span>Sign in with a passkey</span></button>
+        <p class="auth-hint" id="auth-hint" hidden></p>
+
+        <footer class="auth-foot">
+          <p id="auth-foot-note">First time here? Use the passphrase you were given. You can add a passkey once you are in, under <strong>Account &rarr; Security</strong>.</p>
+        </footer>
+      </form>
+    </section>
+  </div>
+</div>
+
+<div class="overlay" id="yt-overlay" hidden><div class="now-modal yt-modal" id="yt-content" role="dialog" aria-modal="true" aria-label="Connect YouTube"></div></div>
+
+<audio id="audio" preload="auto"></audio>
+<script type="module" src="/app.js"></script>
+<script type="module" src="/pwa.js"></script>
+<script type="module" src="/notifications.js"></script>
+</body></html>

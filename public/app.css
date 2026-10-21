@@ -1,0 +1,3513 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   sonora — application stylesheet
+   ───────────────────────────────────────────────────────────────────────────
+   A dark, warm music PWA. Mobile-first: every rule below the reset is written
+   for a 320–430px phone unless it sits inside a `min-width` block. The only
+   max-width queries are the two the test suite pins (`max-width:650px`) plus
+   the short-landscape one.
+
+   CONTENTS
+   01 tokens            02 reset & base         03 typography & utilities
+   04 shell             05 player               06 controls & forms
+   07 home              08 search               09 library
+   10 radio             11 collection & lists   12 admin
+   13 auth & youtube    14 overlays             15 now-playing sheet
+   16 drawer & menus    17 toast                18 skeletons & empty states
+   19 motion            20 responsive           21 safe areas  ← must stay last
+
+   HARD CONTRACTS (pinned by test/library.test.js + test/safe-area.test.js)
+     --accent:#ff997b                    grid-template-columns:235px
+     max-width:650px                     .mobile-nav{height:calc(67px + var(--sab))}
+     .now-modal .modal-close{top:calc(12px + var(--sat))}
+     .now-modal{padding:calc(64px + var(--sat)) …}
+     the LAST `.app{` rule (21) carries `padding:var(--sat)` and
+     `grid-template-rows:minmax(0,1fr) calc(87px + var(--sab))`.
+   Whitespace inside calc() is load-bearing — the tests match it verbatim.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+
+/* ── 01 tokens ──────────────────────────────────────────────────────────────
+   Surfaces are layered: page → panel → card → raised. Borders are hairlines;
+   depth comes from a 1px inset highlight, not from outlines everywhere. */
+:root{
+  color-scheme:dark;
+
+  /* surfaces */
+  --bg:#111215;
+  --bg-deep:#0d0e11;
+  --side:#14151a;
+  --panel:#191a1f;
+  --card:#202126;
+  --card-2:#26272e;
+  --card-3:#2d2e36;
+
+  /* hairlines */
+  --line:rgba(255,255,255,.075);
+  --line-2:rgba(255,255,255,.11);
+  --line-3:rgba(255,255,255,.16);
+  --inset:rgba(255,255,255,.055);
+
+  /* ink — every value is ≥4.5:1 on --bg, --panel and --card (see §2 notes) */
+  --white:#fbf9f6;
+  --text-2:#c9c7cd;
+  --muted:#a5a4ad;
+  --soft:#8f8f99;
+
+  /* accent — restrained coral, never neon */
+  --accent:#ff997b;
+  --accent-2:#f7b4a0;
+  --accent-ink:#241814;
+  --accent-soft:rgba(255,153,123,.13);
+  --accent-line:rgba(255,153,123,.38);
+
+  /* status */
+  --ok:#8fd9a0;
+  --warn:#e6c682;
+  --bad:#ff9a9a;
+  --ok-soft:rgba(143,217,160,.12);
+  --bad-soft:rgba(255,154,154,.12);
+
+  /* radii — 8 / 12 / 16 / 22 / pill. Nothing arbitrary. */
+  --r-xs:8px;
+  --r-sm:12px;
+  --r-md:16px;
+  --r-lg:22px;
+  --r-pill:999px;
+
+  /* elevation — only things that actually float */
+  --shadow-1:0 2px 10px rgba(0,0,0,.25);
+  --shadow-2:0 12px 32px rgba(0,0,0,.35);
+  --shadow-3:0 28px 80px rgba(0,0,0,.55);
+  --shadow-accent:0 8px 26px rgba(233,130,97,.28);
+
+  /* motion */
+  --dur-1:140ms;
+  --dur-2:220ms;
+  --dur-3:320ms;
+  --ease-out:cubic-bezier(.22,.68,.18,1);
+  --ease-spring:cubic-bezier(.2,.9,.25,1.2);
+
+  /* layering */
+  --z-topbar:10;
+  --z-rail:12;
+  --z-player:20;
+  --z-nav:20;
+  --z-drawer:45;
+  --z-overlay:50;
+  --z-menu:60;
+  --z-toast:80;
+
+  /* chrome metrics */
+  --topbar-h:60px;
+  --player-h:71px;
+  --nav-h:67px;
+  --gutter:17px
+}
+
+
+/* ── 02 reset & base ───────────────────────────────────────────────────────── */
+*,
+*::before,
+*::after{box-sizing:border-box}
+
+html,
+body{
+  margin:0;
+  width:100%;
+  /* The root chain has to grow with --app-h too: it is what clips, so leaving
+     it at 100% would cap a taller shell back at the under-reported viewport and
+     the chin would come right back. 100% wherever --app-h is unset. */
+  height:var(--app-h,100%);
+  /* the app owns scrolling: a scrolling document rubber-bands on iOS and
+     shifts the whole UI under the notch */
+  overflow:hidden;
+  background:var(--bg);
+  overscroll-behavior:none
+}
+
+body{
+  color:var(--white);
+  font-family:'Inter',system-ui,sans-serif;
+  font-size:15px;
+  line-height:1.5;
+  font-weight:450;
+  letter-spacing:-.005em;
+  -webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility;
+  -webkit-text-size-adjust:100%;
+  touch-action:manipulation
+}
+
+/* every native control inherits the UI font (never a browser default) */
+button,
+input,
+select,
+textarea{font:inherit;color:inherit;letter-spacing:inherit}
+
+button{border:0;padding:0;background:none;cursor:pointer;-webkit-tap-highlight-color:transparent}
+
+input,
+textarea{-webkit-appearance:none;appearance:none}
+
+a{color:inherit;text-decoration:none}
+
+h1,h2,h3,h4,p{margin:0}
+
+img{
+  display:block;
+  width:100%;
+  height:100%;
+  object-fit:cover;
+  /* broken images keep the surface colour instead of showing an outline */
+  background:var(--card-2);
+  color:transparent
+}
+
+svg{display:block;flex:none}
+
+ul,ol{margin:0;padding:0;list-style:none}
+
+hr{border:0;border-top:1px solid var(--line);margin:0}
+
+[hidden]{display:none!important}
+
+/* native sheet chrome should match the app, not the OS default */
+::selection{background:rgba(255,153,123,.32);color:#fff}
+
+:focus:not(:focus-visible){outline:none}
+
+/* scrollbars: thin, warm, only where the app scrolls */
+*{scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.16) transparent}
+
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:rgba(255,255,255,.14);border-radius:var(--r-pill);border:2px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.26);background-clip:content-box}
+
+
+/* ── 03 typography & utilities ──────────────────────────────────────────────
+   Display type is Inter at 750–800 with tight tracking; body sits at 14–15px.
+   `Inter Display` is an intentional alias: it resolves through the same
+   self-hosted variable file, so the stack degrades to Inter, never to Arial. */
+.ico{width:20px;height:20px;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round;fill:none}
+.ico.sm{width:16px;height:16px}
+.ico.xs{width:14px;height:14px}
+.ico.lg{width:23px;height:23px}
+.ico.fill{fill:currentColor;stroke:currentColor}
+
+.display,
+.page-title,
+.hero h1,
+.now-modal h2,
+.collection-hero h1,
+.section-head h2,
+.music-card-title,
+.station strong{font-family:'Inter Display','Inter',system-ui,sans-serif;font-weight:800;letter-spacing:-.028em}
+
+.eyebrow{display:block;font-size:10px;font-weight:800;letter-spacing:.17em;text-transform:uppercase;color:var(--soft)}
+
+.subtle{color:var(--muted)}
+.muted{color:var(--muted)}
+.accent{color:var(--accent)}
+.hide{display:none}
+
+/* visually hidden but announced */
+.sr-only{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap;border:0}
+
+/* keyboard-only escape hatch past the shell chrome */
+.skip-link{
+  position:fixed;
+  top:calc(8px + var(--sat,0px));
+  left:50%;
+  transform:translate(-50%,-160%);
+  z-index:calc(var(--z-toast) + 1);
+  padding:10px 18px;
+  border-radius:var(--r-pill);
+  background:var(--accent);
+  color:var(--accent-ink);
+  font-size:13px;
+  font-weight:800;
+  box-shadow:var(--shadow-2);
+  transition:transform var(--dur-2) var(--ease-out)
+}
+.skip-link:focus-visible{transform:translate(-50%,0);outline:2px solid #fff;outline-offset:2px}
+
+/* focus ring — one shape for every interactive element in the app */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[tabindex]:focus-visible,
+[role="button"]:focus-visible{outline:2px solid color-mix(in srgb, var(--accent) 75%, white);outline-offset:2px;border-radius:var(--r-xs)}
+
+/* momentary touch feedback (added by app.js on touchstart) */
+.press{transform:scale(.975);opacity:.94}
+
+[aria-busy="true"]{cursor:progress;opacity:.7}
+
+/* numbers that line up in timers and tables */
+.tabular,
+.timebar span,
+.track-time,
+.queue-mini .duration{font-variant-numeric:tabular-nums}
+
+
+/* ── 04 shell ───────────────────────────────────────────────────────────────
+   Mobile: one column — content, player bar, bottom nav. From 651px the bottom
+   nav disappears and a rail + real player appear; the sidebar grows in stages:
+   69px icon rail → 214px → 235px (contract) → 253px. */
+.app{
+  display:grid;
+  grid-template-columns:minmax(0,1fr);
+  grid-template-rows:minmax(0,1fr) var(--player-h) var(--nav-h);
+  /* --app-h is set by the boot script in index.html, and only when the iOS
+     layout viewport is shorter than the physical screen. */
+  height:var(--app-h,100dvh);
+  width:100%;
+  overflow:hidden;
+  background:var(--bg);
+  /* the bottom row grows by the home-indicator strip in §21 */
+}
+
+.main{
+  grid-column:1;
+  grid-row:1;
+  min-width:0;
+  min-height:0;
+  overflow-y:auto;
+  overflow-x:hidden;
+  background:var(--bg);
+  scrollbar-gutter:stable;
+  /* keep momentum scrolling smooth without animating it on navigation */
+  -webkit-overflow-scrolling:touch;
+  overscroll-behavior-y:contain
+}
+
+.page{padding:2px var(--gutter) 28px;max-width:1600px;margin:0 auto;animation:page-enter var(--dur-2) var(--ease-out) both}
+
+/* — sidebar — */
+.sidebar{display:none;grid-column:1;grid-row:1;flex-direction:column;min-height:0;padding:22px 12px 14px;background:var(--side);border-right:1px solid var(--line)}
+
+.brand{display:flex;align-items:center;gap:11px;padding:3px 14px 20px;user-select:none;cursor:pointer;border-radius:var(--r-sm);color:var(--white);text-align:left}
+.brand:focus-visible{outline-offset:4px}
+.brand-logo{
+  width:34px;
+  height:34px;
+  flex:none;
+  display:grid;
+  place-items:center;
+  border-radius:11px;
+  background:linear-gradient(155deg,var(--accent-2),var(--accent));
+  color:#251914;
+  transform:rotate(-7deg);
+  box-shadow:0 5px 18px rgba(255,153,123,.22),inset 0 1px rgba(255,255,255,.35)
+}
+.brand-logo svg{transform:rotate(7deg)}
+.brand-word{font-family:'Inter Display','Inter',system-ui,sans-serif;font-size:23px;font-weight:800;letter-spacing:-.055em;line-height:1}
+.brand-dot{color:var(--accent)}
+
+.nav-group{display:grid;gap:3px}
+
+.nav-label{padding:0 14px 8px;margin-top:22px;font-size:10px;font-weight:800;letter-spacing:.15em;text-transform:uppercase;color:var(--soft)}
+
+.nav-btn{
+  position:relative;
+  width:100%;
+  min-height:40px;
+  display:flex;
+  align-items:center;
+  gap:12px;
+  padding:0 13px;
+  border-radius:var(--r-xs);
+  color:var(--muted);
+  font-size:13px;
+  font-weight:650;
+  text-align:left;
+  transition:background var(--dur-1) var(--ease-out),color var(--dur-1) var(--ease-out)
+}
+.nav-btn .ico{width:19px;height:19px}
+.nav-btn:hover{background:rgba(255,255,255,.05);color:var(--white)}
+.nav-btn:active{background:rgba(255,255,255,.08)}
+.nav-btn.active,
+.nav-btn[aria-current="page"]{background:var(--accent-soft);color:var(--accent-2)}
+.nav-btn.active .ico,
+.nav-btn[aria-current="page"] .ico{stroke-width:2.3}
+.nav-btn.active::before,
+.nav-btn[aria-current="page"]::before{content:'';position:absolute;left:0;top:50%;width:2px;height:16px;translate:0 -50%;border-radius:0 2px 2px 0;background:var(--accent)}
+.nav-btn span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tiny-new{margin-left:auto;padding:2px 6px;border-radius:var(--r-pill);background:rgba(255,255,255,.06);color:var(--soft);font-size:9px;font-weight:800;letter-spacing:.08em}
+
+.playlist-links{display:grid;gap:1px;min-height:0;overflow-y:auto;scrollbar-width:none}
+.playlist-links::-webkit-scrollbar{display:none}
+
+.playlist-link{
+  display:flex;
+  align-items:center;
+  gap:11px;
+  width:100%;
+  min-height:34px;
+  padding:0 14px;
+  border-radius:var(--r-xs);
+  color:var(--muted);
+  font-size:12px;
+  font-weight:600;
+  text-align:left;
+  overflow:hidden;
+  transition:background var(--dur-1) var(--ease-out),color var(--dur-1) var(--ease-out)
+}
+.playlist-link span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.playlist-link:hover{background:rgba(255,255,255,.05);color:var(--white)}
+.playlist-link.active{background:rgba(255,255,255,.07);color:var(--white)}
+.side-empty{padding:8px 14px;color:var(--soft);font-size:11.5px;line-height:1.5}
+.color-dot{width:7px;height:7px;flex:none;border-radius:50%;background:var(--dot,var(--accent));box-shadow:0 0 0 3px color-mix(in srgb,var(--dot,var(--accent)) 16%,transparent)}
+
+.sidebar-bottom{margin-top:auto;padding-top:10px}
+.create-playlist{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  width:100%;
+  min-height:42px;
+  padding:0 14px;
+  border-radius:var(--r-xs);
+  border-top:1px solid var(--line);
+  color:var(--text-2);
+  font-size:12.5px;
+  font-weight:700;
+  text-align:left;
+  transition:color var(--dur-1) var(--ease-out),background var(--dur-1) var(--ease-out)
+}
+.create-playlist:hover{color:var(--accent);background:rgba(255,255,255,.03)}
+
+.sidebar-foot{display:flex;align-items:center;gap:10px;margin:8px 4px 0;padding:10px 8px 4px;border-top:1px solid var(--line);color:var(--soft);font-size:11px;min-width:0}
+.sidebar-foot strong{display:block;font-size:12px;font-weight:700;color:var(--white);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sidebar-foot .icon-btn{margin-left:auto}
+
+.small-avatar{
+  flex:none;
+  display:grid;
+  place-items:center;
+  width:30px;
+  height:30px;
+  border-radius:50%;
+  background:linear-gradient(140deg,#d59976,#8e5c83);
+  color:#fff;
+  font-size:11px;
+  font-weight:800;
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.18)
+}
+
+/* — top bar — */
+.topbar{
+  position:sticky;
+  top:0;
+  z-index:var(--z-topbar);
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:14px;
+  height:var(--topbar-h);
+  padding:0 var(--gutter);
+  background:color-mix(in srgb,var(--bg) 88%,transparent);
+  backdrop-filter:blur(18px) saturate(140%);
+  -webkit-backdrop-filter:blur(18px) saturate(140%);
+  border-bottom:1px solid transparent;
+  transition:border-color var(--dur-1) linear
+}
+.topbar-left,
+.topbar-actions{display:flex;align-items:center;gap:6px;min-width:0}
+
+/* the wordmark replaces the (hidden) search field on phones */
+.topbar-left::before{content:'sonora.';font-family:'Inter Display','Inter',system-ui,sans-serif;font-size:22px;font-weight:800;letter-spacing:-.055em;color:var(--white);padding-right:2px}
+
+.top-search{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  height:38px;
+  width:clamp(180px,26vw,300px);
+  margin-left:8px;
+  padding:0 12px;
+  border-radius:var(--r-pill);
+  border:1px solid var(--line);
+  background:rgba(255,255,255,.035);
+  color:var(--muted);
+  font-size:12.5px;
+  text-align:left;
+  transition:background var(--dur-1) var(--ease-out),border-color var(--dur-1) var(--ease-out),color var(--dur-1) var(--ease-out)
+}
+.top-search .ico{width:16px;height:16px;opacity:.8}
+.top-search span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.top-search kbd,
+.kbd-hint{
+  margin-left:auto;
+  flex:none;
+  padding:2px 6px;
+  border-radius:5px;
+  border:1px solid var(--line-2);
+  background:rgba(255,255,255,.03);
+  color:var(--soft);
+  font-family:'Inter',system-ui,sans-serif;
+  font-size:10px;
+  font-weight:700;
+  letter-spacing:.02em;
+  white-space:nowrap
+}
+.top-search:hover{background:rgba(255,255,255,.07);border-color:var(--line-2);color:var(--white)}
+.top-search:active{background:rgba(255,255,255,.09)}
+
+.topbar .nav-arrow{width:38px;height:38px;border-radius:50%;background:rgba(255,255,255,.05);color:var(--text-2)}
+.topbar .nav-arrow:hover{background:rgba(255,255,255,.1);color:#fff}
+
+.icon-btn{
+  display:grid;
+  place-items:center;
+  width:44px;
+  height:44px;
+  border-radius:var(--r-xs);
+  background:transparent;
+  color:var(--muted);
+  transition:background var(--dur-1) var(--ease-out),color var(--dur-1) var(--ease-out),transform var(--dur-1) var(--ease-out)
+}
+.icon-btn:hover{background:rgba(255,255,255,.07);color:var(--white)}
+.icon-btn:active{transform:scale(.94)}
+.icon-btn.active,
+.icon-btn.primary{color:var(--accent)}
+.icon-btn:disabled{opacity:.35;cursor:not-allowed}
+
+.topbar-actions .icon-btn{position:relative}
+
+.notification-dot{position:absolute;top:11px;right:11px;width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 2px var(--bg)}
+
+.user-button{
+  display:flex;
+  align-items:center;
+  gap:9px;
+  height:44px;
+  padding:0 10px 0 4px;
+  border-radius:var(--r-pill);
+  background:rgba(255,255,255,.05);
+  color:var(--text-2);
+  font-size:12.5px;
+  font-weight:700;
+  min-width:0;
+  transition:background var(--dur-1) var(--ease-out),color var(--dur-1) var(--ease-out)
+}
+.user-button:hover{background:rgba(255,255,255,.09);color:#fff}
+.user-button span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:14ch}
+.user-button .small-avatar{width:28px;height:28px}
+.user-button .ico{width:13px;height:13px;color:var(--soft)}
+
+/* — right rail — */
+.rail{display:none;grid-column:3;grid-row:1;min-width:0;overflow-y:auto;padding:20px 18px 24px;background:var(--side);border-left:1px solid var(--line)}
+.rail-top{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:14px}
+.rail .rail-label{font-size:10px;font-weight:800;letter-spacing:.16em;text-transform:uppercase;color:var(--soft)}
+.rail-cover{position:relative;aspect-ratio:1;border-radius:var(--r-sm);overflow:hidden;background:var(--card-2);box-shadow:var(--shadow-2),inset 0 1px rgba(255,255,255,.08);cursor:pointer}
+.rail-cover:focus-visible{outline-offset:3px}
+.rail-cover::after{content:'';position:absolute;inset:62% 0 0;background:linear-gradient(transparent,rgba(0,0,0,.62));pointer-events:none}
+.rail-live{position:absolute;left:11px;bottom:11px;z-index:1;display:flex;align-items:center;gap:7px;color:#fff;font-size:9.5px;font-weight:800;letter-spacing:.09em}
+.live-dot{width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 3px rgba(255,153,123,.24);animation:pulse 1.9s var(--ease-out) infinite}
+.rail-track-info{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;padding:14px 0 4px}
+.rail-track-info h2{font-family:'Inter Display','Inter',system-ui,sans-serif;font-size:17px;font-weight:800;letter-spacing:-.02em;line-height:1.25;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.rail-track-info span{display:block;margin-top:4px;font-size:12px;color:var(--muted)}
+
+.waveform{display:flex;align-items:center;justify-content:center;gap:3px;height:38px;margin:8px 0 14px}
+.waveform i{width:3px;height:var(--h,10px);border-radius:var(--r-pill);background:#6f6270;opacity:.8;transform-origin:center}
+.waveform i:nth-child(-n+17){background:var(--accent);opacity:.9}
+.waveform.playing i:nth-child(3n){animation:wave 1s var(--ease-out) infinite alternate}
+.waveform.playing i:nth-child(3n+1){animation:wave 1.5s .14s var(--ease-out) infinite alternate}
+.waveform.playing i:nth-child(3n+2){animation:wave 1.2s .3s var(--ease-out) infinite alternate}
+
+.rail-divider{border-top:1px solid var(--line);margin:16px 0}
+.rail-section-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px}
+.rail-section-head strong{font-size:12px;font-weight:800}
+.rail-section-head button{color:var(--soft);font-size:11px;font-weight:700;padding:6px 2px;border-radius:4px;transition:color var(--dur-1) var(--ease-out)}
+.rail-section-head button:hover{color:var(--accent)}
+
+.queue-mini{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  width:100%;
+  min-width:0;
+  padding:6px;
+  margin:0 -6px 4px;
+  border-radius:var(--r-xs);
+  text-align:left;
+  cursor:pointer;
+  background:transparent;
+  border:0;
+  color:inherit;
+  transition:background var(--dur-1) var(--ease-out)
+}
+.queue-mini:hover{background:rgba(255,255,255,.05)}
+.queue-mini .cover{width:40px;height:40px;flex:none;border-radius:6px}
+.queue-mini .queue-text{min-width:0;flex:1}
+.queue-mini strong,
+.queue-mini span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.queue-mini strong{font-size:11.5px;font-weight:700;margin-bottom:3px}
+.queue-mini span{font-size:10.5px;color:var(--muted)}
+.queue-mini .duration{flex:none;font-size:10px;color:var(--soft)}
+.queue-mini.current{background:var(--accent-soft)}
+.queue-mini.current strong{color:var(--accent-2)}
+
+.session-card{position:relative;margin-top:18px;padding:14px;border-radius:var(--r-sm);border:1px solid var(--line);background:linear-gradient(155deg,#242028,#1b1c21);overflow:hidden}
+.session-card::before{content:'';position:absolute;top:-58px;right:-46px;width:132px;height:132px;border-radius:50%;background:rgba(255,153,123,.16);filter:blur(12px);pointer-events:none}
+.session-card .eyebrow{color:var(--accent-2);position:relative}
+.session-card .session-title{position:relative;margin:7px 0 6px;font-size:13px;font-weight:800;letter-spacing:-.01em}
+.session-card p{position:relative;color:var(--muted);font-size:11.5px;line-height:1.6}
+
+/* — mobile bottom nav — */
+.mobile-nav{
+  grid-column:1;
+  grid-row:3;
+  display:grid;
+  grid-auto-flow:column;
+  grid-auto-columns:1fr;
+  height:calc(67px + var(--sab));
+  padding:2px 4px var(--sab);
+  background:var(--side);
+  border-top:1px solid var(--line)
+}
+.mobile-nav button{
+  position:relative;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  justify-content:center;
+  gap:3px;
+  min-width:0;
+  min-height:44px;
+  padding:6px 2px;
+  border-radius:var(--r-xs);
+  color:var(--soft);
+  font-size:9.5px;
+  font-weight:700;
+  letter-spacing:.01em;
+  transition:color var(--dur-1) var(--ease-out)
+}
+.mobile-nav button span{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mobile-nav .ico{width:22px;height:22px;transition:transform var(--dur-2) var(--ease-spring)}
+.mobile-nav button:active .ico{transform:scale(.9)}
+.mobile-nav button.active,
+.mobile-nav button[aria-current="page"]{color:var(--accent)}
+.mobile-nav button.active::after,
+.mobile-nav button[aria-current="page"]::after{content:'';position:absolute;top:0;left:50%;width:18px;height:2px;translate:-50% 0;border-radius:0 0 2px 2px;background:var(--accent)}
+
+
+/* ── 05 player ──────────────────────────────────────────────────────────────
+   Phones get a flush bar with a progress hairline; from 651px it becomes the
+   three-column console (now playing | transport | output). */
+.player{
+  grid-column:1/-1;
+  grid-row:2;
+  position:relative;
+  z-index:var(--z-player);
+  display:flex;
+  align-items:center;
+  gap:10px;
+  min-width:0;
+  padding:0 12px;
+  background:var(--panel);
+  border-top:1px solid var(--line-2);
+  box-shadow:0 -6px 24px rgba(0,0,0,.28)
+}
+
+/* progress is its own element now (was a pseudo-element of the bar) */
+.mini-progress{position:absolute;top:0;left:0;right:0;height:2px;background:rgba(255,255,255,.09);overflow:hidden;pointer-events:none}
+.mini-progress i{display:block;height:100%;width:var(--progress,0%);background:var(--accent);border-radius:0 2px 2px 0;transition:width 240ms linear}
+
+.player-song{display:flex;align-items:center;gap:11px;min-width:0;flex:1;overflow:hidden}
+.player-cover{
+  width:46px;
+  height:46px;
+  min-width:44px;
+  min-height:44px;
+  flex:none;
+  overflow:hidden;
+  border-radius:var(--r-xs);
+  background:var(--card-2);
+  cursor:pointer;
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.06);
+  display:grid;
+  place-items:center;
+  color:var(--soft)
+}
+.player-song-meta{
+  display:flex;
+  flex-direction:column;
+  justify-content:center;
+  align-items:flex-start;
+  min-height:44px;
+  min-width:0;
+  flex:0 1 auto;
+  max-width:min(30ch,62%);
+  padding:0;
+  background:none;
+  text-align:left;
+  cursor:pointer;
+}
+.player-song-meta strong,
+.player-song-meta span{display:block;width:100%;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.player-song-meta strong{font-size:12.5px;font-weight:700;letter-spacing:-.01em}
+.player-song-meta span{margin-top:2px;color:var(--muted);font-size:11px}
+.player-like{flex:none;width:40px;height:40px}
+.player-dislike{flex:none;width:40px;height:40px}
+.player-cover-empty{color:var(--soft)}
+.player-cover-empty .ico{width:20px;height:20px}
+.player.is-playing .mini-progress i{box-shadow:0 0 8px rgba(255,153,123,.55)}
+.player.is-playing .player-cover{box-shadow:inset 0 0 0 1px rgba(255,153,123,.28)}
+.player.is-empty .player-song-meta strong{color:var(--text-2)}
+.player.is-empty .player-song-meta span{color:var(--soft)}
+
+/* transport: phones get play/next only; the full row arrives at 651px */
+.player-center,
+.player-extras{display:none}
+
+.mobile-player-control{display:flex;align-items:center;gap:2px;flex:none}
+.mobile-player-control button{
+  display:grid;
+  place-items:center;
+  width:44px;
+  height:44px;
+  border-radius:50%;
+  background:transparent;
+  color:var(--white);
+  transition:background var(--dur-1) var(--ease-out),transform var(--dur-1) var(--ease-out)
+}
+.mobile-player-control button:hover{background:rgba(255,255,255,.08)}
+.mobile-player-control button:active{transform:scale(.92);background:rgba(255,255,255,.12)}
+.mobile-player-control .ico{width:22px;height:22px}
+
+.player-controls{display:flex;align-items:center;justify-content:center;gap:14px}
+.player-controls button{
+  display:grid;
+  place-items:center;
+  width:36px;
+  height:36px;
+  border-radius:50%;
+  background:transparent;
+  color:var(--muted);
+  transition:color var(--dur-1) var(--ease-out),background var(--dur-1) var(--ease-out),transform var(--dur-1) var(--ease-out)
+}
+.player-controls button:hover{color:var(--white);background:rgba(255,255,255,.06)}
+.player-controls button:active{transform:scale(.93)}
+.player-controls button.on{color:var(--accent)}
+
+/* transport buttons (shared by the player bar and the now-playing sheet) */
+.ctrl{
+  display:grid;
+  place-items:center;
+  width:44px;
+  height:44px;
+  border-radius:50%;
+  background:transparent;
+  color:var(--muted);
+  transition:color var(--dur-1) var(--ease-out),background var(--dur-1) var(--ease-out),transform var(--dur-1) var(--ease-out)
+}
+.ctrl:hover{color:var(--white);background:rgba(255,255,255,.06)}
+.ctrl:active{transform:scale(.93)}
+.ctrl.on{color:var(--accent)}
+.ctrl:disabled{opacity:.4;cursor:not-allowed;transform:none}
+.ctrl .ico{width:19px;height:19px}
+/* One primary transport colour across the whole app: the bar's play button is
+   the same coral as the sheet's, so "this is the play button" never has to be
+   relearned between surfaces. */
+.player-controls .main-toggle{
+  width:40px;
+  height:40px;
+  background:var(--accent);
+  color:var(--accent-ink);
+  box-shadow:0 4px 14px rgba(233,130,97,.28),inset 0 1px rgba(255,255,255,.3)
+}
+.player-controls .main-toggle:hover{background:var(--accent-2)}
+.player-controls .ico{width:18px;height:18px}
+.player-controls .main-toggle .ico{width:17px;height:17px}
+
+.timebar{display:flex;align-items:center;gap:10px;width:100%}
+.timebar span{flex:none;font-size:10.5px;color:var(--soft)}
+
+/* range inputs: a warm track, a filled progress segment, a thumb on hover */
+.range{
+  appearance:none;
+  -webkit-appearance:none;
+  width:100%;
+  height:44px;                     /* 44px hit area, 4px visual track */
+  background:transparent;
+  cursor:pointer;
+  outline:0;
+  --percent:0%
+}
+/* the unfilled track is deliberately visible on a phone screen in daylight:
+   .16 white read as "no bar at all" against the warm charcoal */
+.range::-webkit-slider-runnable-track{height:4px;border-radius:var(--r-pill);background:linear-gradient(90deg,var(--accent) var(--percent),rgba(255,255,255,.26) var(--percent))}
+.range::-moz-range-track{height:4px;border-radius:var(--r-pill);background:rgba(255,255,255,.26)}
+.range::-moz-range-progress{height:4px;border-radius:var(--r-pill);background:var(--accent)}
+.range::-webkit-slider-thumb{
+  -webkit-appearance:none;
+  width:12px;
+  height:12px;
+  margin-top:-4px;
+  border-radius:50%;
+  background:#fff;
+  box-shadow:0 1px 4px rgba(0,0,0,.5);
+  opacity:0;
+  transition:opacity var(--dur-1) var(--ease-out)
+}
+.range::-moz-range-thumb{width:12px;height:12px;border:0;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.5)}
+.range:hover::-webkit-slider-thumb,
+.range:focus-visible::-webkit-slider-thumb{opacity:1}
+/* Touch has no hover, so the thumb would never appear: show it permanently
+   there, slightly larger, so the scrubber reads as draggable. */
+@media (hover:none), (pointer:coarse){
+  .range::-webkit-slider-thumb{opacity:1;width:14px;height:14px;margin-top:-5px}
+}
+
+/* ── the 44px floor is a POINTER rule, not a width rule ──────────────────
+   A 844x390 landscape phone is wider than 650px but still a thumb. Anything
+   that the width-based rules relaxed to 40px for a mouse is restored here. */
+.range:focus-visible{outline:2px solid color-mix(in srgb,var(--accent) 75%,white);outline-offset:6px;border-radius:var(--r-pill)}
+
+.volume-group{display:flex;align-items:center;gap:6px}
+.volume-group .range{width:88px}
+
+
+/* ── 06 controls & forms ────────────────────────────────────────────────────
+   One button vocabulary: coral primary, quiet secondary, ghost, and the round
+   icon actions. Every one of them has hover, active and disabled states. */
+.play-btn,
+.btn-primary{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  gap:8px;
+  min-height:44px;
+  padding:0 20px;
+  border-radius:var(--r-pill);
+  background:var(--accent);
+  color:var(--accent-ink);
+  font-size:13px;
+  font-weight:800;
+  letter-spacing:-.005em;
+  white-space:nowrap;
+  box-shadow:var(--shadow-accent),inset 0 1px rgba(255,255,255,.32);
+  transition:background var(--dur-1) var(--ease-out),transform var(--dur-1) var(--ease-out),box-shadow var(--dur-1) var(--ease-out)
+}
+.play-btn svg,
+.btn-primary svg{width:17px;height:17px}
+.play-btn:hover,
+.btn-primary:hover{background:var(--accent-2);transform:translateY(-1px);box-shadow:0 12px 30px rgba(233,130,97,.32),inset 0 1px rgba(255,255,255,.35)}
+.play-btn:active,
+.btn-primary:active{transform:translateY(0) scale(.985);box-shadow:0 4px 14px rgba(233,130,97,.25)}
+.play-btn:disabled,
+.btn-primary:disabled{background:var(--card-3);color:var(--soft);box-shadow:none;cursor:not-allowed;transform:none}
+/* destructive confirm: same shape, red ink, still a primary action */
+.play-btn.danger,
+.btn-primary.danger{background:#e5675f;color:#2a1113;box-shadow:0 8px 26px rgba(229,103,95,.26),inset 0 1px rgba(255,255,255,.28)}
+.play-btn.danger:hover,
+.btn-primary.danger:hover{background:#f0796f}
+
+.secondary-btn,
+.btn-ghost{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  gap:8px;
+  min-height:44px;
+  padding:0 17px;
+  border-radius:var(--r-pill);
+  border:1px solid var(--line-2);
+  background:rgba(255,255,255,.045);
+  color:var(--white);
+  font-size:12.5px;
+  font-weight:700;
+  white-space:nowrap;
+  transition:background var(--dur-1) var(--ease-out),border-color var(--dur-1) var(--ease-out),transform var(--dur-1) var(--ease-out)
+}
+.secondary-btn svg{width:15px;height:15px}
+.secondary-btn:hover,
+.btn-ghost:hover{background:rgba(255,255,255,.1);border-color:var(--line-3)}
+.secondary-btn:active,
+.btn-ghost:active{transform:scale(.985)}
+.secondary-btn:disabled{opacity:.45;cursor:not-allowed}
+.secondary-btn.danger{color:var(--bad);border-color:rgba(255,154,154,.32);background:var(--bad-soft)}
+.secondary-btn.danger:hover{background:rgba(255,154,154,.2)}
+
+.btn-ghost{background:transparent;border-color:transparent;color:var(--muted)}
+.btn-ghost:hover{color:var(--white);background:rgba(255,255,255,.07)}
+
+.circle-action{
+  display:grid;
+  place-items:center;
+  width:44px;
+  height:44px;
+  border-radius:50%;
+  border:1px solid var(--line-2);
+  background:transparent;
+  color:var(--text-2);
+  transition:color var(--dur-1) var(--ease-out),border-color var(--dur-1) var(--ease-out),background var(--dur-1) var(--ease-out)
+}
+.circle-action:hover,
+.circle-action.active{color:var(--accent);border-color:var(--accent-line);background:var(--accent-soft)}
+
+.text-link{
+  display:inline-flex;
+  align-items:center;
+  gap:5px;
+  min-height:44px;
+  padding:0 2px;
+  color:var(--muted);
+  background:transparent;
+  font-size:11.5px;
+  font-weight:800;
+  letter-spacing:.005em;
+  white-space:nowrap;
+  transition:color var(--dur-1) var(--ease-out)
+}
+.text-link:hover{color:var(--accent)}
+.text-link .ico{width:14px;height:14px;transition:transform var(--dur-2) var(--ease-out)}
+.text-link:hover .ico{transform:translateX(2px)}
+
+.big-play{
+  display:grid;
+  place-items:center;
+  width:58px;
+  height:58px;
+  border-radius:50%;
+  /* the transport's primary action is the brand colour, everywhere: a white
+     disc here read as a different, unrelated control */
+  background:var(--accent);
+  color:var(--accent-ink);
+  box-shadow:0 6px 18px rgba(233,130,97,.22),0 1px 2px rgba(0,0,0,.3),inset 0 1px rgba(255,255,255,.28);
+  transition:background var(--dur-1) var(--ease-out),transform var(--dur-2) var(--ease-spring),box-shadow var(--dur-2) var(--ease-out)
+}
+.big-play:hover{background:var(--accent-2);box-shadow:0 8px 22px rgba(233,130,97,.3),0 1px 2px rgba(0,0,0,.3),inset 0 1px rgba(255,255,255,.36)}
+.big-play:active{transform:scale(.94)}
+
+/* like affordance shared by track rows and the player */
+.like-row{
+  display:grid;
+  place-items:center;
+  width:44px;
+  height:44px;
+  border-radius:50%;
+  background:transparent;
+  color:var(--soft);
+  transition:color var(--dur-1) var(--ease-out),background var(--dur-1) var(--ease-out),transform var(--dur-2) var(--ease-spring)
+}
+.like-row:hover{color:var(--white);background:rgba(255,255,255,.06)}
+.like-row.liked{color:var(--accent)}
+.like-row svg{width:16px;height:16px}
+.like-row.liked svg{fill:currentColor;animation:heart-pop var(--dur-3) var(--ease-spring)}
+
+/* "less like this" — quieter than the heart when off, unmistakable when on. A
+   dislike is a standing instruction, so the on state is a filled mark, not an
+   accent colour: it should read as a decision, not as praise. */
+.dislike-row{color:var(--soft);opacity:.55;transition:color var(--dur-1) var(--ease-out),opacity var(--dur-1) var(--ease-out)}
+.track-row:hover .dislike-row,
+.track-row:focus-within .dislike-row,
+.dislike-row:focus-visible{opacity:1}
+.dislike-row:hover{color:var(--white);background:rgba(255,255,255,.06)}
+.dislike-row.is-disliked{color:var(--bad);opacity:1}
+.dislike-row.is-disliked svg{fill:currentColor}
+.icon-btn.is-disliked{color:var(--bad)}
+.icon-btn.is-disliked svg{fill:currentColor}
+
+/* chips — moods, admin tabs, filters */
+.chips{display:flex;flex-wrap:wrap;gap:7px;min-width:0}
+/* A chip strip with more items than fit (admin sections, search filters) turns
+   into a single swipeable row instead of clipping an unreachable control. */
+.chips.scroll{flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden;scrollbar-width:none;-webkit-overflow-scrolling:touch;scroll-snap-type:x proximity;padding-bottom:2px}
+.chips.scroll::-webkit-scrollbar{display:none}
+/* fade the right edge so a clipped chip reads as "swipe me", not "broken" */
+.chips.scroll{-webkit-mask-image:linear-gradient(to right,#000 calc(100% - 26px),transparent);mask-image:linear-gradient(to right,#000 calc(100% - 26px),transparent)}
+.chips.scroll > *{scroll-snap-align:start;flex:0 0 auto}
+.chip{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  min-height:44px;
+  padding:0 15px;
+  border-radius:var(--r-pill);
+  border:1px solid var(--line-2);
+  background:rgba(255,255,255,.035);
+  color:var(--text-2);
+  font-size:12px;
+  font-weight:700;
+  white-space:nowrap;
+  transition:background var(--dur-1) var(--ease-out),color var(--dur-1) var(--ease-out),border-color var(--dur-1) var(--ease-out)
+}
+.chip:hover{background:rgba(255,255,255,.09);color:#fff}
+.chip.selected{background:#f2eae4;border-color:#f2eae4;color:#221f22}
+.chip.selected:hover{background:#fff}
+.chip.small{min-height:36px;padding:0 12px;font-size:11.5px}
+.chip.ghost{border-color:transparent;background:transparent;color:var(--soft);text-decoration:underline;text-underline-offset:3px}
+.chip.ghost:hover{color:var(--white);background:rgba(255,255,255,.06)}
+
+/* segmented control — the library/player tab bars */
+.segmented{display:flex;gap:2px;padding:3px;border-radius:var(--r-pill);border:1px solid var(--line);background:rgba(255,255,255,.04);max-width:100%;overflow-x:auto;scrollbar-width:none}
+.segmented::-webkit-scrollbar{display:none}
+.segment{
+  flex:0 0 auto;
+  min-height:44px;
+  padding:0 16px;
+  border-radius:var(--r-pill);
+  background:transparent;
+  color:var(--muted);
+  font-size:12.5px;
+  font-weight:700;
+  white-space:nowrap;
+  transition:background var(--dur-1) var(--ease-out),color var(--dur-1) var(--ease-out)
+}
+.segment:hover{color:var(--white)}
+.segment.is-active,
+.segment[aria-selected="true"]{
+  background:var(--card-2);
+  color:var(--white);
+  box-shadow:inset 0 1px rgba(255,255,255,.08),0 1px 3px rgba(0,0,0,.35);
+  animation:segment-in var(--dur-2) var(--ease-out) both
+}
+
+/* forms */
+.field{display:grid;gap:7px;margin-bottom:14px}
+.field label{font-size:10.5px;font-weight:800;letter-spacing:.09em;text-transform:uppercase;color:var(--soft)}
+.field input,
+.field textarea,
+.field select{
+  width:100%;
+  min-height:50px;
+  padding:0 14px;
+  border-radius:var(--r-sm);
+  border:1px solid var(--line-2);
+  background:rgba(255,255,255,.04);
+  color:var(--white);
+  /* 16px on touch layouts — anything smaller makes iOS zoom the viewport */
+  font-size:16px;
+  transition:border-color var(--dur-1) var(--ease-out),background var(--dur-1) var(--ease-out)
+}
+.field input::placeholder,
+.field textarea::placeholder{color:var(--soft)}
+.field input:focus,
+.field textarea:focus,
+.field select:focus{outline:none;border-color:var(--accent-line);background:rgba(255,255,255,.06)}
+.field-error input,
+.field.has-error input{border-color:rgba(255,154,154,.55)}
+
+.field-hint{font-size:11.5px;line-height:1.5;color:var(--soft)}
+.field-error{font-size:11.5px;line-height:1.5;color:var(--bad)}
+
+.form-sheet{
+  display:grid;
+  gap:2px;
+  width:min(520px,100%);
+  max-height:calc(100dvh - 40px);
+  overflow-y:auto;
+  padding:22px;
+  border-radius:var(--r-lg);
+  border:1px solid var(--line-2);
+  background:linear-gradient(160deg,#212227,#17181d 70%);
+  box-shadow:var(--shadow-3),inset 0 1px rgba(255,255,255,.07)
+}
+.form-sheet h2{font-family:'Inter Display','Inter',system-ui,sans-serif;font-size:20px;font-weight:800;letter-spacing:-.02em;margin-bottom:4px}
+.form-sheet .form-lede{color:var(--muted);font-size:12.5px;line-height:1.6;margin-bottom:16px}
+.form-row{display:grid;gap:7px;margin-bottom:14px}
+.form-row > label{font-size:10.5px;font-weight:800;letter-spacing:.09em;text-transform:uppercase;color:var(--soft)}
+.form-actions{display:flex;align-items:center;justify-content:flex-end;gap:9px;margin-top:6px}
+.form-actions .play-btn,
+.form-actions .secondary-btn{min-width:96px}
+
+/* dialog bodies (create playlist, confirm, add-to-playlist, shortcuts) live in
+   a .now-modal.form-sheet, so they are exempt from the full-screen sheet */
+.now-modal.form-sheet{
+  display:flex;
+  flex-direction:column;
+  gap:0;
+  width:min(470px,100%);
+  height:auto;
+  max-height:calc(100dvh - 32px);
+  padding:24px 20px calc(20px + var(--sab,0px));
+  align-self:end;
+  border-radius:var(--r-lg) var(--r-lg) 0 0;
+  border:1px solid var(--line-2);
+  border-bottom:0;
+  background:linear-gradient(170deg,#22232a,#16171c 74%);
+  box-shadow:var(--shadow-3),inset 0 1px rgba(255,255,255,.07);
+  overflow-y:auto;
+  overscroll-behavior:contain
+}
+.now-modal.form-sheet .modal-close{position:absolute;top:10px;right:10px;width:44px;height:44px}
+.form-body{display:grid;gap:2px;align-content:start;min-width:0}
+.form-body .eyebrow{color:var(--accent);font-size:9.5px}
+.form-body h2{font-family:'Inter Display','Inter',system-ui,sans-serif;font-size:21px;font-weight:800;letter-spacing:-.025em;margin:5px 0 0;overflow-wrap:anywhere}
+.form-desc{margin-top:6px;color:var(--muted);font-size:12.5px;line-height:1.6}
+.form-body form{display:grid;gap:0;margin-top:12px}
+.form-body input,
+.form-body select,
+.form-body textarea{
+  width:100%;
+  min-height:50px;
+  padding:0 14px;
+  margin-top:10px;
+  border-radius:var(--r-sm);
+  border:1px solid var(--line-2);
+  background:rgba(255,255,255,.05);
+  color:var(--white);
+  font-size:16px;
+  outline:none;
+  transition:border-color var(--dur-1) var(--ease-out),background var(--dur-1) var(--ease-out)
+}
+.form-body input:focus,
+.form-body textarea:focus{border-color:var(--accent-line);background:rgba(255,255,255,.07)}
+.form-body .field-hint{margin-top:8px}
+.form-body .field-error{margin-top:8px}
+.form-body .field-error:empty{display:none}
+.form-body .form-actions{margin-top:16px}
+
+/* settings sheet — one labelled toggle per preference. The whole row is the
+   label, so the target is the row, not a 24px box. */
+.pref-list{display:grid;gap:6px;margin-top:12px}
+.pref-row{
+  display:flex;
+  align-items:flex-start;
+  gap:12px;
+  min-height:56px;
+  padding:11px 12px;
+  border-radius:var(--r-sm);
+  border:1px solid var(--line);
+  background:rgba(255,255,255,.03);
+  cursor:pointer;
+  transition:background var(--dur-1) var(--ease-out),border-color var(--dur-1) var(--ease-out)
+}
+.pref-row:hover{background:rgba(255,255,255,.055)}
+.pref-row:focus-within{border-color:var(--accent-line)}
+/* A custom-drawn checkbox: the generic `.form-body input` sizing would make it
+   a 50px text field, and the native control ignores the sheet's palette. */
+.pref-row input[type="checkbox"]{
+  appearance:none;
+  display:grid;
+  place-content:center;
+  flex:none;
+  width:24px;
+  height:24px;
+  min-height:0;
+  margin:1px 0 0;
+  padding:0;
+  border-radius:7px;
+  border:1px solid var(--line-2);
+  background:rgba(255,255,255,.05);
+  cursor:pointer;
+  transition:background var(--dur-1) var(--ease-out),border-color var(--dur-1) var(--ease-out)
+}
+.pref-row input[type="checkbox"]::after{
+  content:'';
+  width:12px;
+  height:7px;
+  border-left:2px solid var(--accent-ink);
+  border-bottom:2px solid var(--accent-ink);
+  rotate:-45deg;
+  translate:0 -1px;
+  scale:0;
+  transition:scale var(--dur-1) var(--ease-out)
+}
+.pref-row input[type="checkbox"]:checked{background:var(--accent);border-color:var(--accent)}
+.pref-row input[type="checkbox"]:checked::after{scale:1}
+/* `.form-body input` clears the outline for text fields, and it is declared
+   later than the global `:focus-visible` ring, so the checkbox has to ask for
+   its ring explicitly or it would be the one unreachable-by-keyboard control. */
+.pref-row input[type="checkbox"]:focus-visible{
+  outline:2px solid color-mix(in srgb, var(--accent) 75%, white);
+  outline-offset:2px
+}
+.pref-copy{display:grid;gap:3px;min-width:0}
+.pref-copy strong{font-size:13px;font-weight:650;color:var(--white);line-height:1.35}
+.pref-copy small{font-size:11.5px;line-height:1.5;color:var(--muted)}
+
+/* keyboard cheat-sheet */
+.shortcut-list{display:grid;gap:1px;margin-top:12px}
+.shortcut-list > div{display:flex;align-items:center;gap:6px;padding:9px 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:12px;color:var(--text-2)}
+.shortcut-list > div:last-child{border-bottom:0}
+.shortcut-list kbd{
+  min-width:26px;
+  padding:3px 7px;
+  border-radius:6px;
+  border:1px solid var(--line-2);
+  border-bottom-width:2px;
+  background:rgba(255,255,255,.05);
+  color:var(--white);
+  font-family:'Inter',system-ui,sans-serif;
+  font-size:10.5px;
+  font-weight:700;
+  text-align:center
+}
+.shortcut-list span{margin-left:auto;color:var(--muted);font-size:11.5px}
+
+/* playlist picker */
+.pick-list{display:grid;gap:2px;margin-top:12px}
+.pick-row{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  width:100%;
+  min-height:46px;
+  padding:0 10px;
+  border-radius:var(--r-xs);
+  background:transparent;
+  color:var(--text-2);
+  font-size:12.5px;
+  font-weight:650;
+  text-align:left;
+  transition:background var(--dur-1) var(--ease-out),color var(--dur-1) var(--ease-out)
+}
+.pick-row:hover{background:rgba(255,255,255,.07);color:#fff}
+.pick-row .ico{color:var(--accent);flex:none}
+.pick-row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pick-row small{margin-left:auto;color:var(--soft);font-size:10.5px;font-weight:600}
+
+/* spinner for any button that is mid-request */
+.btn-loading{position:relative;color:transparent;pointer-events:none}
+.btn-loading:hover{color:transparent}
+.btn-loading::after{
+  content:'';
+  position:absolute;
+  width:15px;
+  height:15px;
+  border-radius:50%;
+  border:2px solid rgba(0,0,0,.22);
+  border-top-color:rgba(0,0,0,.7);
+  animation:spin .7s linear infinite
+}
+.secondary-btn.btn-loading::after{border-color:rgba(255,255,255,.25);border-top-color:#fff}
+
+.spinner{
+  display:inline-block;
+  width:14px;
+  height:14px;
+  margin-right:8px;
+  vertical-align:-2px;
+  border-radius:50%;
+  border:2px solid rgba(255,255,255,.22);
+  border-top-color:#fff;
+  animation:spin .7s linear infinite
+}
+
+
+/* ── 07 home ───────────────────────────────────────────────────────────────── */
+.page-head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin:10px 0 18px;flex-wrap:wrap}
+.page-overline{display:block;margin-bottom:6px;color:var(--accent);font-size:10px;font-weight:800;letter-spacing:.16em;text-transform:uppercase}
+.page-title{font-size:clamp(26px,7.4vw,30px);line-height:1.1}
+.date-text{color:var(--soft);font-size:12px;display:none}
+
+.section-head{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:24px 0 14px}
+.section-head h2{font-size:17px;line-height:1.2}
+.section-head p{margin-top:4px;color:var(--soft);font-size:11.5px}
+
+/* hero — the one place we allow a gradient wash */
+.hero{
+  position:relative;
+  isolation:isolate;
+  overflow:hidden;
+  width:100%;
+  min-height:340px;
+  border-radius:var(--r-md);
+  border:1px solid var(--line);
+  background:
+    radial-gradient(ellipse at 74% 30%,rgba(111,78,134,.95) 0%,transparent 46%),
+    linear-gradient(112deg,#282030 8%,#3b2542 58%,#63495f 100%);
+  box-shadow:inset 0 1px rgba(255,255,255,.09),var(--shadow-2)
+}
+.hero-content{position:relative;z-index:2;display:flex;flex-direction:column;align-items:flex-start;height:100%;min-height:340px;max-width:100%;padding:22px}
+.hero-tag{display:flex;align-items:center;gap:9px;color:#e9dbe1;font-size:9.5px;font-weight:800;letter-spacing:.15em}
+.hero-tag::before{content:'';width:20px;height:1px;background:var(--accent)}
+.hero h1{margin:20px 0 10px;max-width:330px;font-size:clamp(30px,8.6vw,38px);line-height:1.03;letter-spacing:-.045em;text-wrap:balance}
+.hero h1 em{font-style:normal;color:var(--accent-2)}
+.hero p{max-width:280px;color:#e0d4e1;font-size:11.5px;line-height:1.65}
+.hero-footer{display:flex;align-items:center;gap:9px;margin-top:auto;padding-top:22px;flex-wrap:wrap}
+.hero-footer .hero-meta{margin-left:2px;color:#e6dae4;font-size:10px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hero-art{position:absolute;inset:28% -34% -8% 4%;z-index:0;opacity:.92;pointer-events:none}
+.hero-orb{
+  position:absolute;
+  top:6%;
+  right:0;
+  width:min(330px,86vw);
+  height:min(330px,86vw);
+  border-radius:50%;
+  background:radial-gradient(circle at 32% 30%,#ffe2c5 0%,#fea58d 22%,#bf6493 44%,#513869 72%,#281d3f 100%);
+  box-shadow:-18px 18px 70px rgba(24,16,28,.55),0 0 70px rgba(255,175,155,.32);
+  transform:rotate(-20deg)
+}
+.hero-orb::before{
+  content:'';
+  position:absolute;
+  inset:0;
+  border-radius:50%;
+  background:repeating-radial-gradient(circle at 50% 51%,transparent 0 9px,rgba(255,255,255,.14) 10px 11px);
+  mix-blend-mode:soft-light;
+  opacity:.8
+}
+.hero-art .ring{
+  position:absolute;
+  top:-30%;
+  right:-24%;
+  width:min(560px,150vw);
+  height:min(560px,150vw);
+  border:1px solid rgba(255,225,201,.25);
+  border-radius:50%;
+  transform:rotate(-23deg) scaleY(.78)
+}
+.hero-art .ring.r2{width:min(640px,170vw);height:min(640px,170vw);border-color:rgba(255,210,195,.18);right:-27%;top:-34%}
+.hero-art .ring.r3{width:min(730px,190vw);height:min(730px,190vw);border-color:rgba(255,221,213,.13);right:-30%;top:-40%}
+.hero-fade{position:absolute;inset:0;z-index:1;pointer-events:none;background:linear-gradient(180deg,rgba(40,32,49,.92),rgba(41,32,48,.55) 46%,transparent 92%)}
+.hero-noise{
+  position:absolute;
+  inset:0;
+  z-index:2;
+  opacity:.16;
+  pointer-events:none;
+  background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.6' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.44'/%3E%3C/svg%3E")
+}
+
+/* quick tiles */
+.quick-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.quick-card{
+  position:relative;
+  display:flex;
+  align-items:center;
+  gap:10px;
+  height:58px;
+  padding:0;
+  border-radius:var(--r-xs);
+  border:1px solid var(--line);
+  background:var(--card);
+  color:var(--white);
+  text-align:left;
+  overflow:hidden;
+  transition:background var(--dur-1) var(--ease-out),transform var(--dur-1) var(--ease-out)
+}
+.quick-card:hover{background:var(--card-2);transform:translateY(-1px)}
+.quick-card:active{transform:translateY(0) scale(.995)}
+.quick-card .cover{width:58px;height:58px;flex:none;border-radius:0;box-shadow:inset -1px 0 rgba(0,0,0,.35)}
+.quick-title{padding:0 8px;font-size:11.5px;font-weight:700;line-height:1.3;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow-wrap:anywhere}
+.quick-card .mini-play{display:none}
+
+/* card grids */
+.card-grid,
+.library-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.music-card{display:block;position:relative;min-width:0;padding:0;background:transparent;color:var(--white);text-align:left}
+.cover-wrap{
+  position:relative;
+  aspect-ratio:1;
+  border-radius:var(--r-sm);
+  overflow:hidden;
+  background:var(--card-2);
+  border:1px solid var(--line);
+  box-shadow:var(--shadow-1),inset 0 1px rgba(255,255,255,.09)
+}
+.music-card .cover{border-radius:inherit;transition:transform var(--dur-3) var(--ease-out)}
+.music-card:hover .cover{transform:scale(1.045)}
+.music-card:active .cover-wrap{border-color:var(--line-3)}
+.cover-play{
+  position:absolute;
+  right:9px;
+  bottom:9px;
+  display:grid;
+  place-items:center;
+  width:40px;
+  height:40px;
+  border-radius:50%;
+  background:var(--accent);
+  color:var(--accent-ink);
+  opacity:0;
+  transform:translateY(6px);
+  box-shadow:0 8px 20px rgba(0,0,0,.45);
+  transition:opacity var(--dur-2) var(--ease-out),transform var(--dur-2) var(--ease-out)
+}
+.music-card:hover .cover-play,
+.music-card:focus-visible .cover-play{opacity:1;transform:none}
+.cover-play svg{width:16px;height:16px}
+.music-card-title{margin:9px 0 3px;font-size:12.5px;letter-spacing:-.015em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.music-card-sub{color:var(--soft);font-size:11px;line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.cover{object-fit:cover;background:var(--card-2)}
+/* placeholder when a track has no artwork (cover() renders a span, not an img).
+   It has to fill the box an <img> would have occupied: the parent decides the
+   size (aspect-ratio in card grids, fixed px in rows and the player). */
+.cover-empty{
+  display:grid;
+  place-items:center;
+  width:100%;
+  height:100%;
+  aspect-ratio:1;
+  background:
+    radial-gradient(circle at 28% 20%,rgba(255,153,123,.16),transparent 62%),
+    linear-gradient(150deg,var(--card-2),var(--panel));
+  color:rgba(255,255,255,.32)
+}
+.cover-empty .ico{width:24px;height:24px;max-width:45%;stroke-width:1.5}
+/* A dead image (artwork proxy rate-limited, or a deleted video) is repointed at
+   a transparent pixel in JS and painted as the waveform placeholder here, so a
+   grid of failures still reads as "no artwork yet" and never as a broken page. */
+img.is-broken{
+  background:
+    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='rgba(255,255,255,.3)' stroke-width='1.6' stroke-linecap='round'><path d='M2 9v6m4-10v14m4-16v18m4-14v10m4-13v16m4-11v6'/></svg>") center/26% no-repeat,
+    radial-gradient(circle at 28% 20%,rgba(255,153,123,.16),transparent 62%),
+    linear-gradient(150deg,var(--card-2),var(--panel))
+}
+/* In a composed collage a broken cover is not "faded artwork", it is a hole. Hide
+   it so the remaining covers reflow instead of leaving an empty frame. */
+.station-hero-art .cover.is-broken,
+.station-card-art .cover.is-broken{display:none}
+.artist-avatar,
+.artist-wrap{border-radius:50%}
+
+/* wide feature (discovery teaser) */
+.wide-feature{
+  display:flex;
+  align-items:center;
+  gap:14px;
+  padding:12px;
+  border-radius:var(--r-sm);
+  border:1px solid var(--line);
+  background:linear-gradient(100deg,#29242b,#1c1d22);
+  box-shadow:inset 0 1px rgba(255,255,255,.05)
+}
+.wide-feature .cover{width:86px;height:86px;flex:none;border-radius:var(--r-xs)}
+.wide-feature .eyebrow{color:var(--accent-2)}
+.wide-feature h3{margin:6px 0 4px;font-family:'Inter Display','Inter',system-ui,sans-serif;font-size:15px;font-weight:800;letter-spacing:-.02em;line-height:1.25}
+.wide-feature p{color:var(--muted);font-size:11px;line-height:1.55;margin-bottom:8px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.wide-feature button{display:inline-flex;align-items:center;gap:5px;min-height:44px;color:var(--accent-2);background:transparent;font-size:11.5px;font-weight:800}
+.wide-feature button:hover{color:var(--accent)}
+
+.intro-note{color:var(--muted);font-size:12.5px;line-height:1.6;margin:8px 0 18px}
+
+
+/* ── 08 search ─────────────────────────────────────────────────────────────── */
+.search-shell{display:grid;grid-template-columns:minmax(0,1fr);gap:12px;margin-bottom:16px}
+.search-box{
+  display:flex;
+  align-items:center;
+  gap:12px;
+  width:100%;
+  max-width:720px;
+  height:52px;
+  padding:0 14px;
+  border-radius:var(--r-sm);
+  border:1px solid var(--line-2);
+  background:rgba(255,255,255,.045);
+  color:var(--muted);
+  transition:border-color var(--dur-1) var(--ease-out),background var(--dur-1) var(--ease-out)
+}
+.search-box:focus-within{border-color:var(--accent-line);background:rgba(255,255,255,.07)}
+.search-box .ico{width:18px;height:18px;flex:none}
+.search-box input{
+  flex:1;
+  min-width:0;
+  height:100%;
+  border:0;
+  background:transparent;
+  color:var(--white);
+  /* 16px: below this iOS zooms on focus */
+  font-size:16px;
+  outline:none
+}
+.search-box input::placeholder{color:var(--soft)}
+.search-box input::-webkit-search-cancel-button{display:none}
+.search-clear{
+  display:grid;
+  place-items:center;
+  width:40px;
+  height:40px;
+  flex:none;
+  border-radius:50%;
+  background:rgba(255,255,255,.07);
+  color:var(--text-2);
+  transition:background var(--dur-1) var(--ease-out),color var(--dur-1) var(--ease-out)
+}
+.search-clear:hover{background:rgba(255,255,255,.14);color:#fff}
+
+.search-recent{display:flex;flex-wrap:wrap;gap:7px;align-items:center}
+.search-hint{color:var(--soft);font-size:11.5px}
+
+.mood-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+.mood{
+  position:relative;
+  display:flex;
+  align-items:flex-start;
+  height:96px;
+  padding:14px;
+  border-radius:var(--r-sm);
+  border:1px solid var(--line-2);
+  background:var(--mood,var(--card-2));
+  color:#fff;
+  font-family:'Inter Display','Inter',system-ui,sans-serif;
+  font-size:15px;
+  font-weight:800;
+  letter-spacing:-.02em;
+  text-align:left;
+  overflow:hidden;
+  isolation:isolate;
+  transition:transform var(--dur-2) var(--ease-out),box-shadow var(--dur-2) var(--ease-out)
+}
+/* The label always sits on the dark side of the tile, so it stays legible over
+   any artwork that lands there. */
+.mood::after{
+  content:'';
+  position:absolute;
+  inset:0;
+  z-index:1;
+  background:linear-gradient(100deg,rgba(0,0,0,.52) 0%,rgba(0,0,0,.3) 46%,rgba(0,0,0,.04) 100%);
+  pointer-events:none
+}
+.mood:hover{transform:translateY(-2px);box-shadow:var(--shadow-2)}
+.mood:active{transform:translateY(0) scale(.995)}
+.mood span{position:relative;z-index:2}
+.mood-name{position:relative;z-index:2;text-shadow:0 1px 12px rgba(0,0,0,.45)}
+.mood .mood-arrow{
+  position:absolute;
+  top:11px;
+  right:11px;
+  z-index:2;
+  display:grid;
+  place-items:center;
+  width:26px;
+  height:26px;
+  border-radius:50%;
+  background:rgba(0,0,0,.22);
+  color:rgba(255,255,255,.82);
+  transition:background var(--dur-1) var(--ease-out),color var(--dur-1) var(--ease-out)
+}
+.mood:hover .mood-arrow{background:var(--accent);color:var(--accent-ink)}
+/* the tiles are shorter on a phone, and the label can be two words wide */
+@media(max-width:650px){
+  .mood .mood-arrow{width:24px;height:24px;top:9px;right:9px}
+  .mood .mood-arrow .ico{width:13px;height:13px}
+  .mood-name{max-width:calc(100% - 30px)}
+}
+/* The artwork is a tilted record leaning out of the tile: one crisp hairline
+   edge and one soft shadow make it read as an object, not a stray photo. */
+.mood img{
+  position:absolute;
+  z-index:0;
+  right:-12px;
+  bottom:-16px;
+  width:88px;
+  height:88px;
+  border-radius:9px;
+  opacity:.82;
+  transform:rotate(11deg);
+  box-shadow:0 10px 28px rgba(0,0,0,.5),0 0 0 1px rgba(255,255,255,.14),inset 0 0 0 1px rgba(0,0,0,.2);
+  transition:transform var(--dur-3) var(--ease-out),opacity var(--dur-2) var(--ease-out)
+}
+.mood:hover img{transform:rotate(7deg) scale(1.03);opacity:.92}
+
+.search-track-list{margin-top:6px}
+
+/* Search answers in shelves: songs, albums, artists, playlists. The type tabs
+   switch between them from the one answer already in memory, so they sit right
+   under the field. On a 320px phone they scroll sideways *inside* their own
+   pill — the document never widens (docs/ux-spec.md §5). */
+.search-filters{display:flex;flex-wrap:nowrap;min-width:0;max-width:100%;overflow-x:auto;margin:0 0 6px}
+.search-filters .segment{display:inline-flex;align-items:center;gap:7px}
+.seg-count{font-size:10.5px;font-weight:800;font-variant-numeric:tabular-nums;opacity:.55;letter-spacing:0}
+.segment.is-active .seg-count,
+.segment[aria-selected="true"] .seg-count{opacity:.72}
+.section-count{margin-left:8px;color:var(--soft);font-size:12px;font-weight:700;letter-spacing:0;font-variant-numeric:tabular-nums}
+.search-shelves{display:block;min-width:0}
+.search-shelves .section-head:first-child{margin-top:18px}
+/* Five tabs cannot fit below ~520px; fade the clipped edge so a half-visible
+   label reads as "swipe me" rather than a broken tab (same trick as .chips.scroll). */
+@media (max-width:520px){
+  .search-filters{-webkit-mask-image:linear-gradient(to right,#000 calc(100% - 28px),transparent);mask-image:linear-gradient(to right,#000 calc(100% - 28px),transparent)}
+}
+.search-empty{padding:34px 14px;border-radius:var(--r-sm);color:var(--muted);font-size:12.5px;text-align:center}
+.sort-btn{flex:none;width:44px;height:44px}
+.search-skeleton{display:grid;gap:8px;margin-top:12px}
+
+.toolbar-row{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:12px 0 16px;min-width:0}
+.toolbar-row .chips{overflow-x:auto;flex-wrap:nowrap;scrollbar-width:none;padding-bottom:1px}
+.toolbar-row .chips::-webkit-scrollbar{display:none}
+
+
+/* ── 09 library ────────────────────────────────────────────────────────────── */
+.library-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.empty-library{padding:56px 12px;text-align:center;color:var(--muted);font-size:12.5px}
+.empty-library h3{color:var(--white);margin-bottom:6px;font-size:15px}
+
+
+/* ── 10 radio ──────────────────────────────────────────────────────────────── */
+.radio-feature{
+  position:relative;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:16px;
+  overflow:hidden;
+  padding:20px;
+  border-radius:var(--r-md);
+  border:1px solid var(--line-2);
+  background:
+    radial-gradient(circle at 78% 45%,rgba(232,150,119,.32),transparent 42%),
+    linear-gradient(125deg,#34323e,#47354b 67%,#382b3c);
+  box-shadow:inset 0 1px rgba(255,255,255,.08)
+}
+.radio-copy{position:relative;z-index:1;min-width:0}
+.radio-feature h2{margin:12px 0 8px;font-family:'Inter Display','Inter',system-ui,sans-serif;font-size:clamp(24px,6.6vw,34px);font-weight:800;line-height:1.08;letter-spacing:-.035em}
+.radio-feature p{max-width:300px;color:#d7ccd8;font-size:11.5px;line-height:1.7;margin-bottom:14px}
+.radio-feature .radio-live{display:inline-flex;align-items:center;gap:7px;color:var(--accent-2);font-size:9.5px;font-weight:800;letter-spacing:.14em}
+.radio-feature .radio-graphics{position:absolute;right:-70px;top:50%;translate:0 -50%;display:flex;align-items:center;gap:7px;opacity:.16;pointer-events:none}
+.radio-feature .radio-graphics i{width:12px;height:var(--h,30px);border-radius:var(--r-pill);background:linear-gradient(#ffd0a9,#fd9476)}
+
+.station-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.station{
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+  min-width:0;
+  padding:9px;
+  border-radius:var(--r-sm);
+  border:1px solid var(--line);
+  background:var(--card);
+  color:var(--white);
+  text-align:left;
+  transition:background var(--dur-2) var(--ease-out),border-color var(--dur-2) var(--ease-out),transform var(--dur-2) var(--ease-out)
+}
+.station:hover{background:var(--card-2);border-color:var(--line-2);transform:translateY(-2px)}
+.station:active{transform:translateY(0)}
+.station .cover{width:100%;aspect-ratio:1.5;border-radius:var(--r-xs);box-shadow:inset 0 0 0 1px rgba(255,255,255,.06)}
+.station-art{position:relative;overflow:hidden;border-radius:var(--r-xs);background:var(--card-3)}
+.station-art .cover{width:100%;aspect-ratio:1.5;border-radius:inherit}
+.station-play{
+  position:absolute;
+  right:8px;
+  bottom:8px;
+  display:grid;
+  place-items:center;
+  width:34px;
+  height:34px;
+  border-radius:50%;
+  background:rgba(20,20,24,.72);
+  color:#fff;
+  backdrop-filter:blur(6px);
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.14);
+  transition:background var(--dur-1) var(--ease-out),transform var(--dur-1) var(--ease-out)
+}
+.station:hover .station-play{background:var(--accent);color:var(--accent-ink);transform:scale(1.05)}
+.station-play svg{width:14px;height:14px}
+.station-body{display:grid;gap:3px;min-width:0}
+.station strong{font-size:12.5px;letter-spacing:-.015em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.station p{color:var(--muted);font-size:10.5px;line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.station small,
+.station-body small{color:var(--muted);font-size:9px;font-weight:800;letter-spacing:.09em;text-transform:uppercase}
+.station-meta{color:var(--accent);font-size:9px;font-weight:800;letter-spacing:.05em}
+
+
+/* ── 11 collection & track lists ───────────────────────────────────────────── */
+.collection-hero{display:flex;align-items:center;gap:14px;padding:12px 0 16px;min-width:0}
+.collection-art{width:104px;height:104px;flex:none;border-radius:var(--r-xs);overflow:hidden;box-shadow:var(--shadow-2),inset 0 0 0 1px rgba(255,255,255,.08)}
+.collection-copy{min-width:0;flex:1}
+/* the action row repeats the track count on desktop, where the hero meta line
+   is far away; on a phone the two would sit next to each other */
+.collection-count{margin-left:auto;color:var(--soft);font-size:11px;white-space:nowrap}
+@media(max-width:650px){.collection-count{display:none}}
+.collection-hero .collection-type{display:block;color:var(--accent);font-size:9.5px;font-weight:800;letter-spacing:.15em;text-transform:uppercase}
+.collection-hero h1{
+  margin:7px 0;
+  font-size:clamp(21px,6vw,28px);
+  line-height:1.1;
+  letter-spacing:-.035em;
+  display:-webkit-box;
+  -webkit-line-clamp:2;
+  -webkit-box-orient:vertical;
+  overflow:hidden;
+  overflow-wrap:anywhere
+}
+.collection-hero.compact .collection-art{width:84px;height:84px}
+.collection-hero p{display:none}
+.collection-hero .collection-meta{color:var(--soft);font-size:10.5px;line-height:1.5}
+.collection-hero .collection-meta strong{color:var(--text-2);font-weight:700}
+
+.collection-actions{display:flex;align-items:center;flex-wrap:wrap;gap:9px;padding-bottom:12px}
+.collection-actions .play-btn{width:52px;height:52px;min-height:52px;padding:0;border-radius:50%}
+.collection-actions .play-btn svg{width:20px;height:20px}
+
+/* ── 11c artist page ─────────────────────────────────────────────────────────
+   An artist is not a playlist: the hero is a round avatar with the name and a
+   clamped biography, and the page below it is a catalogue (popular songs, then
+   releases, then videos, then neighbours). Round is the one shape that says
+   "person, not album" without a label. */
+.artist-hero{display:flex;align-items:center;gap:16px;padding:14px 0 14px;min-width:0}
+.artist-hero-art{
+  width:112px;height:112px;flex:none;border-radius:50%;overflow:hidden;
+  box-shadow:var(--shadow-2),inset 0 0 0 1px rgba(255,255,255,.1)
+}
+.artist-hero-art .cover{width:100%;height:100%}
+.artist-hero-copy{min-width:0;flex:1}
+.artist-hero h1{
+  margin:7px 0;
+  font-size:clamp(22px,5.6vw,32px);
+  line-height:1.08;
+  letter-spacing:-.035em;
+  display:-webkit-box;
+  -webkit-line-clamp:2;
+  -webkit-box-orient:vertical;
+  overflow:hidden;
+  overflow-wrap:anywhere
+}
+.artist-hero p{
+  color:var(--muted);font-size:11.5px;line-height:1.6;max-width:56ch;margin-bottom:8px;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden
+}
+.artist-hero .collection-meta{color:var(--soft);font-size:10.5px;line-height:1.5}
+.artist-hero .collection-meta strong{color:var(--text-2);font-weight:700}
+
+/* A horizontal strip on a phone (one thumb), a grid once there is room. */
+.artist-strip{
+  display:grid;grid-auto-flow:column;grid-auto-columns:minmax(184px,1fr);gap:9px;
+  overflow-x:auto;overscroll-behavior-x:contain;scroll-snap-type:x proximity;
+  padding-bottom:4px;margin-bottom:8px;scrollbar-width:none
+}
+.artist-strip::-webkit-scrollbar{display:none}
+.artist-chip{
+  display:flex;align-items:center;gap:10px;min-width:0;padding:7px 12px 7px 7px;
+  border-radius:var(--r-pill);border:1px solid var(--line);background:var(--card);
+  color:var(--white);text-align:left;scroll-snap-align:start;
+  transition:border-color var(--dur-1) var(--ease-out),background var(--dur-1) var(--ease-out)
+}
+.artist-chip:hover{border-color:var(--line-2);background:var(--card-2)}
+.artist-chip-art{
+  display:grid;place-items:center;width:38px;height:38px;flex:none;border-radius:50%;
+  overflow:hidden;background:var(--card-2);color:var(--muted)
+}
+.artist-chip-art .cover{width:100%;height:100%}
+.artist-chip-art .ico{width:17px;height:17px}
+.artist-chip-copy{min-width:0;display:grid}
+.artist-chip-copy strong{font-size:12px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.artist-chip-copy small{color:var(--soft);font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* Following an artist is a state, not a one-off action: the same pill reads
+   Follow / Following and carries aria-pressed, so the two states differ by more
+   than colour alone (and the label is inside the button, not only in a title). */
+.follow-btn{gap:7px;padding:0 15px}
+.follow-btn[aria-pressed="true"],
+.follow-btn.is-following{
+  background:var(--accent-soft);border-color:var(--accent-line);color:var(--accent-2)
+}
+.follow-btn[aria-pressed="true"]:hover,
+.follow-btn.is-following:hover{background:rgba(255,153,123,.22);border-color:var(--accent-line);color:var(--white)}
+
+/* The library's Artists tab marks a follow, which is the one entry there the
+   listener chose rather than earned by listening. It rides on the artwork as a
+   badge: a caption under the card would change that card's height and knock the
+   grid out of line with the artists next to it. It is anchored to the card, not
+   to .cover-wrap — an artist's artwork is a clipped circle, which would cut the
+   label in half. */
+.following-tag{
+  position:absolute;left:8px;top:8px;z-index:1;
+  display:inline-flex;align-items:center;gap:5px;padding:3px 9px;
+  border-radius:var(--r-pill);border:1px solid var(--accent-line);
+  background:rgba(28,22,30,.82);backdrop-filter:blur(6px);
+  color:var(--accent-2);font-size:9.5px;font-weight:800;letter-spacing:.07em;text-transform:uppercase
+}
+
+/* The album's artist, from the hero meta line — the way from a release back to
+   the rest of someone's work. Sits inline in a line of muted meta text. */
+.artist-link{
+  background:none;border:0;padding:0;font:inherit;font-size:inherit;font-weight:700;
+  color:var(--text-2);cursor:pointer;border-radius:var(--r-xs)
+}
+.artist-link:hover,.artist-link:focus-visible{color:var(--accent);text-decoration:underline}
+
+/* The album cell of a track row doubles as the way into that release. It keeps
+   the column's own visibility rules (.track-album is hidden on a phone), so the
+   same markup is a plain label on mobile and a link on desktop. */
+.track-album-link{
+  background:none;border:0;padding:0;margin:0;font:inherit;font-size:11px;
+  color:var(--muted);text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  cursor:pointer;transition:color var(--dur-1) var(--ease-out)
+}
+.track-album-link:hover,.track-album-link:focus-visible{color:var(--white);text-decoration:underline}
+
+/* A value in the now-playing "About" tab that is also a way somewhere. It has
+   to look different from the static rows above it, or nobody discovers that the
+   artist and the album can be opened. */
+.detail-link{
+  display:inline-flex;align-items:center;justify-content:flex-end;gap:4px;
+  background:none;border:0;padding:0;font:inherit;font-size:12px;font-weight:650;
+  color:var(--accent-2);text-align:right;max-width:62%;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;cursor:pointer;min-height:24px
+}
+.detail-link .ico{width:12px;height:12px;flex:none;opacity:.75}
+.detail-link:hover,.detail-link:focus-visible{color:var(--accent);text-decoration:underline}
+
+.dur-hero{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.progress-dot{width:5px;height:5px;border-radius:50%;background:var(--soft)}
+
+.track-header{
+  display:grid;
+  grid-template-columns:18px minmax(0,1fr) 44px 44px 38px 44px;
+  align-items:center;
+  gap:4px;
+  padding:6px 4px;
+  border-bottom:1px solid var(--line);
+  color:var(--soft);
+  font-size:10px;
+  font-weight:700;
+  letter-spacing:.06em;
+  text-transform:uppercase
+}
+.track-header .track-album{display:none}
+.track-header > :last-child{text-align:right}
+
+.track-row{
+  position:relative;
+  display:grid;
+  grid-template-columns:18px minmax(0,1fr) 44px 44px 38px 44px;
+  align-items:center;
+  gap:4px;
+  min-height:62px;
+  padding:4px;
+  border-radius:var(--r-xs);
+  cursor:pointer;
+  transition:background var(--dur-1) var(--ease-out)
+}
+.track-row:focus-visible{outline:2px solid color-mix(in srgb,var(--accent) 75%,white);outline-offset:-2px}
+/* per-row overflow menu: always reachable, never shouting */
+.track-more{
+  display:grid;
+  place-items:center;
+  width:44px;
+  height:44px;
+  border-radius:50%;
+  background:transparent;
+  color:var(--soft);
+  transition:color var(--dur-1) var(--ease-out),background var(--dur-1) var(--ease-out),opacity var(--dur-1) var(--ease-out)
+}
+.track-more:hover{color:var(--white);background:rgba(255,255,255,.08)}
+/* pointer devices: keep the row calm until it is hovered or focused */
+@media (hover:hover) and (pointer:fine){
+  .track-more{opacity:0}
+  .track-row:hover .track-more,
+  .track-row:focus-within .track-more,
+  .track-more:focus-visible{opacity:1}
+}
+.track-list{display:block}
+.track-list.compact .track-row{padding-left:0;padding-right:0}
+.track-row:hover{background:rgba(255,255,255,.045)}
+.track-row:active{background:rgba(255,255,255,.07)}
+.track-row.active{background:var(--accent-soft)}
+.track-row.active .track-name{color:var(--accent-2)}
+
+.track-index{position:relative;display:grid;place-items:center;height:100%;color:var(--soft);font-size:11px;font-variant-numeric:tabular-nums}
+.track-index .ico{display:none;width:13px;height:13px;color:var(--white)}
+.track-row:hover .track-index span,
+.track-row:hover .track-index .eq{display:none}
+.track-row:hover .track-index .ico{display:block}
+.track-row.active .track-index span{display:none}
+.track-index .eq{display:none;align-items:flex-end;gap:2px;height:12px}
+.track-row.active .track-index .eq{display:flex}
+.eq i{width:2px;height:3px;border-radius:1px;background:var(--accent);animation:eq .9s var(--ease-out) infinite alternate}
+.eq i:nth-child(2){animation-delay:.2s}
+.eq i:nth-child(3){animation-delay:.45s}
+
+.track-details{display:flex;align-items:center;gap:10px;min-width:0}
+.track-details .cover{width:44px;height:44px;flex:none;border-radius:6px;box-shadow:inset 0 0 0 1px rgba(255,255,255,.06)}
+.track-desc{min-width:0}
+.track-name{font-size:12.5px;font-weight:700;color:var(--white);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.track-artist{margin-top:2px;color:var(--muted);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.track-album{display:none}
+.track-time{color:var(--soft);font-size:10.5px;text-align:right;padding-right:4px}
+.track-row.playing .track-name{color:var(--accent-2)}
+
+
+/* ── 11b the personal station ────────────────────────────────────────────────
+   The pinned station is the one surface that is always "yours", so it gets the
+   only four-up artwork treatment in the app: four covers from the queue read as
+   a mix, where a single cover would read as one album. */
+.station-card{
+  display:grid;
+  grid-template-columns:64px minmax(0,1fr);
+  align-items:center;
+  gap:14px;
+  padding:14px;
+  border-radius:var(--r-md);
+  border:1px solid var(--line-2);
+  background:
+    radial-gradient(circle at 88% 20%,rgba(255,153,123,.16),transparent 46%),
+    linear-gradient(120deg,#232029,#2b2430 62%,#241f28);
+}
+.station-card-art .cover{width:64px;height:64px;border-radius:var(--r-xs)}
+.station-card-mark{display:grid;place-items:center;width:64px;height:64px;border-radius:var(--r-xs);
+  background:linear-gradient(140deg,rgba(255,153,123,.22),rgba(255,153,123,.06));color:var(--accent-2)}
+.station-card-mark .ico{width:24px;height:24px}
+.station-card-copy{min-width:0}
+.station-card-copy strong{display:block;font-size:14px;font-weight:800;color:var(--white);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.station-card-copy p{margin-top:4px;color:var(--muted);font-size:11.5px;line-height:1.55}
+/* The one thing that separates the station from a playlist: it does not end. */
+.station-card-endless{display:block;margin-top:3px;color:var(--accent-2);font-weight:700;font-size:10.5px;
+  letter-spacing:.08em;text-transform:uppercase}
+.station-card-actions{grid-column:1 / -1;display:flex;flex-wrap:wrap;gap:9px}
+.station-card-actions .play-btn{flex:1 1 auto;justify-content:center}
+
+.station-hero{
+  display:grid;
+  gap:16px;
+  padding:16px;
+  border-radius:var(--r-md);
+  border:1px solid var(--line-2);
+  background:
+    radial-gradient(circle at 82% 18%,rgba(255,153,123,.2),transparent 44%),
+    linear-gradient(135deg,#2a2431,#3a2a38 60%,#2b2330);
+}
+.station-hero-art{display:grid;grid-template-columns:repeat(2,1fr);gap:4px;width:100%;max-width:180px}
+.station-hero-art .cover{aspect-ratio:1;width:100%;height:auto;border-radius:var(--r-xs)}
+.station-hero-art.single{grid-template-columns:1fr}
+.station-hero-art.single .cover{border-radius:var(--r-sm);box-shadow:var(--shadow-2)}
+.station-hero-copy .eyebrow{color:var(--accent-2);font-size:9.5px;font-weight:800;letter-spacing:.14em}
+.station-hero-copy h2{margin:8px 0 12px;font-family:'Inter Display','Inter',system-ui,sans-serif;font-size:clamp(19px,4.6vw,25px);font-weight:800;line-height:1.22;letter-spacing:-.025em;color:var(--white)}
+.station-hero-actions{display:flex;flex-wrap:wrap;gap:9px}
+.station-seeds{margin-top:12px;color:var(--muted);font-size:11.5px;line-height:1.6}
+.station-seeds strong{color:var(--text-2);font-weight:700}
+
+@media (min-width:811px){
+  .station-card{grid-template-columns:76px minmax(0,1fr) auto;gap:18px;padding:18px}
+  .station-card-art .cover,
+  .station-card-mark{width:76px;height:76px}
+  .station-card-copy strong{font-size:16px}
+  .station-card-actions{grid-column:auto;flex-wrap:nowrap}
+  .station-card-actions .play-btn{flex:0 0 auto}
+  .station-hero{grid-template-columns:200px minmax(0,1fr);align-items:center;gap:24px;padding:24px}
+  .station-hero-art{max-width:200px}
+}
+
+/* Below the desktop breakpoint a row cannot hold heart + dislike + time + menu
+   without squeezing the title to nothing, so the dislike button steps aside and
+   the same action stays in the row menu and the player bar. */
+@media (max-width:810px){
+  .track-row,
+  .track-header{grid-template-columns:18px minmax(0,1fr) 44px 38px 44px}
+  .track-header > :nth-child(5){display:none}
+  .dislike-row{display:none}
+}
+
+/* ── 12 admin ────────────────────────────────────────────────────────────────
+   Owner-only console. Dense tables on desktop; on phones each row becomes a
+   stacked block (`.responsive`) so no action hides behind a horizontal scroll. */
+.admin-lede{color:var(--muted);font-size:12px;line-height:1.6;margin-top:6px;max-width:560px}
+.admin-who{display:inline-flex;align-items:center;gap:6px;color:var(--text-2);font-size:11px;font-weight:700;white-space:nowrap}
+.admin-who .ico{width:15px;height:15px;color:var(--accent)}
+.admin-error{
+  display:flex;align-items:center;justify-content:space-between;gap:12px;
+  margin-bottom:14px;padding:11px 14px;border-radius:var(--r-sm);
+  background:var(--bad-soft);border:1px solid rgba(255,154,154,.28);
+  color:#f3d7d7;font-size:12px
+}
+.admin-stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin-bottom:14px}
+.admin-stat{display:grid;gap:4px;min-width:0;padding:13px;border-radius:var(--r-sm);border:1px solid var(--line);background:var(--panel);box-shadow:inset 0 1px rgba(255,255,255,.05)}
+.admin-stat-label{font-size:9.5px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:var(--soft)}
+.admin-stat strong{font-family:'Inter Display','Inter',system-ui,sans-serif;font-size:23px;font-weight:800;letter-spacing:-.04em;line-height:1.05;color:var(--white)}
+.admin-stat-hint{font-size:10.5px;color:var(--soft);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.admin-grid{display:grid;grid-template-columns:1fr;gap:11px;margin-bottom:14px}
+.admin-card{min-width:0;padding:15px;border-radius:var(--r-sm);border:1px solid var(--line);background:var(--panel);box-shadow:inset 0 1px rgba(255,255,255,.04)}
+.admin-card h3{font-family:'Inter Display','Inter',system-ui,sans-serif;font-size:13.5px;font-weight:800;letter-spacing:-.015em;margin-bottom:12px;color:var(--white)}
+.admin-card .secondary-btn,
+.admin-card .play-btn{margin-top:11px}
+.admin-bar{height:6px;border-radius:var(--r-pill);background:rgba(255,255,255,.09);overflow:hidden;margin:4px 0 9px}
+.admin-bar i{display:block;height:100%;border-radius:var(--r-pill);background:linear-gradient(90deg,var(--accent),var(--accent-2))}
+.admin-kv{
+  display:flex;align-items:baseline;justify-content:space-between;gap:12px;
+  padding:6px 0;border-bottom:1px solid rgba(255,255,255,.05);
+  font-size:11.5px;color:var(--muted);min-width:0
+}
+.admin-kv:last-of-type{border-bottom:0}
+.admin-kv b{color:var(--white);font-weight:650;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:62%}
+.admin-note{font-size:11px;line-height:1.6;color:var(--soft);margin-top:9px;overflow-wrap:anywhere}
+.admin-note code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;color:var(--text-2)}
+.admin-note.warn{color:var(--warn)}
+.admin-inline{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:11px}
+.admin-inline .secondary-btn,
+.admin-inline .play-btn{margin-top:0}
+
+.admin-form{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px;margin-bottom:14px;border-radius:var(--r-sm);border:1px solid var(--line);background:var(--panel)}
+.admin-form-title{display:flex;align-items:center;gap:7px;font-size:12px;font-weight:800;color:var(--white);margin-right:4px;width:100%}
+.admin-form input,
+.admin-form select{
+  flex:1 1 140px;min-width:0;height:44px;padding:0 12px;
+  border-radius:var(--r-xs);border:1px solid var(--line-2);
+  background:rgba(255,255,255,.04);color:var(--white);
+  font-size:16px;outline:none
+}
+.admin-form input:focus,
+.admin-form select:focus{border-color:var(--accent-line);background:rgba(255,255,255,.07)}
+.admin-form select{flex:0 0 110px}
+.admin-form .play-btn{flex:0 0 auto}
+.admin-form.compact{padding:9px 11px;margin:11px 0 0;background:var(--card)}
+
+.admin-table-wrap{border-radius:var(--r-sm);border:1px solid var(--line);background:var(--panel);overflow-x:auto;margin-bottom:8px}
+.admin-table{width:100%;border-collapse:collapse;font-size:12px;min-width:760px}
+.admin-table th{
+  padding:10px 12px;text-align:left;white-space:nowrap;
+  border-bottom:1px solid var(--line-2);
+  font-size:9.5px;font-weight:800;letter-spacing:.11em;text-transform:uppercase;color:var(--soft)
+}
+.admin-table td{padding:9px 12px;border-bottom:1px solid rgba(255,255,255,.04);color:var(--text-2);vertical-align:middle}
+.admin-table tbody tr:last-child td{border-bottom:0}
+.admin-table tbody tr:hover{background:rgba(255,255,255,.03)}
+.admin-table tr.is-disabled td{opacity:.55}
+.admin-table.audit{min-width:600px}
+.admin-table.audit code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;color:#d3bdb6}
+
+.admin-user-name{display:flex;align-items:center;gap:6px;font-size:12.5px;font-weight:750;color:var(--white)}
+.admin-sub{margin-top:3px;font-size:10.5px;color:var(--soft)}
+.admin-sub code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)}
+.admin-you{padding:1px 6px;border-radius:var(--r-pill);background:var(--accent);color:var(--accent-ink);font-size:8.5px;font-weight:800;letter-spacing:.06em;text-transform:uppercase}
+.admin-badge{display:inline-block;padding:3px 8px;border-radius:var(--r-pill);font-size:9.5px;font-weight:800;letter-spacing:.04em;text-transform:uppercase;white-space:nowrap}
+.admin-badge.admin{background:#ffb9a4;color:#2b1a12}
+.admin-badge.user{background:var(--card-3);color:var(--text-2)}
+.admin-badge.on{background:rgba(143,217,160,.16);color:var(--ok)}
+.admin-badge.off{background:var(--bad-soft);color:var(--bad)}
+
+.admin-actions{text-align:right}
+.admin-action-grid{display:flex;flex-wrap:wrap;gap:5px;justify-content:flex-end;min-width:0}
+.admin-actions button{
+  min-height:36px;padding:0 10px;border-radius:7px;
+  border:1px solid var(--line-2);background:var(--card-2);
+  color:var(--text-2);font-size:11px;font-weight:700;white-space:nowrap;
+  transition:background var(--dur-1) var(--ease-out),color var(--dur-1) var(--ease-out)
+}
+.admin-actions button:hover{background:var(--card-3);color:#fff}
+.admin-actions button.danger{color:var(--bad)}
+.admin-actions button.danger:hover{background:rgba(255,154,154,.18);color:#ffd3d3}
+.admin-actions button:disabled{opacity:.35;cursor:not-allowed}
+.admin-search-row{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}
+.admin-search{flex:1 1 260px;max-width:520px;height:46px}
+.admin-empty{padding:22px 12px;text-align:center;color:var(--soft);font-size:12px}
+
+
+/* ── 13 auth & connect-youtube sheet ───────────────────────────────────────── */
+/*
+   Signing in is its own screen, not a sheet over a half-visible app. Two panes:
+   a quiet editorial pitch on the left, the actual form on the right. The pitch
+   is decoration and is marked aria-hidden, so a screen reader goes straight to
+   the fields. Below 900px the pitch collapses to the wordmark and the form takes
+   the whole viewport — a login that scrolls on a phone is a login people abandon.
+*/
+.overlay.auth{
+  padding:18px;
+  align-items:center;
+  justify-content:center;
+  background:radial-gradient(120% 90% at 15% 0%,#191a20 0%,var(--bg) 55%,var(--bg-deep) 100%);
+}
+.auth-shell{
+  display:grid;
+  grid-template-columns:1.02fr .98fr;
+  width:100%;
+  max-width:1010px;
+  min-height:min(660px,calc(100dvh - 36px));
+  max-height:calc(100dvh - 36px);
+  border-radius:var(--r-lg);
+  border:1px solid var(--line-2);
+  background:var(--panel);
+  box-shadow:var(--shadow-3),inset 0 1px rgba(255,255,255,.06);
+  overflow:hidden;
+}
+
+/* ── left pane: the pitch ── */
+.auth-pitch{
+  position:relative;
+  display:flex;
+  flex-direction:column;
+  gap:28px;
+  padding:38px 36px 30px;
+  overflow:hidden;
+  background:
+    radial-gradient(90% 70% at 8% 0%,rgba(255,153,123,.16),transparent 62%),
+    radial-gradient(70% 60% at 100% 100%,rgba(152,138,224,.13),transparent 60%),
+    linear-gradient(160deg,#1c1d23,#121317 78%);
+  border-right:1px solid var(--line);
+}
+/* hairline score, like the ruled edge of a record sleeve */
+.auth-pitch::after{
+  content:"";
+  position:absolute;inset:0;
+  pointer-events:none;
+  background-image:repeating-linear-gradient(90deg,transparent 0 38px,rgba(255,255,255,.032) 38px 39px);
+  mask-image:linear-gradient(180deg,transparent,#000 18%,#000 82%,transparent);
+}
+.auth-brand{position:relative;z-index:1;display:flex;align-items:center;gap:12px}
+.auth-brand .brand-logo{width:38px;height:38px;margin:0}
+.auth-brand .brand-logo svg{width:22px;height:22px}
+.auth-brand > span{font-family:'Inter Display','Inter',system-ui,sans-serif;font-size:21px;font-weight:800;letter-spacing:-.045em}
+.auth-pitch-copy{position:relative;z-index:1;margin-top:6px}
+.auth-pitch-copy h2{
+  font-family:'Inter Display','Inter',system-ui,sans-serif;
+  font-size:clamp(30px,3.4vw,42px);
+  line-height:1.02;
+  font-weight:800;
+  letter-spacing:-.055em;
+  margin-bottom:14px;
+}
+.auth-pitch-copy p{max-width:34ch;color:var(--muted);font-size:13px;line-height:1.65}
+.auth-points{position:relative;z-index:1;display:grid;gap:16px;margin-top:24px}
+.auth-points li{display:grid;grid-template-columns:34px 1fr;gap:12px;align-items:start}
+.auth-point-ico{
+  display:grid;place-items:center;width:34px;height:34px;border-radius:11px;
+  border:1px solid var(--line-2);background:rgba(255,255,255,.045);color:var(--accent)
+}
+.auth-point-ico svg{width:18px;height:18px}
+/*
+   Scoped through the copy column (`li > div > …`) on purpose. A bare
+   `.auth-points span{display:block}` also matches the `.auth-point-ico` span —
+   and being one element more specific, it wins: the box silently became
+   `display:block`, `place-items:center` stopped applying, and the icon pinned
+   itself 7px above the centre of its tile.
+*/
+.auth-points li > div > strong{display:block;font-size:12.5px;font-weight:700;letter-spacing:-.01em;margin-bottom:2px}
+.auth-points li > div > span{display:block;color:var(--soft);font-size:11.5px;line-height:1.55}
+/* The wordmark, the pitch, the proofs, then the waveform anchored to the bottom
+   edge: a top-to-bottom read with the decoration taking the leftover space
+   instead of a hole in the middle. */
+.auth-eq{position:relative;z-index:1;display:flex;align-items:flex-end;gap:5px;height:32px;width:min(100%,300px);margin-top:auto;opacity:.5}
+.auth-eq i{flex:0 0 2.5px;border-radius:2px 2px 0 0;background:linear-gradient(180deg,var(--accent),rgba(255,153,123,.12));height:20%;animation:auth-eq 2.4s var(--ease-out) infinite alternate}
+.auth-eq i:nth-child(2n){animation-duration:1.9s;animation-delay:-.4s}
+.auth-eq i:nth-child(3n){animation-duration:2.9s;animation-delay:-1.1s}
+.auth-eq i:nth-child(5n){animation-duration:1.6s;animation-delay:-.8s}
+@keyframes auth-eq{from{height:12%}to{height:100%}}
+
+/* ── right pane: the form ── */
+.auth-panel{display:flex;overflow-y:auto;overscroll-behavior:contain;background:var(--panel)}
+.auth-form{display:flex;flex-direction:column;width:100%;max-width:400px;margin:auto;padding:40px 40px 32px}
+.auth-head{margin-bottom:24px}
+.auth-overline{display:block;font-size:10px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:var(--soft);margin-bottom:8px}
+.auth-head h1{
+  font-family:'Inter Display','Inter',system-ui,sans-serif;
+  font-size:clamp(26px,2.6vw,32px);
+  font-weight:800;letter-spacing:-.05em;line-height:1.05;margin-bottom:8px
+}
+.auth-head p{color:var(--muted);font-size:12.5px;line-height:1.6;max-width:36ch}
+.auth-field{margin-bottom:15px}
+.auth-label-row{display:flex;align-items:baseline;justify-content:space-between}
+.auth-pass-wrap{position:relative;display:flex}
+.auth-pass-wrap input{padding-right:52px}
+.auth-reveal{
+  position:absolute;top:50%;right:6px;transform:translateY(-50%);
+  display:grid;place-items:center;width:38px;height:38px;border-radius:10px;
+  color:var(--soft);transition:color var(--dur-1) var(--ease-out),background var(--dur-1) var(--ease-out)
+}
+.auth-reveal svg{width:18px;height:18px}
+.auth-reveal:hover{color:var(--white);background:rgba(255,255,255,.07)}
+.auth-reveal[aria-pressed="true"]{color:var(--accent)}
+
+/* checkbox: the native control is kept for keyboard and screen readers, the
+   painted box is the sibling so it can match the rest of the system */
+.auth-remember{
+  display:grid;grid-template-columns:22px 1fr;gap:11px;align-items:start;
+  margin:2px 0 18px;padding:11px 12px;border-radius:var(--r-sm);cursor:pointer;
+  border:1px solid transparent;
+  transition:background var(--dur-1) var(--ease-out),border-color var(--dur-1) var(--ease-out)
+}
+.auth-remember:hover{background:rgba(255,255,255,.035);border-color:var(--line)}
+.auth-remember input{position:absolute;opacity:0;width:1px;height:1px;pointer-events:none}
+.auth-remember-box{
+  display:grid;place-items:center;width:22px;height:22px;margin-top:1px;
+  border-radius:7px;border:1.5px solid var(--line-3);background:rgba(255,255,255,.04);
+  color:transparent;
+  transition:background var(--dur-1) var(--ease-out),border-color var(--dur-1) var(--ease-out),color var(--dur-1) var(--ease-out)
+}
+.auth-remember-box svg{width:14px;height:14px;stroke-width:3.2}
+.auth-remember input:checked + .auth-remember-box{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+.auth-remember input:focus-visible + .auth-remember-box{outline:2px solid var(--accent-line);outline-offset:2px}
+.auth-remember-copy strong{display:block;font-size:12.5px;font-weight:700;letter-spacing:-.01em}
+.auth-remember-copy small{display:block;margin-top:2px;color:var(--soft);font-size:11px;line-height:1.5}
+
+.auth-submit{width:100%;min-height:50px;margin-top:2px;font-size:13.5px}
+.auth-or{display:flex;align-items:center;gap:12px;margin:18px 0 14px;color:var(--soft);font-size:10px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}
+.auth-or::before,.auth-or::after{content:"";flex:1;height:1px;background:var(--line-2)}
+.auth-passkey{width:100%;min-height:50px}
+.auth-passkey svg{width:17px;height:17px}
+.auth-hint{margin-top:10px;padding:10px 12px;border-radius:var(--r-sm);background:rgba(230,198,130,.09);border:1px solid rgba(230,198,130,.22);color:var(--warn);font-size:11.5px;line-height:1.55}
+.auth-err{
+  min-height:0;margin:0 0 12px;color:var(--bad);font-size:12px;line-height:1.5;
+  padding:0;border-radius:var(--r-sm)
+}
+.auth-err:not(:empty){padding:10px 12px;background:var(--bad-soft);border:1px solid rgba(255,154,154,.24)}
+.auth-foot{margin-top:auto;padding-top:26px}
+.auth-foot p{color:var(--soft);font-size:11px;line-height:1.6}
+.auth-foot strong{color:var(--text-2);font-weight:600}
+
+@media (max-width:900px){
+  .auth-shell{grid-template-columns:1fr;min-height:0;max-height:none;width:min(460px,100%)}
+  .auth-pitch{padding:24px 26px 20px;gap:16px;border-right:0;border-bottom:1px solid var(--line)}
+  .auth-pitch-copy h2{font-size:26px;margin-bottom:8px}
+  .auth-pitch-copy p{font-size:12px;max-width:44ch}
+  .auth-points,.auth-eq{display:none}
+  .auth-form{padding:30px 26px 26px;max-width:none}
+  .auth-head h1{font-size:27px}
+}
+@media (max-width:520px){
+  .overlay.auth{padding:0;align-items:stretch}
+  .auth-shell{max-width:none;min-height:100dvh;border:0;border-radius:0;box-shadow:none}
+  .auth-pitch{padding:22px 22px 18px}
+  .auth-form{padding:26px 22px 24px}
+  .auth-foot{padding-top:22px}
+}
+@media (prefers-reduced-motion:reduce){
+  .auth-eq i{animation:none;height:46%}
+}
+
+/* ── account & security page ──────────────────────────────────────────────── */
+/*
+   One vertical rhythm for the whole page: head, pills, the two-card grid, then
+   the danger card, all separated by the same gap. The head carries a bottom
+   margin for every other page, so inside this grid it is zeroed rather than
+   added to — otherwise the pills end up floating between two different gaps.
+*/
+/*
+   A settings page wants a measure, not the whole viewport. Left to the 1600px
+   page cap, the cards reach 750px and every row strands its actions half a metre
+   from the label they belong to. 1180px keeps two comfortable cards side by side
+   at 1920 and 2560 while still filling a laptop screen, and centring it reads as
+   deliberate rather than as a column that ran out.
+*/
+.security-page{display:grid;gap:16px;width:100%;max-width:1180px;margin-inline:auto}
+.security-page > .page-head{margin-bottom:0}
+.security-hero{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:16px}
+.security-hero .page-title{margin-bottom:6px}
+.security-lede{color:var(--muted);font-size:13px;line-height:1.65;max-width:62ch}
+.security-session{display:flex;flex-wrap:wrap;gap:8px;margin:0}
+.sec-pill{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border-radius:var(--r-pill);border:1px solid var(--line-2);background:rgba(255,255,255,.04);font-size:11px;font-weight:600;color:var(--text-2)}
+.sec-pill svg{width:14px;height:14px;color:var(--soft)}
+.sec-pill.ok{border-color:rgba(143,217,160,.28);background:var(--ok-soft);color:var(--ok)}
+.sec-pill.ok svg{color:var(--ok)}
+
+.security-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:16px;align-items:start}
+.sec-card{display:grid;gap:0;border-radius:var(--r-md);border:1px solid var(--line-2);background:var(--card);overflow:hidden}
+.sec-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;padding:18px 18px 14px;border-bottom:1px solid var(--line)}
+.sec-card-head .icon-btn{flex:0 0 auto;width:34px;height:34px;margin-top:-2px}
+.sec-card-head .icon-btn svg{width:16px;height:16px}
+.sec-card-head h2{font-family:'Inter Display','Inter',system-ui,sans-serif;font-size:16px;font-weight:800;letter-spacing:-.025em;margin-bottom:4px}
+.sec-card-head p{color:var(--soft);font-size:11.5px;line-height:1.55;max-width:38ch}
+.sec-card-body{padding:8px}
+.sec-empty{padding:22px 14px;text-align:center;color:var(--soft);font-size:12px;line-height:1.6}
+.sec-empty strong{display:block;color:var(--text-2);font-weight:700;margin-bottom:3px}
+
+.sec-row{display:grid;grid-template-columns:38px 1fr auto;gap:12px;align-items:center;padding:11px 10px;border-radius:var(--r-sm);transition:background var(--dur-1) var(--ease-out)}
+.sec-row:hover{background:rgba(255,255,255,.035)}
+.sec-row + .sec-row{border-top:1px solid var(--line)}
+.sec-ico{display:grid;place-items:center;width:38px;height:38px;border-radius:11px;border:1px solid var(--line-2);background:rgba(255,255,255,.045);color:var(--text-2)}
+.sec-ico svg{width:19px;height:19px}
+.sec-row.is-current .sec-ico{color:var(--accent);border-color:var(--accent-line);background:var(--accent-soft)}
+.sec-name{display:block;font-size:12.5px;font-weight:700;letter-spacing:-.01em;overflow-wrap:anywhere}
+.sec-tags{display:flex;flex-wrap:wrap;gap:5px;margin-top:5px}
+.sec-meta{display:block;margin-top:5px;color:var(--soft);font-size:11px;line-height:1.45}
+.sec-badge{display:inline-flex;align-items:center;padding:2px 7px;border-radius:var(--r-pill);font-size:9.5px;font-weight:800;letter-spacing:.06em;text-transform:uppercase}
+.sec-badge.this{background:var(--accent-soft);color:var(--accent);border:1px solid var(--accent-line)}
+.sec-badge.saved{background:rgba(255,255,255,.06);color:var(--text-2);border:1px solid var(--line-2)}
+.sec-badge.risk{background:var(--bad-soft);color:var(--bad);border:1px solid rgba(255,154,154,.3)}
+.sec-actions{display:flex;align-items:center;gap:6px}
+.sec-actions .icon-btn{width:34px;height:34px}
+.sec-actions .icon-btn svg{width:16px;height:16px}
+
+.sec-add{width:100%;margin-top:4px;justify-content:center}
+.sec-danger{border-color:rgba(255,154,154,.22)}
+.sec-danger .sec-card-head{border-bottom-color:rgba(255,154,154,.16)}
+.sec-danger-list{display:grid;gap:2px;padding:8px}
+/* The copy takes the room it needs and the button sits at the end of the *row*,
+   not at the end of the viewport. */
+.sec-danger-item{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:16px;padding:12px 10px;border-radius:var(--r-sm)}
+.sec-danger-item + .sec-danger-item{border-top:1px solid var(--line)}
+.sec-danger-item strong{display:block;font-size:12.5px;font-weight:700;letter-spacing:-.01em}
+.sec-danger-item span{display:block;margin-top:2px;color:var(--soft);font-size:11px;line-height:1.5}
+
+@media (max-width:600px){
+  .sec-card-head{padding:15px 14px 12px}
+  .sec-row{grid-template-columns:34px 1fr;gap:10px;padding:11px 8px}
+  .sec-row .sec-actions{grid-column:1/-1;justify-content:flex-end}
+  .sec-danger-item{grid-template-columns:1fr;align-items:stretch;gap:10px}
+  .sec-danger-item .secondary-btn,.sec-danger-item .play-btn{width:100%}
+}
+
+/* youtube cookie sheet */
+.yt-modal{display:flex;flex-direction:column;max-height:calc(100dvh - 36px);overflow-y:auto;overscroll-behavior:contain}
+.yt-modal h2{font-family:'Inter Display','Inter',system-ui,sans-serif;font-size:22px;font-weight:800;letter-spacing:-.02em;margin-bottom:6px}
+.yt-modal > p{color:var(--muted);font-size:12.5px;line-height:1.6;margin-bottom:14px}
+.yt-steps{display:grid;gap:10px;margin-bottom:16px;counter-reset:s}
+.yt-steps li{display:grid;grid-template-columns:24px 1fr;gap:10px;font-size:12.5px;line-height:1.6;color:var(--text-2)}
+.yt-steps li::before{
+  counter-increment:s;content:counter(s);
+  display:grid;place-items:center;
+  width:22px;height:22px;border-radius:50%;
+  background:var(--card-2);color:var(--white);
+  font-size:10.5px;font-weight:800
+}
+.yt-steps li b{color:var(--white);font-weight:700}
+.yt-steps a{color:var(--accent);border-bottom:1px solid var(--accent-line)}
+.yt-steps code{padding:1px 5px;border-radius:5px;background:rgba(255,255,255,.06);font-size:11.5px;color:var(--accent-2)}
+.yt-drop{
+  margin-bottom:10px;padding:16px;text-align:center;cursor:pointer;
+  border:1.5px dashed var(--line-3);border-radius:var(--r-sm);
+  transition:border-color var(--dur-1) var(--ease-out),background var(--dur-1) var(--ease-out)
+}
+.yt-drop:hover,
+.yt-drop.dragging{border-color:var(--accent);background:var(--accent-soft)}
+.yt-drop strong{display:block;font-size:12.5px;margin-bottom:3px}
+.yt-drop span{font-size:11px;color:var(--soft)}
+.yt-textarea{
+  width:100%;min-height:92px;padding:11px;
+  border-radius:var(--r-sm);border:1px solid var(--line-2);
+  background:rgba(255,255,255,.04);color:var(--text-2);
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:16px;
+  line-height:1.5;
+  resize:vertical;
+  outline:none
+}
+.yt-textarea:focus{border-color:var(--accent-line)}
+.yt-actions{display:flex;gap:9px;align-items:center;margin-top:12px}
+.yt-actions .play-btn{flex:1}
+.yt-note{margin-top:12px;padding-top:12px;border-top:1px solid var(--line);font-size:11px;line-height:1.6;color:var(--soft)}
+.yt-err{margin-top:10px;color:var(--bad);font-size:12px;line-height:1.5}
+.yt-ok,
+.yt-bad,
+.yt-warn{display:flex;gap:10px;align-items:center;padding:12px;margin-bottom:13px;border-radius:var(--r-sm);font-size:12.5px;line-height:1.55}
+.yt-ok{background:var(--ok-soft);border:1px solid rgba(143,217,160,.3);color:#d6efdc}
+.yt-ok svg{color:var(--ok)}
+.yt-bad{background:var(--bad-soft);border:1px solid rgba(255,154,154,.3);color:#f6dede}
+.yt-bad svg{color:var(--bad)}
+.yt-warn{background:rgba(230,198,130,.1);border:1px solid rgba(230,198,130,.28);color:#efe5cd;align-items:flex-start}
+.yt-warn svg{color:var(--warn);margin-top:1px}
+.yt-connected{display:grid;gap:5px;margin-bottom:14px;font-size:12px;color:var(--muted)}
+.yt-connected b{color:var(--white);font-weight:650}
+
+/* diagnostics list inside the youtube sheet */
+.diag{margin-top:14px;padding-top:14px;border-top:1px solid var(--line);display:grid;gap:7px}
+.diag-head{font-size:12px;font-weight:800;color:var(--white)}
+.diag-row{display:grid;grid-template-columns:16px 1fr;gap:8px;align-items:baseline;font-size:11.5px}
+.diag-mark{font-weight:800;text-align:center}
+.diag-row.ok .diag-mark{color:var(--ok)}
+.diag-row.bad .diag-mark{color:var(--bad)}
+.diag-row.warn .diag-mark{color:var(--warn)}
+.diag-name{color:var(--text-2)}
+.diag-detail{grid-column:2;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;color:var(--soft);overflow:hidden;text-overflow:ellipsis}
+.diag-row.warn .diag-detail{color:#bda97f}
+.diag-advice{
+  margin-top:6px;padding:9px 11px;border-radius:var(--r-xs);
+  background:rgba(255,255,255,.05);border-left:2px solid var(--accent);
+  font-size:11.5px;line-height:1.6;color:var(--text-2)
+}
+
+
+/* ── 14 overlays ────────────────────────────────────────────────────────────
+   One scrim, three shapes: the full-screen now-playing sheet, the queue drawer
+   and a small popover menu. The scrim itself is a solid tint (no full-page
+   backdrop-filter — that was the single most expensive paint in the app). */
+.overlay,
+.drawer-backdrop{position:fixed;inset:0;z-index:var(--z-overlay);display:grid;place-items:center;padding:0;background:rgba(7,7,10,.8)}
+.drawer-backdrop{z-index:var(--z-drawer);background:rgba(7,7,10,.7)}
+
+.overlay[hidden],
+.drawer-backdrop[hidden],
+.context-menu[hidden],
+.profile-popover[hidden],
+
+/* entrance */
+.overlay:not([hidden]){animation:backdrop-in var(--dur-2) var(--ease-out) both}
+.overlay:not([hidden]) .now-modal{animation:sheet-in var(--dur-3) var(--ease-out) both}
+.drawer-backdrop:not([hidden]){animation:backdrop-in var(--dur-2) var(--ease-out) both}
+.drawer-backdrop:not([hidden]) .drawer{animation:sheet-in var(--dur-3) var(--ease-out) both}
+
+/* exit — app.js adds .closing for ~180ms before restoring [hidden] */
+.overlay.closing{animation:backdrop-out 180ms var(--ease-out) both}
+.overlay.closing .now-modal{animation:sheet-out 180ms var(--ease-out) both}
+.drawer-backdrop.closing{animation:backdrop-out 180ms var(--ease-out) both}
+.drawer-backdrop.closing .drawer{animation:sheet-out 180ms var(--ease-out) both}
+
+/* buttons that live in a corner of a sheet */
+.modal-close{
+  position:absolute;
+  top:12px;
+  right:12px;
+  display:grid;
+  place-items:center;
+  width:44px;
+  height:44px;
+  border-radius:50%;
+  background:rgba(255,255,255,.09);
+  color:var(--white);
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.08);
+  z-index:3;
+  transition:background var(--dur-1) var(--ease-out),transform var(--dur-1) var(--ease-out)
+}
+.modal-close:hover{background:rgba(255,255,255,.16)}
+.modal-close:active{transform:scale(.93)}
+.modal-close .ico{width:18px;height:18px}
+
+
+/* ── 15 now-playing sheet ───────────────────────────────────────────────────
+   Phone: a full-height sheet. Grip at the top, close pinned above the artwork,
+   artwork sized by the viewport height so the transport always stays above the
+   fold, and a scrollable lyrics/about region that absorbs the leftover space.
+   Desktop: a two-column dialog. */
+.now-modal{
+  padding:calc(64px + var(--sat)) 22px calc(24px + var(--sab));
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+  width:100%;
+  height:100%;
+  max-height:100%;
+  overflow-y:auto;
+  overscroll-behavior:contain;
+  border-radius:0;
+  border:0;
+  background:
+    radial-gradient(ellipse at 50% -12%,rgba(120,86,124,.35),transparent 58%),
+    linear-gradient(180deg,#1d1e24,#121317 70%);
+  box-shadow:none;
+  -webkit-overflow-scrolling:touch
+}
+
+/* swipe handle */
+.sheet-grip{position:absolute;top:calc(10px + var(--sat));left:50%;translate:-50% 0;width:40px;height:4px;border-radius:var(--r-pill);background:rgba(255,255,255,.22)}
+
+/* The sheet itself takes focus when it opens (so no control is ringed the
+   instant it appears); it is a panel, not a control, so it gets no ring. */
+.now-modal:focus,
+.now-modal:focus-visible{outline:none}
+
+.now-modal .modal-cover{
+  flex:none;
+  align-self:center;
+  height:min(32dvh,270px);
+  width:auto;
+  aspect-ratio:1;
+  overflow:hidden;
+  border-radius:var(--r-sm);
+  background:var(--card-2);
+  box-shadow:var(--shadow-3),inset 0 0 0 1px rgba(255,255,255,.08)
+}
+/* YouTube artwork is 4:3 (or 16:9): fill the square frame and crop, instead of
+   letterboxing it inside a black box. object-fit only crops once the element
+   is actually the size of its frame. */
+.now-modal .modal-cover > .cover{width:100%;height:100%;display:block;border-radius:inherit}
+
+.modal-content{display:flex;flex-direction:column;gap:8px;min-height:0;width:100%;max-width:460px;margin:0 auto;flex:1 1 auto}
+
+.now-modal h2{
+  font-size:clamp(22px,6.2vw,30px);
+  line-height:1.12;
+  letter-spacing:-.035em;
+  overflow-wrap:anywhere;
+  display:-webkit-box;
+  -webkit-line-clamp:2;
+  -webkit-box-orient:vertical;
+  overflow:hidden
+}
+.now-modal .byline{color:var(--muted);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.now-modal .eyebrow{color:var(--accent);font-size:9.5px}
+
+/* new sheet internals (np-*) */
+/* the identity block and the track actions share one row: eyebrow / title /
+   artist on the left, the three track actions top-right */
+.np-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;flex:none;min-width:0}
+/* On the queue tab the list is the content: let it take the room the artwork
+   would otherwise hold. The transition is short and transform-free, so it does
+   not fight the sheet's own entrance. */
+.now-modal.tab-queue .modal-cover{height:min(17dvh,132px)}
+@media(max-height:700px){.now-modal.tab-queue .modal-cover{height:84px}}
+
+/* Lyrics get a short fade at the pane edge; the queue does not. Prose that is
+   cut mid-line looks like a rendering bug, while a list row cut at the edge
+   reads as "there is more" already — and dimming it made the row look
+   disabled. 22px covers the descenders of one line and nothing more. */
+.now-modal:not(.tab-queue) .np-scroll{
+  -webkit-mask-image:linear-gradient(to bottom,#000 calc(100% - 22px),rgba(0,0,0,.06));
+  mask-image:linear-gradient(to bottom,#000 calc(100% - 22px),rgba(0,0,0,.06))
+}
+
+/* Lyrics and the queue scroll inside a single scroll region. */
+.np-scroll{
+  flex:1 1 auto;
+  min-height:0;
+  overflow-y:auto;
+  overscroll-behavior:contain;
+  padding-right:2px;
+  padding-bottom:10px;
+  scrollbar-width:thin;
+  scrollbar-color:rgba(255,255,255,.22) transparent;
+  /* No mask fade: it dimmed whatever sat at the edge, which read as "disabled"
+     on a queue row. The pane clips like any list, but with enough bottom air
+     that the clipped row is clearly *more content* and not a collision with
+     the transport below. */
+  padding-bottom:14px;
+  scroll-padding-bottom:14px
+}
+.np-scroll::-webkit-scrollbar{width:6px}
+.np-scroll::-webkit-scrollbar-thumb{background:rgba(255,255,255,.16);border-radius:3px}
+.np-head-copy{min-width:0;flex:1 1 auto;display:flex;flex-direction:column;gap:4px}
+.np-actions{
+  display:flex;
+  align-items:center;
+  gap:2px;
+  /* centred against the identity block, pulled out to the sheet's own gutter
+     so the icon column aligns with the close button above it */
+  align-self:center;
+  flex:none;
+  margin:0 -12px 0 0
+}
+.np-actions .icon-btn{width:44px;height:44px}
+.np-actions .icon-btn .ico{width:22px;height:22px}
+.np-actions .secondary-btn{min-height:38px;padding:0 13px;font-size:11.5px}
+/* the queue count is a caption, not a control: align it to the icons' optical
+   centre instead of the flex baseline */
+.np-meta{margin-left:auto;color:var(--soft);font-size:11px;line-height:1;padding-right:2px;white-space:nowrap}
+/* on a phone the queue count lives in the drawer header; here it would only
+   compete with the four icons it sits next to */
+@media(max-width:650px){.np-meta{display:none}}
+.np-next{display:grid;gap:2px;flex:0 0 auto;padding-top:6px;border-top:1px solid var(--line)}
+.np-next .queue-mini{margin-bottom:0}
+
+/* swapping tabs inside the sheet */
+.modal-tabs{display:flex;gap:16px;margin:2px 0 0;border-bottom:1px solid var(--line);overflow-x:auto;scrollbar-width:none;flex:none}
+.modal-tabs::-webkit-scrollbar{display:none}
+/* Keyboard focus on a tab must be visible without turning the tab into a
+   filled button. A faint inset ring plus a brighter label is enough, and it
+   leaves the coral underline as the single "selected" signal. */
+.modal-tabs button:focus-visible{
+  outline:2px solid rgba(255,153,123,.34);
+  outline-offset:-2px;
+  border-radius:7px;
+  color:var(--white);
+  background:rgba(255,153,123,.06)
+}
+.modal-tabs button{
+  min-height:44px;
+  min-width:44px;
+  position:relative;
+  padding:0 9px 10px;
+  background:transparent;
+  color:var(--muted);
+  font-size:12px;
+  font-weight:800;
+  white-space:nowrap;
+  transition:color var(--dur-1) var(--ease-out),border-color var(--dur-1) var(--ease-out)
+}
+.modal-tabs button:hover{color:var(--text-2)}
+/* one continuous rule, with the active segment painted *over* it */
+.modal-tabs button::after{
+  content:'';
+  position:absolute;
+  left:0;
+  right:0;
+  bottom:-1px;
+  height:2px;
+  border-radius:1px;
+  background:transparent;
+  transition:background var(--dur-1) var(--ease-out)
+}
+.modal-tabs button.active{color:var(--white)}
+.modal-tabs button.active::after{background:var(--accent)}
+
+/* Lyrics are plain content inside .np-scroll. They used to be a second scroll
+   container, which clipped a line mid-glyph and defeated the parent's fade. */
+.lyric-lines{
+  flex:0 0 auto;
+  min-height:0;
+  max-height:none;
+  overflow:visible;
+  padding:10px 4px 2px 0;
+  color:#d3c6d3;
+  font-family:'Inter Display','Inter',system-ui,sans-serif;
+  font-size:15px;
+  font-weight:600;
+  line-height:1.7;
+  letter-spacing:-.01em
+}
+.lyric-lines p{margin-bottom:6px}
+.lyric-lines p:first-child{color:var(--white)}
+.lyric-lines p.active{color:var(--white);font-weight:750}
+.lyric-lines .plain{white-space:pre-wrap;font:inherit}
+
+/* No divider here. Above it sits a scroll pane that legitimately clips its
+   last line, and a hairline landing under a clipped line reads as a
+   strikethrough. The transport's own weight anchors the bottom of the sheet. */
+.modal-progress{margin-top:-4px;padding-top:10px;flex:none}
+.modal-progress .timebar span{font-size:10px}
+.modal-controls{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:4px;
+  /* The scroll region above owns all the slack, so the progress + actions +
+     transport stay one tight cluster at the bottom instead of drifting apart
+     on a tall phone. */
+  margin-top:-14px;      /* the seek range's 44px hit box is centred on a 4px
+                            track, so its visual baseline sits 20px lower */
+  padding-top:0;
+  flex:none
+}
+/* A sheet is a focused surface: its secondary controls must be clearly
+   readable, not a ghost of the primary button. */
+.modal-controls .ctrl,
+.np-actions .icon-btn{color:var(--text-2)}
+.modal-controls .ctrl:hover,
+.np-actions .icon-btn:hover{color:var(--white)}
+.modal-controls .icon-btn{width:44px;height:44px}
+/* one optical size for the whole transport row, big play included: the
+   secondary glyphs read as siblings of the primary, not as disabled */
+.modal-controls .ctrl .ico,
+.modal-controls .ctrl .ico.lg{width:22px;height:22px}
+.modal-controls .big-play{width:56px;height:56px}
+.modal-controls .big-play .ico,
+.modal-controls .big-play .ico.lg{width:24px;height:24px}
+
+/* tab counter + queue/lyrics placeholders inside the sheet */
+.tab-badge{
+  display:inline-block;
+  min-width:18px;
+  margin-left:6px;
+  padding:1px 5px;
+  border-radius:var(--r-pill);
+  background:var(--accent-soft);
+  color:var(--accent-2);
+  font-size:10px;
+  font-weight:800;
+  line-height:1.5;
+  text-align:center;
+}
+.modal-tabs button.active .tab-badge{background:var(--accent-soft);color:var(--accent-2)}
+.np-meta{margin-left:auto;color:var(--soft);font-size:10.5px;white-space:nowrap}
+.np-empty{display:flex;flex-direction:column;align-items:center;gap:8px;padding:22px 12px;text-align:center;color:var(--soft)}
+.np-empty .ico{width:22px;height:22px;opacity:.7}
+.np-empty p{font-size:12px;line-height:1.5}
+.np-empty.small{padding:14px 8px}
+.np-empty.small p{font-size:11.5px}
+.np-loading{display:flex;align-items:center;gap:4px;padding:16px 2px;color:var(--soft);font-size:12px}
+.np-details{display:grid;gap:2px;align-content:start}
+.detail-row{display:flex;align-items:baseline;justify-content:space-between;gap:14px;padding:8px 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:12px;color:var(--soft)}
+.detail-row:last-of-type{border-bottom:0}
+.detail-row b{color:var(--white);font-weight:650;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:62%}
+.detail-note{margin-top:8px;color:var(--muted);font-size:11.5px;line-height:1.6}
+
+/* a rejected form shakes once; transform-only, 240ms */
+form.shake{animation:shake 240ms var(--ease-out) both}
+
+/* the sheet ignores transitions while the user is dragging it down */
+.now-modal.dragging{transition:none;animation:none}
+
+
+/* ── 16 drawer & menus ─────────────────────────────────────────────────────── */
+.drawer{
+  position:absolute;
+  left:0;
+  right:0;
+  bottom:0;
+  width:100%;
+  max-height:82dvh;
+  overflow-y:auto;
+  overscroll-behavior:contain;
+  padding:22px 18px calc(22px + var(--sab));
+  border-radius:var(--r-lg) var(--r-lg) 0 0;
+  border-top:1px solid var(--line-2);
+  background:linear-gradient(180deg,#1e1f25,#15161b);
+  box-shadow:var(--shadow-3),inset 0 1px rgba(255,255,255,.06)
+}
+.drawer-top{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:14px}
+.drawer-top h2{font-family:'Inter Display','Inter',system-ui,sans-serif;font-size:19px;font-weight:800;letter-spacing:-.025em}
+.drawer .eyebrow{margin:14px 0 8px;color:var(--soft)}
+.drawer-list{display:grid}
+.drawer-list .queue-mini{padding:7px;margin:0 0 2px;border-radius:var(--r-xs)}
+.drawer-list .queue-mini:hover{background:rgba(255,255,255,.06)}
+.drawer-list .queue-mini.current{background:var(--accent-soft)}
+.drawer-section{margin-top:12px}
+.drawer-section + .drawer-section{margin-top:10px}
+
+/* Queue rows: a play target plus a separate reorder grip. The grip is a sibling
+   of the play button, never a child — a control inside a control is invalid
+   HTML and would swallow the row's own activation. 44px square so it is a real
+   touch target next to the 40px artwork (docs/ux-spec.md §4.4). */
+.queue-row{position:relative;display:flex;align-items:center;gap:2px;min-width:0}
+.queue-row .queue-mini{flex:1 1 auto;width:auto;min-width:0;margin:0}
+.queue-grip{
+  flex:none;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  width:44px;
+  height:44px;
+  padding:0;
+  border:0;
+  border-radius:var(--r-xs);
+  background:transparent;
+  color:var(--soft);
+  cursor:grab;
+  /* A finger dragging the handle must move the row, not scroll the drawer. */
+  touch-action:none;
+  transition:color var(--dur-1) var(--ease-out),background var(--dur-1) var(--ease-out)
+}
+.queue-grip .ico{width:16px;height:16px}
+.queue-grip:hover{color:var(--white);background:rgba(255,255,255,.06)}
+.queue-grip:active{cursor:grabbing}
+/* In a room the server owns the order: the handle is still visible, so its
+   absence is not read as a bug, but it explains itself instead of dragging. */
+.queue-grip[disabled]{cursor:default;opacity:.45}
+.queue-grip[disabled]:hover{background:transparent;color:var(--soft)}
+/* The row under the finger. Only transform/opacity move, and the lift is a
+   shadow on the surfaces inside it, so a drag never reflows the list. */
+.queue-row.dragging{z-index:3;will-change:transform}
+.queue-row.dragging .queue-mini,
+.queue-row.dragging .queue-grip{
+  background:var(--card-2);
+  box-shadow:var(--shadow-2),inset 0 1px rgba(255,255,255,.08)
+}
+/* Where it will land: one coral hairline above or below a row. */
+.queue-row.drop-before::before,
+.queue-row.drop-after::after{
+  content:'';
+  position:absolute;
+  left:4px;
+  right:4px;
+  height:2px;
+  border-radius:2px;
+  background:var(--accent);
+  animation:queue-drop var(--dur-1) var(--ease-out) both
+}
+.queue-row.drop-before::before{top:-3px}
+.queue-row.drop-after::after{bottom:-3px}
+@keyframes queue-drop{from{opacity:0;transform:scaleX(.45)}}
+
+/* context menu + profile popover share one shell */
+/* a row leaving the DOM (un-like, remove-from-playlist) fades before it goes */
+.track-row.removing{opacity:0;transform:translateX(-12px);transition:opacity 160ms var(--ease-out),transform 160ms var(--ease-out)}
+
+.context-menu,
+.profile-popover{
+  position:fixed;
+  z-index:var(--z-menu);
+  width:min(240px,calc(100vw - 24px));
+  padding:6px;
+  border-radius:var(--r-sm);
+  border:1px solid var(--line-2);
+  background:rgba(36,37,44,.98);
+  color:var(--white);
+  box-shadow:var(--shadow-3),inset 0 1px rgba(255,255,255,.07);
+  animation:menu-in var(--dur-1) var(--ease-out) both
+}
+.context-menu.flip-y{translate:0 -100%;transform-origin:bottom left}
+.context-menu.flip-x{translate:-100% 0;transform-origin:top right}
+.context-menu.flip-x.flip-y{translate:-100% -100%;transform-origin:bottom right}
+.context-menu button,
+.profile-popover button{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  width:100%;
+  min-height:44px;
+  padding:0 10px;
+  border-radius:var(--r-xs);
+  background:transparent;
+  color:var(--text-2);
+  font-size:12.5px;
+  font-weight:650;
+  text-align:left;
+  transition:background var(--dur-1) var(--ease-out),color var(--dur-1) var(--ease-out)
+}
+.context-menu button:hover,
+.profile-popover button:hover{background:rgba(255,255,255,.08);color:var(--white)}
+.context-menu button svg,
+.profile-popover button svg{width:15px;height:15px;color:var(--soft)}
+.context-menu button:hover svg,
+.profile-popover button:hover svg{color:var(--accent)}
+/* Fallback slot only: app.js anchors the popover to the trigger that opened it
+   (topbar button or sidebar footer) and overrides left/top inline. Without
+   script this keeps it on screen near the topbar button. */
+.profile-popover{top:calc(54px + var(--sat,0px));right:12px}
+
+
+/* ── 17 toast ───────────────────────────────────────────────────────────────
+   A floating status pill above the player. Dark surface (the old white pill
+   out-shouted the app), one accent-coloured icon, and a quiet border. */
+.toast{
+  position:fixed;
+  left:50%;
+  bottom:calc(150px + var(--sab,0px));
+  translate:-50% 0;
+  z-index:var(--z-toast);
+  display:flex;
+  align-items:center;
+  gap:9px;
+  max-width:calc(100vw - 28px);
+  padding:11px 15px;
+  border-radius:var(--r-pill);
+  border:1px solid var(--line-2);
+  background:rgba(38,39,46,.98);
+  color:var(--white);
+  font-size:12px;
+  font-weight:700;
+  line-height:1.35;
+  text-align:left;
+  box-shadow:var(--shadow-2),inset 0 1px rgba(255,255,255,.07);
+  opacity:0;
+  transform:translateY(8px);
+  pointer-events:none;
+  transition:opacity var(--dur-2) var(--ease-out),transform var(--dur-2) var(--ease-out)
+}
+.toast[hidden]{display:none!important}
+.toast.show{opacity:1;transform:translateY(0)}
+.toast svg{color:var(--ok);flex:none}
+.toast.error,
+.toast[data-kind="error"]{border-color:rgba(255,154,154,.4);background:rgba(48,32,34,.98)}
+.toast.error svg,
+.toast[data-kind="error"] svg{color:var(--bad)}
+.toast.info,
+.toast[data-kind="info"]{border-color:var(--accent-line);background:rgba(46,34,33,.98)}
+.toast.info svg,
+.toast[data-kind="info"] svg{color:var(--accent)}
+.toast[data-kind="success"] svg{color:var(--ok)}
+
+
+/* ── 18 skeletons & empty states ───────────────────────────────────────────── */
+/* `.sk` is the atom; `.sk-hero` is the one block that ships without it */
+.sk,
+.sk-hero{position:relative;overflow:hidden;border-radius:var(--r-xs);background:linear-gradient(100deg,#23242a,#1c1d22)}
+.sk::after,
+.sk-hero::after{
+  content:'';
+  position:absolute;
+  inset:0;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.06),transparent);
+  transform:translateX(-100%);
+  animation:sk-shimmer 1.7s var(--ease-out) infinite
+}
+.sk-hero{height:clamp(200px,30vw,322px);border-radius:var(--r-md);margin-bottom:18px}
+.sk-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:22px}
+.sk-card{display:grid;gap:8px;min-width:0}
+.sk-cover{width:100%;aspect-ratio:1;border-radius:var(--r-sm)}
+.sk-cover.sm{width:44px;height:44px;flex:none;border-radius:6px}
+.sk-cover.xl{width:104px;height:104px;flex:none;border-radius:var(--r-xs)}
+/* an artist skeleton is a circle, matching the avatar it stands in for */
+.sk-cover.round{border-radius:50%}
+.sk-line.tall{height:16px;border-radius:6px}
+.sk-pill{height:44px;width:118px;border-radius:var(--r-pill)}
+.sk-actions{display:flex;gap:9px;margin:6px 0 16px}
+.sk-line{height:9px;border-radius:var(--r-pill)}
+.sk-line + .sk-line{margin-top:-2px}
+.sk-rows{display:grid;gap:10px}
+.sk-row{display:flex;align-items:center;gap:12px;min-height:60px}
+.sk-lines{display:grid;gap:7px;flex:1;min-width:0}
+.w-35{width:35%}
+.w-40{width:40%}
+.w-60{width:60%}
+.w-70{width:70%}
+
+/* legacy placeholder text ("Loading…") that is still emitted by app.js:
+   keep it quiet and centred instead of a bare line of punctuation */
+.skeleton{padding:26px 14px;border-radius:var(--r-sm);color:var(--soft);font-size:12.5px;text-align:center;background:rgba(255,255,255,.02)}
+
+.empty-state{display:flex;flex-direction:column;align-items:center;gap:10px;padding:44px 20px 48px;text-align:center;color:var(--muted)}
+.empty-art{
+  display:grid;
+  place-items:center;
+  width:64px;
+  height:64px;
+  margin-bottom:2px;
+  border-radius:50%;
+  border:1px solid var(--line);
+  background:var(--card);
+  color:var(--accent);
+  box-shadow:inset 0 1px rgba(255,255,255,.06)
+}
+.empty-art .ico{width:26px;height:26px}
+.empty-state h3{font-size:15px;font-weight:800;letter-spacing:-.015em;color:var(--white)}
+.empty-state p{max-width:34ch;font-size:12.5px;line-height:1.6;color:var(--muted)}
+.empty-actions{display:flex;gap:9px;align-items:center;margin-top:4px}
+
+
+/* ── 19 motion ──────────────────────────────────────────────────────────────
+   Transform + opacity only, nothing over 400ms, and everything collapses under
+   prefers-reduced-motion at the very bottom of this section. */
+@keyframes page-enter{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@keyframes card-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@keyframes sheet-in{from{opacity:0;transform:translateY(22px)}to{opacity:1;transform:none}}
+@keyframes drawer-in{from{opacity:.4;transform:translateX(26px)}to{opacity:1;transform:none}}
+@keyframes drawer-out{from{opacity:1;transform:none}to{opacity:0;transform:translateX(26px)}}
+@keyframes sheet-out{from{opacity:1;transform:none}to{opacity:0;transform:translateY(26px)}}
+@keyframes backdrop-in{from{opacity:0}to{opacity:1}}
+@keyframes backdrop-out{from{opacity:1}to{opacity:0}}
+@keyframes menu-in{from{opacity:0;transform:scale(.96)}to{opacity:1;transform:none}}
+@keyframes toast-in{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+@keyframes segment-in{
+  from{opacity:.55;transform:scale(.965)}
+  to{opacity:1;transform:none}
+}
+@keyframes shake{
+  0%,100%{transform:translateX(0)}
+  20%{transform:translateX(-6px)}
+  40%{transform:translateX(5px)}
+  60%{transform:translateX(-3px)}
+  80%{transform:translateX(2px)}
+}
+@keyframes heart-pop{0%{transform:scale(1)}35%{transform:scale(1.28)}70%{transform:scale(.94)}100%{transform:scale(1)}}
+@keyframes sk-shimmer{to{transform:translateX(100%)}}
+@keyframes wave{to{transform:scaleY(.35)}}
+@keyframes pulse{50%{opacity:.35;transform:scale(.85)}}
+@keyframes eq{from{height:3px}to{height:12px}}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* staggered entrance for card grids — 30ms per item, capped at 8 */
+.card-grid > *,
+.library-grid > *,
+.quick-grid > *,
+.mood-grid > *,
+.station-grid > *,
+.sk-grid > *{animation:card-in var(--dur-3) var(--ease-out) both}
+.card-grid > :nth-child(2),
+.library-grid > :nth-child(2),
+.quick-grid > :nth-child(2),
+.mood-grid > :nth-child(2),
+.station-grid > :nth-child(2),
+.sk-grid > :nth-child(2){animation-delay:30ms}
+.card-grid > :nth-child(3),
+.library-grid > :nth-child(3),
+.quick-grid > :nth-child(3),
+.mood-grid > :nth-child(3),
+.station-grid > :nth-child(3),
+.sk-grid > :nth-child(3){animation-delay:60ms}
+.card-grid > :nth-child(4),
+.library-grid > :nth-child(4),
+.quick-grid > :nth-child(4),
+.station-grid > :nth-child(4),
+.sk-grid > :nth-child(4){animation-delay:90ms}
+.card-grid > :nth-child(5),
+.library-grid > :nth-child(5),
+.quick-grid > :nth-child(5),
+.station-grid > :nth-child(5),
+.sk-grid > :nth-child(5){animation-delay:120ms}
+.library-grid > :nth-child(6),
+.station-grid > :nth-child(6),
+.sk-grid > :nth-child(6){animation-delay:150ms}
+.library-grid > :nth-child(7),
+.sk-grid > :nth-child(7){animation-delay:180ms}
+.library-grid > :nth-child(8),
+.sk-grid > :nth-child(8){animation-delay:210ms}
+
+/* long lists: skip rendering work for rows that are far off-screen */
+.rail .queue-mini,
+.rail .session-card,
+.admin-card{content-visibility:auto;contain-intrinsic-size:auto 120px}
+
+@media (prefers-reduced-motion:reduce){
+  *,
+  *::before,
+  *::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}
+  .toast{opacity:1;transform:none}
+}
+
+
+/* ── 20 responsive ──────────────────────────────────────────────────────────
+   651px  icon rail + real player, bottom nav gone
+   811px  the sidebar regains its labels, two-column player console
+   1081px the third column (queue rail) appears
+   1311px full 235px sidebar (contract) + 292px rail
+   1601px wide-screen typography and gutters                                */
+
+/* — 651 — phones in landscape, small tablets */
+@media(max-width:650px){
+  .topbar .nav-arrow,
+  .top-search{display:none}
+  /* the avatar alone is the account affordance on a phone; the name and the
+     chevron only add noise at 390px */
+  .user-button{width:44px;padding:0;justify-content:center;background:transparent}
+  .user-button span,
+  .user-button .ico{display:none}
+  .user-button:hover{background:rgba(255,255,255,.06)}
+  .topbar-actions .icon-btn{width:44px}
+  .kbd-hint{display:none}
+  .search-shell{padding:0}
+
+  /* The hero footer holds two real actions. On a phone they share one row
+     (tightened, never wrapped) so both are visible above the player without
+     scrolling; the caption that used to collide with them is hidden. */
+  .hero-footer{flex-wrap:nowrap;gap:8px;padding-top:16px;row-gap:0}
+  .hero-footer .play-btn{padding:0 14px;font-size:12.5px;white-space:nowrap}
+  /* the ghost action sits on top of the artwork gradient: give it its own scrim
+     so it stays legible over the brightest part of the orb */
+  .hero-footer .secondary-btn{padding:0 12px;font-size:12.5px;white-space:nowrap;
+    background:rgba(24,18,28,.42);border-color:rgba(255,255,255,.26)}
+  .hero-footer .hero-meta{display:none}
+
+  /* admin tables become stacked rows: no horizontal scrolling on a phone */
+  .admin-table.responsive{min-width:0}
+  .admin-table.responsive thead{display:none}
+  .admin-table.responsive tbody tr{display:block;padding:10px 6px 12px;border-bottom:1px solid var(--line)}
+  .admin-table.responsive tbody tr:last-child{border-bottom:0}
+  .admin-table.responsive td{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:5px 8px;border:0;text-align:right}
+  .admin-table.responsive td::before{content:attr(data-label);flex:none;color:var(--soft);font-size:9.5px;font-weight:800;letter-spacing:.11em;text-transform:uppercase;text-align:left}
+  .admin-table.responsive td:first-child{display:block;text-align:left;padding-bottom:9px;margin-bottom:6px;border-bottom:1px solid var(--line)}
+  .admin-table.responsive td:first-child::before{display:none}
+  .admin-table.responsive td.admin-actions{display:block;padding-top:9px}
+  .admin-table.responsive td.admin-actions::before{display:none}
+  .admin-table.responsive .admin-action-grid{justify-content:flex-start;gap:6px}
+  .admin-table.responsive .admin-action-grid button{min-height:40px;padding:0 12px;font-size:11.5px}
+  .admin-search .search-clear{display:none}
+  .admin .toolbar-row,
+  .toolbar-row:has(.admin-who){flex-wrap:wrap}
+  .admin-who{margin-left:auto}
+}
+
+/* ── the phone bar: cover, one line of title, play, next ─────────────────────
+   The like action lives in the now-playing sheet, so the bar stays a bar:
+   a 46px title row next to two 44px transport targets never overlaps. */
+@media(max-width:650px){
+  .player{padding:0 6px 0 8px;gap:4px}
+  .player-song{gap:10px;flex:1 1 auto}
+  .player-cover{width:42px;height:42px;border-radius:7px}
+  .player-song-meta{flex:1 1 auto;width:0;max-width:none;min-width:0;min-height:44px;overflow:hidden}
+  .player-song-meta strong{font-size:12.5px;line-height:1.25}
+  .player-song-meta span{display:none}
+  /* on touch the like control is a real 44x44 target, like everything else
+     in the bar */
+  .player-like{display:grid;flex:none;width:44px;height:44px}
+  /* "less like this" is a rare, deliberate action: it lives in the sheet and
+     the row menu, not in the 71px bar next to the transport */
+  .player-dislike{display:none}
+  .mobile-player-control{gap:6px}
+  .mobile-player-control .ico{width:20px;height:20px}
+}
+
+/* A short phone (SE, 360x640) cannot afford a 322px hero above the fold: the
+   primary action would sit behind the player. Tighten it so both actions are
+   visible without scrolling. */
+/* Narrowest phones: two actions cannot share a row inside the hero's padding,
+   so they stack — each is still comfortably 44px tall and fully visible. */
+@media(max-width:380px){
+  .hero-footer{flex-wrap:wrap;row-gap:8px;gap:8px}
+}
+
+/* A short phone cannot afford a 128px square above the lyrics: the scroll
+   region collapsed to a single line. Shrink the art and tighten the header so
+   the sheet still shows a usable amount of text. */
+@media(max-width:650px) and (max-height:700px){
+  .now-modal .modal-cover{height:clamp(96px,calc(100dvh - 440px),160px)}
+  .now-modal h2{font-size:20px;line-height:1.18;margin-top:2px}
+  .now-modal .eyebrow{font-size:9px}
+  .modal-tabs{margin-top:0}
+  .np-scroll{min-height:84px}
+  .modal-controls{margin-top:2px}
+}
+
+@media(max-width:650px) and (max-height:700px){
+  .hero{min-height:258px}
+  .hero-content{min-height:258px;padding:20px}
+  .hero h1{margin:14px 0 8px;font-size:clamp(27px,8.2vw,32px)}
+  .hero p{font-size:11.5px;line-height:1.55}
+}
+
+@media(min-width:651px){
+  .app{grid-template-columns:69px minmax(0,1fr);grid-template-rows:minmax(0,1fr) 82px}
+  .main{grid-column:2}
+
+  .sidebar{display:flex;align-items:center;padding:18px 8px 12px}
+  .brand{justify-content:center;padding:2px 0 20px;width:100%}
+  .brand-word,
+  .sidebar .nav-btn span,
+  .nav-label,
+  .playlist-links,
+  .sidebar-bottom,
+  .tiny-new{display:none}
+  .sidebar-foot{display:none}
+  .nav-btn{justify-content:center;width:46px;height:46px;min-height:46px;padding:0;margin:0 auto}
+  .nav-btn .ico{width:21px;height:21px}
+  .nav-btn.active::before,
+  .nav-btn[aria-current="page"]::before{display:none}
+
+  .mobile-nav{display:none}
+  .rail{display:none}
+
+  .topbar{height:64px;padding:0 22px}
+  .topbar-left::before{content:none}
+  .topbar .nav-arrow{display:grid;width:36px;height:36px}
+  .top-search{display:flex}
+
+  .icon-btn{width:38px;height:38px}
+  .user-button{height:38px}
+  .notification-dot{top:9px;right:9px}
+  .date-text{display:block}
+
+  .page{padding:4px 22px 44px}
+  .page-head{margin:12px 0 20px}
+  .page-title{font-size:clamp(28px,3.4vw,33px)}
+  .section-head{margin:26px 0 15px}
+  .section-head h2{font-size:18px}
+
+  .hero{min-height:322px}
+  .hero-footer{gap:9px;row-gap:9px;flex-wrap:wrap}
+  .hero-footer .play-btn{padding:0 16px}
+  .hero-footer .secondary-btn{padding:0 14px}
+  .hero-footer .hero-meta{display:none}
+  /* full width: the artwork is a background layer, and the action row needs
+     the room to stay on one line on a phone */
+  .hero-content{min-height:322px;max-width:100%;padding:30px}
+  .hero-art{inset:0 0 0 34%;opacity:1}
+  .hero-orb{top:-64px;right:7%;width:360px;height:360px}
+  .hero-art .ring{top:-26%;right:-22%;width:540px;height:540px}
+  .hero-art .ring.r2{width:620px;height:620px;top:-30%}
+  .hero-art .ring.r3{width:710px;height:710px;top:-36%}
+  .hero-fade{background:linear-gradient(90deg,#282031 2%,rgba(43,34,53,.72) 36%,transparent 82%)}
+  .hero h1{font-size:clamp(34px,3.3vw,46px);max-width:420px;margin:24px 0 12px;letter-spacing:-.04em}
+  .hero p{font-size:12px;max-width:318px}
+  .hero-footer{padding-top:20px}
+
+  .quick-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}
+  .quick-card{height:62px}
+  .quick-card .cover{width:62px;height:62px}
+  .quick-title{padding-right:44px}
+  @media (hover:hover) and (pointer:fine){
+    .quick-card .mini-play{
+      display:grid;
+      position:absolute;
+      right:10px;
+      width:34px;
+      height:34px;
+      place-items:center;
+      border-radius:50%;
+      background:var(--accent);
+      color:var(--accent-ink);
+      opacity:0;
+      transform:translateY(3px);
+      box-shadow:0 6px 16px rgba(0,0,0,.4);
+      transition:opacity var(--dur-2) var(--ease-out),transform var(--dur-2) var(--ease-out)
+    }
+    .quick-card .mini-play svg{width:14px;height:14px}
+    .quick-card:hover .mini-play,
+    .quick-card:focus-visible .mini-play{opacity:1;transform:none}
+  }
+  .card-grid,
+  .library-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
+  .music-card .cover-play{width:42px;height:42px}
+  .wide-feature{padding:14px;gap:18px}
+  .wide-feature .cover{width:104px;height:104px}
+  .wide-feature h3{font-size:17px}
+  .wide-feature p{font-size:11.5px;-webkit-line-clamp:2}
+
+  .mood-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:11px}
+  .mood{height:108px;font-size:16px;padding:16px}
+  .mood img{width:96px;height:96px}
+  .search-box{height:54px}
+  .chip{min-height:44px;padding:0 14px}
+  .segment{min-height:44px}
+  .toolbar-row{margin:14px 0 18px}
+
+  .station-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:13px}
+  .station{padding:11px}
+  .station .cover,
+  .station-art .cover{aspect-ratio:1.4}
+  .station strong{font-size:13px}
+  .radio-feature{padding:24px;min-height:210px}
+  .radio-feature .radio-graphics{position:static;translate:none;opacity:.7;flex:1;justify-content:flex-end}
+  .radio-feature .radio-graphics i{width:11px}
+
+  .collection-hero{align-items:flex-end;gap:22px;padding:14px 0 24px}
+  .collection-art{width:170px;height:170px;border-radius:var(--r-sm)}
+  .collection-hero.compact .collection-art{width:140px;height:140px}
+  .collection-hero h1{font-size:clamp(28px,3.7vw,42px);-webkit-line-clamp:3}
+  .collection-hero p{display:block;max-width:52ch;color:var(--muted);font-size:12px;line-height:1.65;margin-bottom:9px}
+  .collection-actions{padding-bottom:14px}
+  .collection-actions .play-btn{width:56px;height:56px;min-height:56px}
+  .collection-actions .circle-action{width:44px;height:44px}
+
+  /* An artist page at desktop width: the avatar grows with the collection art
+     so the two heroes read as the same kind of page, and the neighbours become
+     a grid instead of a scroll strip. */
+  .artist-hero{align-items:flex-end;gap:22px;padding:14px 0 22px}
+  .artist-hero-art{width:170px;height:170px}
+  .artist-hero h1{font-size:clamp(28px,3.7vw,42px);-webkit-line-clamp:3}
+  .artist-hero p{-webkit-line-clamp:3}
+  .artist-strip{
+    grid-auto-flow:row;grid-template-columns:repeat(3,minmax(0,1fr));
+    grid-auto-columns:auto;overflow:visible;padding-bottom:0
+  }
+
+  .track-header,
+  .track-row{grid-template-columns:28px minmax(0,2fr) minmax(0,1.2fr) 44px 44px 56px 44px;gap:12px}
+  /* 40px keeps the row light visually while staying a comfortable mouse
+     target; the glyph inside is 22px, so it does not read as a small button */
+  .ctrl{width:40px;height:40px}
+  .track-header .track-album,
+  .track-album{display:block}
+  .track-header{padding:8px 8px;font-size:10px}
+  .track-row{padding:6px 8px}
+  .track-name{font-size:13px}
+  .track-artist{font-size:11px}
+  .track-time{font-size:11px}
+
+  /* player console */
+  .player{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(230px,1.45fr) minmax(0,.8fr);align-items:center;gap:14px;padding:0 16px}
+  .mobile-player-control{display:none}
+  .player-center{display:block;width:100%;max-width:560px;margin:0 auto}
+  /* 651–810 is a two-handed tablet, not a desktop: the like pair moves to the
+     sheet so the title is not squeezed to six characters */
+  .player-like,
+  .player-dislike{display:none}
+  .player-extras{display:flex;align-items:center;justify-content:flex-end;gap:4px}
+  /* flex:none matters: in a short landscape window the extras column is
+     narrow and the buttons were being squeezed to 24px wide, which looked
+     like a broken icon strip. */
+  .player-extras .icon-btn{width:40px;height:40px;flex:none}
+  .sort-btn{width:44px;height:44px}
+  .player-extras .volume-group{display:none}
+  .player-cover{width:48px;height:48px}
+  .player-song-meta strong{font-size:12.5px;max-width:22ch}
+  .player-controls{gap:12px;margin-bottom:5px}
+  /* the bar's transport: 40px is the desktop floor (the glyph is 18px,
+     so it does not read as a small button) */
+  .player-controls button{width:40px;height:40px}
+  .player-controls .main-toggle{width:40px;height:40px}
+
+  .now-modal{
+    display:grid;
+    grid-template-columns:minmax(0,1fr) minmax(0,1.12fr);
+    align-items:center;
+    gap:clamp(20px,3vw,38px);
+    width:min(880px,100%);
+    height:auto;
+    max-height:min(88dvh,760px);
+    padding:clamp(22px,3vw,38px);
+    border-radius:var(--r-lg);
+    border:1px solid var(--line-2);
+    background:linear-gradient(150deg,#272029,#16171c 72%);
+    box-shadow:var(--shadow-3),inset 0 1px rgba(255,255,255,.08)
+  }
+  .overlay{padding:26px}
+  .sheet-grip{display:none}
+  .modal-close{position:absolute;top:14px;right:14px;width:44px;height:44px}
+  /* In the two-column sheet the text column starts at the top of the sheet,
+     where the close button floats — reserve its corner so the track actions
+     never sit underneath it. */
+  .np-head{padding-right:54px}
+  .now-modal .modal-cover{width:100%;height:auto;max-width:min(300px,70vw);max-height:min(28dvh,270px);justify-self:center;border-radius:var(--r-sm);box-shadow:0 26px 60px rgba(0,0,0,.55),inset 0 0 0 1px rgba(255,255,255,.08)}
+  .modal-content{max-width:none;margin:0;gap:10px;flex:0 1 auto}
+  .now-modal h2{font-size:clamp(26px,3vw,38px);-webkit-line-clamp:3}
+  .now-modal .byline{font-size:14px}
+  .modal-tabs{margin-top:4px}
+  .lyric-lines{flex:0 1 auto;max-height:200px;font-size:17px;line-height:1.75}
+  .np-scroll{flex:0 1 auto;max-height:220px}
+  .np-next{max-height:132px}
+  .modal-controls{margin-top:8px}
+  .modal-controls .big-play{width:58px;height:58px}
+
+  .yt-modal{display:flex;flex-direction:column;width:min(600px,100%);max-height:min(90dvh,780px);padding:26px;overflow-y:auto}
+  .yt-modal h2{font-size:26px}
+  .yt-steps li{font-size:13px}
+  .auth.now-modal{padding:32px;max-width:430px;width:100%}
+
+  .drawer{
+    left:auto;
+    right:0;
+    top:0;
+    bottom:0;
+    width:min(392px,100vw);
+    max-height:none;
+    padding:22px 20px;
+    border-radius:0;
+    border-top:0;
+    border-left:1px solid var(--line-2);
+    box-shadow:-30px 0 80px rgba(0,0,0,.5)
+  }
+  .drawer-backdrop:not([hidden]) .drawer{animation:drawer-in var(--dur-3) var(--ease-out) both}
+  .drawer-backdrop.closing .drawer{animation:drawer-out 180ms var(--ease-out) both}
+
+  .context-menu button,
+  .profile-popover button{min-height:38px}
+  .profile-popover{top:calc(58px + var(--sat,0px));right:16px}
+
+  .toast{bottom:calc(94px + var(--sab,0px));font-size:12.5px}
+
+  .field input,
+  .field textarea,
+  .field select,
+  .admin-form input,
+  .admin-form select,
+  .admin-search input{font-size:15px}
+  .yt-textarea{font-size:12.5px}
+  .form-sheet{padding:26px}
+  .now-modal.form-sheet{align-self:center;width:min(470px,100%);padding:26px;border-bottom:1px solid var(--line-2);border-radius:var(--r-lg)}
+  .now-modal.form-sheet .modal-close{top:14px;right:14px}
+  .form-body input,
+  .form-body select,
+  .form-body textarea{font-size:15px}
+  .sk-cover.xl{width:160px;height:160px;border-radius:var(--r-sm)}
+  .search-clear{width:36px;height:36px}
+
+  .admin-stats{grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+  .admin-form{flex-wrap:nowrap}
+  .admin-form-title{width:auto}
+  .admin-form input{flex:1 1 auto}
+
+  .sk-grid{grid-template-columns:repeat(4,minmax(0,1fr))}
+  .empty-state{padding:56px 24px}
+}
+
+.rail-queue{display:grid;gap:0;min-height:0}
+
+/* Short desktop windows: the rail stack (art · title · waveform · queue ·
+   session card) is taller than the space above the player, so the last card
+   was always sliced. Reclaim the 35px from breathing room rather than from
+   content: keep all four queue rows, tighten the block gaps, and cap the
+   artwork so the whole column fits above the fold. */
+@media (min-width: 1081px) and (max-height: 1000px) {
+  .rail{gap:9px;padding-top:16px;padding-bottom:16px}
+  .rail-cover{max-height:min(27vh,196px);max-width:min(27vh,196px);margin:0 auto;width:100%}
+  .rail-queue .queue-mini{height:44px}
+  .rail-track-info h2{font-size:15px}
+  .waveform{height:30px}
+  .session-card{padding:13px}
+  .session-card .session-title{font-size:13px}
+}
+
+/* — 811 — tablets *//* — 811 — tablets */
+@media(min-width:811px){
+  .app{grid-template-columns:214px minmax(0,1fr)}
+  .sidebar{align-items:stretch;padding:22px 12px 14px}
+  .brand{justify-content:flex-start;padding:2px 12px 18px;width:auto}
+  .brand-word,
+  .nav-label,
+  .sidebar-bottom,
+  .tiny-new{display:block}
+  .sidebar-foot{display:flex}
+  .playlist-links{display:grid}
+  .sidebar .nav-btn span{display:block}
+  /* from 811 up the bar keeps the taste pair in the sheet and gives the title
+     the full left column; the row menu and the sheet carry like/dislike */
+  .player-like,
+  .player-dislike{display:none}
+  .playlist-links{display:grid}
+  .nav-btn{justify-content:flex-start;width:auto;height:auto;min-height:44px;padding:0 13px;margin:0}
+  .nav-btn.active::before,
+  .nav-btn[aria-current="page"]::before{display:block}
+  .page{padding:6px 26px 48px}
+  .topbar{padding:0 26px}
+  .player{grid-template-columns:minmax(0,1fr) minmax(260px,1.5fr) minmax(0,1fr);gap:18px;padding:0 22px}
+  .player-extras .volume-group{display:flex}
+  .player-cover{width:52px;height:52px}
+  .card-grid,
+  .library-grid{grid-template-columns:repeat(4,minmax(0,1fr))}
+  .admin-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .now-modal{grid-template-columns:minmax(0,1fr) minmax(300px,1.05fr);width:min(920px,100%)}
+  .now-modal .modal-cover{max-width:320px}
+  .hero-content{max-width:60%}
+  .collection-art{width:196px;height:196px}
+}
+
+/* — 1081 — the rail returns */
+/* wide desktop: the bar has room for the taste pair next to the title again */
+@media(min-width:1081px){
+  .player-like,
+  .player-dislike{display:grid;width:40px;height:40px}
+}
+
+@media(min-width:1081px){
+  .app{grid-template-columns:218px minmax(0,1fr) 264px}
+  .rail{display:block}
+  .page{padding:6px 28px 52px}
+  .topbar{padding:0 28px}
+  .topbar .nav-arrow{display:grid}
+  .hero{min-height:330px}
+  .hero-content{min-height:330px}
+  .player{grid-template-columns:minmax(0,1.05fr) minmax(300px,1.45fr) minmax(0,1fr)}
+  .admin-stats{grid-template-columns:repeat(5,minmax(0,1fr))}
+  .admin-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .search-shell{grid-template-columns:minmax(0,1fr)}
+}
+
+/* — 1311 — the documented desktop shell (contract keeps 235px verbatim) */
+@media(min-width:1311px){
+  .app{grid-template-columns:235px minmax(0,1fr) 292px}
+  .sidebar{padding:26px 13px 16px}
+  .brand{padding:3px 16px 22px}
+  .brand-word{font-size:24px}
+  .page{padding:8px 34px 60px}
+  .topbar{padding:0 34px}
+  .rail{padding:24px 22px 28px}
+  .hero{min-height:344px}
+  .hero-content{min-height:344px;padding:34px}
+  .hero h1{max-width:450px}
+  .quick-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+  .quick-card{height:66px}
+  .quick-card .cover{width:66px;height:66px}
+  .card-grid,
+  .library-grid{grid-template-columns:repeat(4,minmax(0,1fr));gap:19px}
+  .player{grid-template-columns:minmax(200px,1fr) minmax(320px,1.35fr) minmax(200px,1fr);gap:24px;padding:0 24px}
+  .player-cover{width:52px;height:52px}
+  .player-controls{gap:16px}
+  .player-controls button{width:40px;height:40px}
+  .player-extras{gap:8px}
+  .player-extras .volume-group{display:flex}
+  .mood{height:120px}
+  .collection-art{width:207px;height:207px}
+}
+
+/* — 1601 — wide desktop */
+@media(min-width:1601px){
+  .app{grid-template-columns:253px minmax(0,1fr) 310px}
+  .page{padding:10px 42px 70px}
+  .topbar{padding:0 42px;height:70px}
+  .rail{padding:28px 24px 32px}
+  .hero{min-height:366px}
+  .hero-content{min-height:366px;padding:40px}
+  .hero h1{font-size:52px;max-width:500px;margin:30px 0 14px}
+  .hero p{font-size:12.5px;max-width:340px}
+  .page-title{font-size:34px}
+  .section-head h2{font-size:19px}
+  .card-grid,
+  .library-grid{gap:22px}
+  .music-card-title{font-size:13px}
+  .track-name{font-size:13.5px}
+  .now-modal{width:min(960px,100%);gap:44px}
+  .now-modal .modal-cover{max-width:360px}
+  .lyric-lines{font-size:18px}
+  .player-song-meta strong{max-width:24ch}
+}
+
+/* — short landscape (phones on their side): keep the content above the fold */
+@media (orientation:landscape) and (max-height:520px){
+  .topbar{height:52px}
+  .page{padding-top:2px;padding-bottom:28px}
+  .page-head{margin:4px 0 12px}
+  .hero{min-height:250px}
+  .hero-content{min-height:250px;padding:18px 20px}
+  .hero h1{font-size:clamp(24px,4vw,32px);margin:12px 0 8px;max-width:340px}
+  .hero p{font-size:11px;-webkit-line-clamp:2;display:-webkit-box;-webkit-box-orient:vertical;overflow:hidden}
+  .hero-footer{padding-top:14px}
+  .collection-hero{padding:8px 0 12px}
+  .collection-art{width:96px;height:96px}
+  .collection-hero p{display:none}
+  .section-head{margin:18px 0 10px}
+  /* two columns, both constraining their own scroll region, so the transport
+     never lands below the fold on a 390px-tall phone */
+  /* more specific than the safe-area .overlay rule further down, which would
+     otherwise re-add 26px around a sheet that is already height-constrained */
+  body > .overlay{padding:8px calc(8px + var(--sar,0px)) calc(8px + var(--sab,0px)) calc(8px + var(--sal,0px))}
+  .now-modal{
+    display:grid;
+    grid-template-columns:minmax(0,168px) minmax(0,1fr);
+    grid-template-rows:minmax(0,1fr);
+    align-items:center;
+    gap:18px;
+    height:calc(100dvh - 16px);
+    max-height:calc(100dvh - 16px);
+    padding:14px 18px;
+    overflow:hidden
+  }
+  .now-modal .modal-cover{width:100%;height:auto;max-width:168px;max-height:100%}
+  .modal-content{height:100%;min-height:0;overflow:hidden;gap:6px}
+  .now-modal h2{font-size:20px;-webkit-line-clamp:2}
+  .now-modal .byline{font-size:12px}
+  .modal-tabs{margin:0}
+  .modal-tabs button{min-height:44px;padding-bottom:6px;font-size:11.5px}
+  .np-scroll{flex:1 1 auto;min-height:0;max-height:none;overflow-y:auto}
+  .lyric-lines{font-size:13.5px;overflow:visible}
+  .np-next{border-top:0;padding-top:0}
+  /* keep like / queue / more reachable: a compact row instead of hiding them */
+  .np-actions{display:flex;gap:2px;padding:2px 0 0;border-top:0}
+  .np-actions .icon-btn{width:40px;height:40px}
+  .np-meta{display:none}
+  .modal-progress{margin-top:0}
+  .modal-controls{margin-top:0;gap:2px}
+  .modal-controls .big-play{width:44px;height:44px}
+  /* landscape phones are still touch devices: keep the 44px floor and buy the
+     height back by hiding the artwork, which has no room here anyway */
+  .modal-controls .icon-btn,
+  .modal-controls .ctrl{width:44px;height:44px}
+  .toast{bottom:calc(88px + var(--sab,0px))}
+}
+
+@media (orientation:landscape) and (max-height:520px) and (max-width:650px){
+  .app{grid-template-rows:minmax(0,1fr) 64px calc(56px + var(--sab))}
+  .mobile-nav{height:calc(56px + var(--sab))}
+  .mobile-nav button span{display:none}
+  .player-cover{width:38px;height:38px}
+}
+
+
+/* ── 21 safe areas (installed-PWA insets) ───────────────────────────────────
+   The viewport meta opts into `viewport-fit=cover` with a translucent status
+   bar, so on iOS the page paints edge to edge: the top ~59pt sits behind the
+   status bar / Dynamic Island and the bottom ~34pt behind the home indicator.
+   Anything that touches an edge offsets itself by env(safe-area-inset-*).
+   On desktop and iPad these resolve to 0px and nothing moves.
+
+   This block must stay LAST: test/safe-area.test.js reads the final `.app{`
+   rule and requires both `padding:var(--sat)` and the 87px player row. */
+:root{--sat:env(safe-area-inset-top,0px);--sab:env(safe-area-inset-bottom,0px);--sal:env(safe-area-inset-left,0px);--sar:env(safe-area-inset-right,0px)}
+
+/* The shell fills the screen exactly; content starts below the notch and the
+   player row grows by the home-indicator strip so nothing is covered.
+   --app-h only exists in an iOS home-screen app whose reported viewport is
+   shorter than the screen (see the boot script in index.html); everywhere else
+   this is plain 100dvh. */
+.app{height:100vh;height:var(--app-h,100dvh);padding:var(--sat) var(--sar) 0 var(--sal);grid-template-rows:minmax(0,1fr) calc(87px + var(--sab))}
+
+/* A full-screen overlay is `inset:0`, which resolves against the same
+   under-reported viewport as .app did; give it the same height so a full-height
+   sheet (now playing, auth, connect) still reaches the bottom of the screen.
+   100% is the identical value wherever --app-h is unset. */
+.overlay,.drawer-backdrop{height:var(--app-h,100%)}
+
+/* edge-hugging chrome inside the shell is already inset by .app's padding */
+.player{padding-bottom:0}
+.sidebar{padding-left:calc(12px + var(--sal))}
+.rail{padding-right:calc(22px + var(--sar))}
+.drawer{padding-top:calc(22px + var(--sat));padding-bottom:calc(22px + var(--sab))}
+.overlay{padding:calc(26px + var(--sat)) var(--sar) calc(26px + var(--sab)) var(--sal)}
+.toast{bottom:calc(96px + var(--sab))}
+.profile-popover{top:calc(58px + var(--sat));right:calc(16px + var(--sar))}
+
+@media(max-width:1080px){
+  .app{grid-template-rows:minmax(0,1fr) calc(82px + var(--sab))}
+}
+
+@media(max-width:650px){
+  .app{grid-template-rows:minmax(0,1fr) var(--player-h) calc(67px + var(--sab))}
+  .player{padding-bottom:0}
+  .mobile-nav{height:calc(67px + var(--sab));padding:2px 4px var(--sab)}
+  /* full-screen sheets: pad by the real inset instead of a guessed value, and
+     pin the close button above the artwork so it cannot scroll away */
+  .overlay{padding:0 var(--sar) 0 var(--sal)}
+  .now-modal{padding:calc(64px + var(--sat)) 22px calc(24px + var(--sab))}
+  .now-modal .modal-close{position:fixed;top:calc(12px + var(--sat));right:18px;z-index:3}
+  .sheet-grip{top:calc(10px + var(--sat))}
+  .toast{bottom:calc(150px + var(--sab))}
+  .drawer{padding-bottom:calc(22px + var(--sab))}
+  .profile-popover{top:calc(54px + var(--sat));right:calc(12px + var(--sar))}
+  .context-menu{max-width:calc(100vw - 16px - var(--sal) - var(--sar))}
+  .yt-modal{padding:calc(24px + var(--sat)) 20px calc(20px + var(--sab));max-height:calc(100dvh - var(--sat) - var(--sab))}
+  .auth.now-modal{padding:52px 22px calc(22px + var(--sab))}
+}
+
+/* ── very narrow phones (≤365px) ─────────────────────────────────────────────
+   Two hero actions side by side need ~274px; below that they either wrap or
+   push a pixel past the hero's edge, and a wrapped pair stays legible while a
+   clipped button does not. Kept last so it wins over the phone block above. */
+@media (max-width:365px){
+  .hero-footer{flex-wrap:wrap;row-gap:9px}
+}
+
+/* ── touch floor, declared LAST so it wins the cascade ───────────────────
+   The 44px minimum is a pointer rule, not a width rule: an 844x390 landscape
+   phone is wider than 650px but still a thumb, and the width-based blocks
+   relax these controls to 40px for a mouse. */
+@media (hover:none), (pointer:coarse){
+  .ctrl,
+  .player-controls button,
+  .player-extras .icon-btn,
+  .player-like,
+  .player-dislike,
+  .icon-btn,
+  .modal-controls .ctrl,
+  .modal-controls .icon-btn,
+  .sort-btn,
+  .circle-action,
+  .big-play,
+  .player-controls .main-toggle{width:44px;height:44px}
+  .chip,
+  .segment{min-height:44px}
+}

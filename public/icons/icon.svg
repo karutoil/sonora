@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="sonora">
+  <title>sonora</title>
+  <!-- The in-app mark: the coral rounded square of .brand-logo with the same
+       six-bar waveform as #i-wave. The square is upright here (launchers mask
+       it themselves); the -7deg tilt belongs to the CSS, not the icon.
+       Flat fill on purpose: gradients triple the PNG, and the product mark is
+       flat coral anyway. -->
+  <rect width="512" height="512" rx="116" ry="116" fill="#ff997b"/>
+  <g transform="translate(256 256) scale(10.2) translate(-12 -12)"
+     fill="none" stroke="#241914" stroke-width="2" stroke-linecap="round">
+    <path d="M2 9v6m4-10v14m4-16v18m4-14v10m4-13v16m4-11v6"/>
+  </g>
+</svg>

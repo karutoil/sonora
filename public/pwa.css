@@ -1,0 +1,450 @@
+/* sonora — install / update / offline chrome.
+   Loaded after app.css and namespaced .pwa-* so it can borrow the design
+   tokens without ever colliding with the app. Every rule has a literal
+   fallback, so this file is still correct if the tokens are missing.
+
+   Placement is deliberate: the stack floats in the gap above the player, which
+   is 99px on desktop, 94px at tablet width (player row 82px) and 148px on
+   mobile (71px player + 67px nav). Nothing here ever covers the mini player,
+   the nav or a focused control. */
+
+.pwa-stack {
+  position: fixed;
+  left: 0;
+  right: 0;
+  /* pwa.js measures the real player bar and overrides --pwa-bottom, so a
+     redesign of the player (or a new breakpoint) can never make this chrome
+     cover it. The calc() below is the no-measurement fallback. */
+  bottom: var(--pwa-bottom, calc(99px + env(safe-area-inset-bottom, 0px)));
+  z-index: 30; /* over the player (20), under every overlay (50+) */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  pointer-events: none;
+  font-family: Inter, system-ui, -apple-system, sans-serif;
+}
+
+.pwa-stack > * { pointer-events: auto; }
+
+@media (max-width: 1080px) {
+  .pwa-stack { bottom: var(--pwa-bottom, calc(94px + env(safe-area-inset-bottom, 0px))); }
+}
+
+@media (max-width: 650px) {
+  .pwa-stack { bottom: var(--pwa-bottom, calc(148px + env(safe-area-inset-bottom, 0px))); }
+}
+
+/* ── pills: update + connection status ─────────────────────────────────── */
+
+.pwa-pill {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  max-width: min(440px, calc(100vw - 24px));
+  min-height: 40px;
+  padding: 4px 6px 4px 14px;
+  border: 1px solid #ffffff1f;
+  border-radius: 999px;
+  background: #201d22f2;
+  color: #f4f0ec;
+  box-shadow: 0 12px 34px #00000080;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.25;
+  letter-spacing: -0.005em;
+  -webkit-backdrop-filter: blur(14px);
+  backdrop-filter: blur(14px);
+  animation: pwa-rise 220ms cubic-bezier(0.22, 0.68, 0.18, 1);
+}
+
+.pwa-pill-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pwa-pill-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent, #ff997b);
+  box-shadow: 0 0 0 3px #ff997b29;
+}
+
+.pwa-pill[data-tone="offline"] .pwa-pill-dot {
+  background: #eab369;
+  box-shadow: 0 0 0 3px #eab36929;
+}
+
+.pwa-pill[data-tone="online"] .pwa-pill-dot {
+  background: #7ed3a2;
+  box-shadow: 0 0 0 3px #7ed3a229;
+}
+
+/* the bottom-edge self-check: amber, and its numbers must line up */
+.pwa-pill[data-tone="warn"] .pwa-pill-dot {
+  background: #eab369;
+  box-shadow: 0 0 0 3px #eab36929;
+}
+.pwa-pill[data-tone="warn"] .pwa-pill-text {
+  font-variant-numeric: tabular-nums;
+}
+
+/* The desktop install notice (see the desktop block at the end of this file).
+   Its one action is the only thing worth tapping in that corner, so unlike the
+   update pill's Refresh it is filled; and a notification has room for one
+   readable sentence, so this pill may be wider than the update/offline ones
+   (which never render at those widths anyway). */
+.pwa-pill[data-kind="install"] { max-width: min(560px, calc(100vw - 40px)); }
+.pwa-pill[data-kind="install"] .pwa-pill-action {
+  padding: 0 14px;
+  background: var(--accent, #ff997b);
+  color: #251914;
+}
+.pwa-pill[data-kind="install"] .pwa-pill-action:hover { background: #ffab92; }
+
+.pwa-pill-action,
+.pwa-pill-dismiss {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  min-height: 32px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--accent, #ff997b);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+  /* Grow the hit area to 44px without making the pill itself chunky. */
+  margin-block: -6px;
+}
+
+.pwa-pill-dismiss {
+  width: 32px;
+  padding: 0;
+  color: #a8a4ac;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.pwa-pill-action:hover,
+.pwa-pill-dismiss:hover { background: #ffffff14; }
+
+.pwa-pill-action:active { transform: scale(0.97); }
+
+/* ── install banner ────────────────────────────────────────────────────── */
+
+.pwa-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: min(440px, calc(100vw - 24px));
+  padding: 12px;
+  border: 1px solid #ffffff22;
+  border-radius: 16px;
+  background: linear-gradient(148deg, #2b252b 0%, #1a191e 100%);
+  box-shadow: 0 20px 52px #000000a6, inset 0 1px #ffffff14;
+  color: #f4f0ec;
+  animation: pwa-rise 240ms cubic-bezier(0.22, 0.68, 0.18, 1);
+}
+
+.pwa-banner-art {
+  flex: none;
+  width: 38px;
+  height: 38px;
+  border-radius: 11px;
+  box-shadow: 0 6px 18px #ff997b2e;
+  transform: rotate(-4deg);
+}
+
+.pwa-banner-body { flex: 1; min-width: 0; }
+
+.pwa-banner-title {
+  margin: 0;
+  font-family: "Inter Display", Inter, system-ui, sans-serif;
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: -0.015em;
+  color: #f8f5f2;
+}
+
+.pwa-banner-text {
+  margin: 3px 0 0;
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1.45;
+  color: #a9a5ad;
+}
+
+.pwa-banner-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  flex: none;
+}
+
+.pwa-banner-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px; /* touch target, per the UX spec */
+  padding: 0 15px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: #d8d4da;
+  font: inherit;
+  font-family: Inter, system-ui, sans-serif;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.005em;
+  cursor: pointer;
+  transition: background 140ms ease, color 140ms ease, transform 140ms ease;
+}
+
+.pwa-banner-btn.primary {
+  background: var(--accent, #ff997b);
+  color: #251914;
+}
+
+.pwa-banner-btn.primary:hover { background: #ffab92; }
+.pwa-banner-btn.primary:active { transform: scale(0.98); }
+
+.pwa-banner-btn.ghost { border-color: #ffffff26; color: #c5c1c9; }
+.pwa-banner-btn.ghost:hover { background: #ffffff12; color: #f4f0ec; }
+
+/* ── iOS "Add to Home Screen" sheet ────────────────────────────────────── */
+
+.pwa-sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 70; /* above the app's overlays, below the toast (80) */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: calc(16px + env(safe-area-inset-top, 0px)) 16px
+    calc(16px + env(safe-area-inset-bottom, 0px));
+  background: #08080bbf;
+  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px);
+  animation: pwa-fade 160ms ease-out;
+}
+
+.pwa-sheet-backdrop[hidden] { display: none; }
+
+.pwa-sheet {
+  width: min(420px, 100%);
+  max-height: calc(100dvh - 32px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+  overflow: auto;
+  padding: 22px;
+  border: 1px solid #ffffff26;
+  border-radius: 22px;
+  background: linear-gradient(160deg, #2b242b 0%, #17171c 100%);
+  box-shadow: 0 34px 90px #000000b3, inset 0 1px #ffffff14;
+  color: #f4f0ec;
+  animation: pwa-pop 240ms cubic-bezier(0.22, 0.68, 0.18, 1);
+}
+
+.pwa-sheet-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.pwa-sheet-art {
+  flex: none;
+  width: 44px;
+  height: 44px;
+  border-radius: 13px;
+  transform: rotate(-4deg);
+  box-shadow: 0 8px 22px #ff997b2e;
+}
+
+.pwa-sheet-title {
+  margin: 0 0 4px;
+  font-family: "Inter Display", Inter, system-ui, sans-serif;
+  font-size: 18px;
+  font-weight: 800;
+  letter-spacing: -0.6px;
+  line-height: 1.2;
+}
+
+.pwa-sheet-text {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #a9a5ad;
+}
+
+.pwa-sheet-close {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  margin: -8px -8px 0 auto;
+  border: 0;
+  border-radius: 50%;
+  background: #ffffff14;
+  color: #f4f0ec;
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.pwa-sheet-close:hover { background: #ffffff24; }
+
+.pwa-steps {
+  display: grid;
+  gap: 14px;
+  margin: 0 0 20px;
+  padding: 0;
+  list-style: none;
+}
+
+.pwa-step {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.pwa-step-n {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  margin-top: 1px;
+  border-radius: 50%;
+  background: #ff997b24;
+  color: var(--accent, #ff997b);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.pwa-step strong {
+  display: block;
+  font-size: 12.5px;
+  font-weight: 750;
+  color: #f6f2ef;
+}
+
+.pwa-step p {
+  margin: 3px 0 0;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: #a29ea6;
+}
+
+.pwa-step b { color: #e9e4e0; font-weight: 750; }
+
+.pwa-step-share {
+  display: inline-block;
+  width: 13px;
+  height: 13px;
+  margin: 0 1px -2px;
+  color: #ffb49c;
+}
+
+.pwa-sheet-done { width: 100%; }
+
+/* ── focus, motion, narrow screens ─────────────────────────────────────── */
+
+.pwa-stack button:focus-visible,
+.pwa-sheet button:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent, #ff997b) 75%, white);
+  outline-offset: 2px;
+}
+
+@keyframes pwa-rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+
+@keyframes pwa-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes pwa-pop {
+  from { opacity: 0; transform: translateY(14px) scale(0.985); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (max-width: 650px) {
+  /* Bottom sheet on a phone: thumb-reachable, above the home indicator. */
+  .pwa-sheet-backdrop { align-items: flex-end; padding-left: 0; padding-right: 0; padding-bottom: 0; }
+  .pwa-sheet {
+    width: 100%;
+    max-height: calc(100dvh - env(safe-area-inset-top, 0px) - 24px);
+    padding: 22px 20px calc(22px + env(safe-area-inset-bottom, 0px));
+    border-radius: 22px 22px 0 0;
+    animation-name: pwa-sheet-up;
+  }
+}
+
+@media (max-width: 360px) {
+  .pwa-banner-art { display: none; }
+  .pwa-banner { gap: 10px; }
+  .pwa-pill { font-size: 11px; }
+}
+
+/* Landscape phones: the banner would eat half the screen. Keep the one-line
+   offer, drop the explanatory line, and lay the actions out side by side. */
+@media (max-height: 480px) {
+  .pwa-banner { padding: 8px 10px; gap: 10px; }
+  .pwa-banner-text { display: none; }
+  .pwa-banner-actions { flex-direction: row; }
+  .pwa-banner-art { width: 32px; height: 32px; border-radius: 9px; }
+}
+
+@keyframes pwa-sheet-up {
+  from { opacity: 0; transform: translateY(28px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* ── desktop ─────────────────────────────────────────────────────────────
+   Windows and macOS install too: Chromium fires beforeinstallprompt there, and
+   an installed PWA gets a Start-menu / Dock entry and a frameless, offline
+   window. So the offer is not suppressed at desktop widths — pwa.js simply
+   renders it as a one-line notice (.pwa-pill[data-kind="install"]) instead of
+   the card, because the card used to sit on top of the sidebar's own buttons
+   and the content grid. Declared last so it wins over the base rules above. */
+@media (min-width: 1081px) {
+  /* Bottom-right, in the corner a desktop notification belongs in: the left
+     edge of a wide window is the sidebar's playlist list, which is nothing but
+     rows to click, and the centre is where the app's own toasts appear. */
+  .pwa-stack {
+    align-items: flex-end;
+    padding-right: calc(20px + var(--sar, 0px));
+  }
+  .pwa-pill { align-self: flex-end; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pwa-stack *,
+  .pwa-pill,
+  .pwa-banner,
+  .pwa-sheet,
+  .pwa-sheet-backdrop {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+@media (forced-colors: active) {
+  .pwa-pill,
+  .pwa-banner,
+  .pwa-sheet { border: 1px solid CanvasText; }
+  .pwa-banner-btn.primary { background: Highlight; color: HighlightText; }
+}
