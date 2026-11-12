@@ -1,0 +1,21 @@
+# Rootless Podman override; use after compose.yaml, for example:
+#   podman compose -f compose.yaml -f compose.podman.yaml up -d --build
+#
+# The image deliberately runs as node (1000:1000). keep-id maps that container
+# identity to the invoking host user/group, so the ./data bind mount is writable
+# without running as root or making host files owned by a subuid. This option is
+# Podman-specific; Docker users should use compose.yaml alone.
+#
+# in_pod: false is required, not cosmetic. podman-compose 1.3 puts every project
+# into a shared pod by default, and `podman run` refuses `--userns` and `--pod` in
+# the same command ("--userns and --pod cannot be set together"). Without this
+# line the documented command above fails outright — and a stack started some
+# other way (a bare `podman compose up`, an older compose file) silently runs
+# without the mapping, which is the read-only bind mount that surfaces as
+# "attempt to write a readonly database" on the first boot that has to migrate.
+x-podman:
+  in_pod: false
+
+services:
+  sonora:
+    userns_mode: "keep-id:uid=1000,gid=1000"

@@ -36,11 +36,31 @@ issues a refresh token, so a tab left open overnight (or a PWA resumed a week
 later) renews itself silently.
 
 Refresh tokens **rotate**: each use revokes the presented token and returns a new
-one. Presenting an already-used token is treated as theft — the entire device is
-deleted, and both the thief and the legitimate client must sign in again. Two
-tabs racing the same token is handled by the same rule, which is why the client
-funnels every 401 through a single shared refresh promise rather than firing one
-per request.
+one. Rotation is not idempotent, and one browser is more than one tab, so a replay
+is judged by *when* it arrives:
+
+- **Within `SONORA_REFRESH_GRACE_MS`** (default 30 000 ms) of the rotation, a
+  replay is read as a race. The chain is walked forward to its newest link, that
+  link is rotated, and the presenter gets a fresh access cookie and a fresh
+  refresh token with `200`. Nothing is revoked, so a tab whose response was lost in
+  flight — or two tabs refreshing at the same moment — stay signed in.
+- **After the window**, a replay is treated as theft: the whole device is deleted
+  (refresh tokens revoked, device row gone, so the access cookie stops working on
+  the next request) and a `refresh_replay` row is written to the audit log
+  (*Admin → audit*). Both the thief and the legitimate client must sign in again.
+
+The window is a deliberate trade, and it is worth knowing what it costs: a refresh
+token copied out of a browser-profile backup, a synced cookie jar or an old log
+and presented inside those 30 seconds is indistinguishable from the race above, so
+it converts into a live session. The audit row is written on the theft path, not
+on the graced one, so such a replay leaves no explicit trace. If that matters more
+to you than a rare spurious sign-out, set `SONORA_REFRESH_GRACE_MS=0`: rotation
+becomes strictly one-shot and every presentation of an already-used token is
+theft.
+
+The client still funnels every `401` through a single shared refresh promise
+rather than firing one per request, which is what keeps the race rare in the first
+place.
 
 "Remember me" is reversible after the fact: *Account → Security* can forget a
 device, which destroys its refresh token and (for the current device) re-issues
@@ -79,7 +99,9 @@ Design decisions worth knowing:
   `0` forever, so only a real decrease on a non-zero counter is treated as a
   cloned authenticator.
 - **RP ID and origin come from the request** (`x-forwarded-host` /
-  `x-forwarded-proto` honoured), overridable with `SONORA_RP_ID` / `SONORA_ORIGIN`.
+  `x-forwarded-proto` honoured only while `SONORA_TRUST_PROXY` is on — the same
+  switch that governs `req.ip`, so a client cannot poison the origin a passkey
+  is bound to), overridable with `SONORA_RP_ID` / `SONORA_ORIGIN`.
   Behind a tunnel that rewrites `Host`, set them explicitly.
 
 ### Why passkeys are refused on an IP address
@@ -116,6 +138,7 @@ change.
 | POST | `/api/auth/logout` | end this device and forget it |
 | GET | `/api/me` | current user, device id, remembered flag, hasPasskeys |
 | GET | `/api/auth/security` | session summary, passkeys, devices, capabilities |
+| GET | `/api/auth/passkeys` | this user's registered passkeys |
 | POST | `/api/auth/passkey/register/options` | start passkey registration |
 | POST | `/api/auth/passkey/register/verify` | finish registration |
 | POST | `/api/auth/passkey/login/options` | start passkey sign-in |
@@ -132,11 +155,13 @@ change.
 ```sh
 SONORA_SESSION_MINUTES=720   # access token lifetime
 SONORA_REFRESH_DAYS=30       # how long "remember me" lasts
+SONORA_REFRESH_GRACE_MS=30000  # a replay this soon after rotation is a race, not theft; 0 = strict
 SONORA_LOGIN_RATE_MAX=10     # sign-in attempts per window, per client IP
 SONORA_LOGIN_RATE_WINDOW="1 minute"
 SONORA_RP_ID=                # passkey RP ID; defaults to the request hostname
 SONORA_ORIGIN=               # passkey expected origin; defaults to the request origin
 SONORA_RP_NAME=sonora        # the name the browser shows in its passkey prompt
+SONORA_TRUST_PROXY=1         # trusted proxy hops for req.ip / the passkey RP context (1 = one tunnel)
 ```
 
 ## Housekeeping

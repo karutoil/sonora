@@ -96,8 +96,15 @@ compensation is needed.
 `position(now) >= duration`, the snapshot reports `ended: true` and
 `playing: false` at `duration`. Any member may then send `next {auto:true}`
 (natural continuation); the server only accepts `auto` when the state really is
-ended, so it cannot be used to skip. A user-initiated skip obeys the room's
-control policy.
+ended, so it cannot be used to skip — with one small tolerance (500 ms) because
+a correct client that is a few milliseconds ahead of the server reaches the end
+of *its* file first, and refusing that one advance would wedge a room at every
+track boundary. A user-initiated skip obeys the room's control policy.
+
+The end is also *broadcast*: when the derived playhead crosses `duration` with
+nobody commanding, the room pushes a `state` frame with `ended: true` and
+`playing: false`. Clients clamp their own position to the duration, so a room
+nobody advances pauses at its end instead of looping.
 
 ### Commands and revision
 
@@ -105,20 +112,29 @@ Every command carries the `rev` the client last saw.
 
 - **Absolute** commands (`play`, `pause`, `seek`, `select`, `queue-add`,
   `queue-remove`) are applied against current state. The intent does not depend
-  on the old revision, and rebasing is exactly what the user asked for.
-- **Relative** commands (`next`, `prev`) require `rev` to match. Two people
-  pressing next at once must advance once, not twice; the loser gets
-  `409 { error: 'stale', state }` and simply follows the winner.
-- **Auto-advance** (`next {auto:true}`) is accepted when the state is ended, or
-  from the host when it is not (the host's player knows its own end even when
-  the catalogue had no duration for the track).
+  on the old revision, and rebasing is exactly what the user asked for — except
+  for a removal by index, which is only honoured against the revision it was
+  formed on (`409 stale` otherwise) because "index 2" means a different song
+  once the queue has shifted. Naming the track (`queue-remove {videoId}`) is the
+  primary form and is idempotent.
+- **Relative** commands (`next`, `prev`) require an integer `rev`, and it must
+  match; a missing or malformed revision is `400 { code: 'BAD_INPUT' }`, never
+  "assume current". Two people pressing next at once must advance once, not
+  twice; the loser gets `409 { error: 'stale', state }` and simply follows the
+  winner.
+- **Auto-advance** (`next {auto:true}`) is accepted when the state is ended
+  (within the 500 ms tolerance above), or from the host when it is not (the
+  host's player knows its own end even when the catalogue had no duration for
+  the track). The ended-track case is checked *before* the control policy, so a
+  `host`-controlled room still carries itself forward when the host's phone is
+  asleep.
 
 ### Control policy
 
 | `control` | members may |
 | --- | --- |
 | `everyone` (default) | play, pause, seek, next, prev, pick a track, change what is playing (queue-set), add to the queue |
-| `host` | only add to the queue; transport is the host's |
+| `host` | only add to the queue; transport is the host's (an ended track may still be continued by any member — see auto-advance above) |
 
 Adding to the queue stays collaborative under `host` control because a queue is
 a suggestion, not an interruption. The host can flip the policy at any time;
@@ -139,8 +155,10 @@ offset = server.now - (t0 + rtt / 2)
 Ticks and state events are not used for the offset: a one-way delay would bias
 it forward by the whole delay. They are used for presence and liveness only.
 
-Once the clock agrees, the correction loop runs once a second (and on
-`seeked` / `playing`):
+Once the clock agrees, the correction loop runs once a second. It is also
+invoked immediately whenever a fresh state (stream event, poll or command
+response) lands, so a deliberate play/pause/seek is applied in the same frame
+rather than up to a second later:
 
 | local drift | action |
 | --- | --- |
@@ -213,13 +231,14 @@ All paths are under `/api/rooms`, authenticated, and JSON except the stream.
 | GET | `/api/rooms` | rooms I host or joined → `{ rooms }` |
 | GET | `/api/rooms/:code` | snapshot; private non-invited → `403 { code:'PRIVATE' }` |
 | POST | `/api/rooms/:code/join` | join (public or invited) → snapshot |
-| POST | `/api/rooms/:code/leave` | leave → `{ ok }` |
+| POST | `/api/rooms/:code/leave` | leave → `{ ok, code, host }`; a host keeps their seat (leaving is not ending) |
 | DELETE | `/api/rooms/:code` | end the room (host) → `{ ok }` |
 | PATCH | `/api/rooms/:code` | `{visibility?, control?}` (host) → snapshot |
 | GET | `/api/rooms/:code/state` | snapshot (the polling fallback) |
 | GET | `/api/rooms/:code/time` | `{ now }` — clock probe |
 | GET | `/api/rooms/:code/events` | SSE: `snapshot`, `state`, `members`, `room`, `tick` |
-| POST | `/api/rooms/:code/command` | `{ type, rev, ... }` → snapshot, or `409 stale` || GET | `/api/rooms/:code/people?q=` | invite candidates (host) → `{ people }` |
+| POST | `/api/rooms/:code/command` | `{ type, rev, ... }` → snapshot, or `409 stale` |
+| GET | `/api/rooms/:code/people?q=` | invite candidates (host) → `{ people }` |
 | POST | `/api/rooms/:code/invite` | `{ name }` or `{ userId }` (host) → `{ invites }` |
 | DELETE | `/api/rooms/:code/invite/:userId` | remove an invite (host) → `{ invites }` |
 
@@ -277,12 +296,15 @@ calibrated its offset computes `positionMs + (serverNow − at)` while playing.
 `GET /events` sends one `snapshot` immediately (the same object as `/state`,
 including `members`), then:
 
-- `state` — a new snapshot on every command
+- `state` — a new snapshot on every command, and one when the derived playhead
+  reaches the end of the track (`ended: true`, `playing: false`)
 - `members` — the roster after a join/leave/connect/disconnect (guests receive
   the same event with an empty roster and the counts)
 - `room` — after a visibility/control change, when the host ends the room
-  (followed by closing the stream), or to a guest being removed because the room
-  became private (`{ removed: true, reason }`)
+  (followed by closing the stream), to a guest being removed because the room
+  became private (`{ removed: true, reason }`), or with `{ error }` when the
+  room is at its 200-stream ceiling (the stream is closed and the client falls
+  back to polling rather than reopening a full door)
 - `tick` — `{"now":…}` every 15 s; a comment line every 15 s on quiet rooms
 
 The stream sets `cache-control: no-cache, no-transform` and
@@ -302,7 +324,9 @@ polling `/state` every 3 s.
 - **One queue, no per-listener shuffle.** Shuffle is a personal opinion; a
   shared playhead has to be the same order for everyone.
 - **No chat.** This is a listening feature; the link lives in whatever chat
-  the group already uses.
+  the group already uses. The venue view's speech bubbles are *status* for the
+  same reason: they only ever repeat a fact the room already has (who hosts, how
+  many are listening, what is next) and never put words in a person's mouth.
 - **No live streams** — they have no end and no finite duration to sync to.
 - **Guests are listeners, not members.** No name, no roster entry, no commands.
   The count is honest; the identity is the connection.
@@ -333,3 +357,5 @@ audio access.
 - `test/listen-page.test.js` — the listener page's running order: server-rendered
   queue/played/room facts, a host command repainting it in place, the phone
   layout, and an ended room staying readable.
+- `test/listen-venue.test.js` — the opt-in venue view: a view of the same room
+  (same track, same queue, same count), never a second player, and no chat.

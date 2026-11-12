@@ -159,6 +159,8 @@
     color: #251914;
   }
   button:hover { background: #ffab92; }
+  button:disabled { opacity: .7; cursor: progress; }
+  button:disabled:hover { background: #ff997b; }
   .reload {
     color: #c9c4cb;
     border: 1px solid #ffffff26;
@@ -190,21 +192,27 @@
   </div>
   <p class="word">sonora<span>.</span></p>
   <p class="eyebrow">Offline</p>
-  <h1>No connection right now</h1>
-  <p>sonora can't reach your library. Check your network — the app will pick up
-    exactly where you left off.</p>
+  <h1>No connection to sonora</h1>
+  <p>Either you're offline or the sonora server isn't answering — the app will
+    pick up exactly where you left off.</p>
   <div class="actions">
     <button type="button" id="retry">Try again</button>
     <a class="reload" href="/">Reload sonora</a>
   </div>
   <p class="note">Your library, likes and playlists are safe — nothing is lost
-    while you're offline.</p>
+    while the server is unreachable.</p>
 </main>
 <script>
   // No framework, no dependency: a reload is the retry. If the server is still
-  // unreachable the service worker serves this page again.
-  document.getElementById('retry').addEventListener('click', function () {
-    location.reload();
+  // unreachable the service worker serves this page again — and because that
+  // page looks identical, the button must show that it tried.
+  var retry = document.getElementById('retry');
+  retry.addEventListener('click', function () {
+    if (retry.disabled) return;
+    retry.disabled = true;
+    retry.textContent = 'Retrying…';
+    // One frame for the label, then the reload.
+    setTimeout(function () { location.reload(); }, 60);
   });
 </script>
 </body>

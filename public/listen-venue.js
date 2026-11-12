@@ -207,11 +207,11 @@ const ROOM_SVG = `
       <text class="v-screen-title" x="934" y="330">Waiting for music</text>
       <text class="v-screen-sub" x="934" y="352"></text>
       <rect x="934" y="368" width="532" height="5" rx="2.5" fill="rgba(255,255,255,.28)"/>
-      <rect class="v-screen-fill" x="934" y="368" width="0" height="5" rx="2.5" fill="hsl(var(--hue) 90% 74%)"/>
+      <rect class="v-screen-fill" x="934" y="368" width="0" height="5" rx="2.5"/>
       <text class="v-screen-elapsed" x="934" y="394">0:00</text>
       <text class="v-screen-total" x="1466" y="394" text-anchor="end">–:––</text>
     </g>
-    <rect class="v-screen-glow" x="914" y="104" width="572" height="312" rx="8" fill="none" stroke="hsl(var(--hue) 85% 65% / .5)" stroke-width="2"/>
+    <rect class="v-screen-glow" x="914" y="104" width="572" height="312" rx="8" fill="none" stroke-width="2"/>
   </g>
   <!-- projector body -->
   <g opacity=".92">
@@ -220,16 +220,16 @@ const ROOM_SVG = `
     <rect x="1180" y="72" width="40" height="16" fill="#14161b"/>
   </g>
 
+  <!-- neon on the right-hand wall -->
+  <g class="v-neon">
+        <path class="v-neon-halo" d="M1330 492 h30 M1376 472 v40 M1420 492 h30" stroke-width="16" stroke-linecap="round" fill="none"/>
+    <path class="v-neon-line" d="M1330 492 h30 M1376 472 v40 M1420 492 h30" stroke-width="6" stroke-linecap="round" fill="none"/>
+  </g>
+
   <!-- string lights -->
   <g class="v-string">
     <path d="M0,118 C 240,54 480,146 760,80 S 1290,140 1600,68" fill="none" stroke="#120d0a" stroke-width="3"/>
     <g class="v-bulbs"></g>
-  </g>
-
-  <!-- neon above the booth -->
-  <g class="v-neon">
-    <rect x="64" y="432" width="150" height="60" rx="12" fill="#120d14" stroke="hsl(var(--hue) 90% 65% / .65)" stroke-width="2"/>
-    <path d="M88 462 h26 M128 446 v32 M160 462 h22" stroke="hsl(var(--hue) 95% 74%)" stroke-width="5" stroke-linecap="round" fill="none"/>
   </g>
 
   <!-- rug -->
@@ -253,60 +253,69 @@ const ROOM_SVG = `
       <circle cx="304" cy="600" r="17" fill="#71757f"/>
       <circle cx="304" cy="600" r="5" fill="#2b2e36"/>
       <rect x="214" y="568" width="44" height="62" rx="6" fill="#1b1d22" stroke="#3d414a" stroke-width="2"/>
-      <circle cx="226" cy="584" r="4.5" fill="hsl(var(--hue) 90% 66%)"/>
+      <circle class="v-led" cx="226" cy="584" r="4.5"/>
       <circle cx="248" cy="584" r="4.5" fill="#6d717d"/>
       <rect x="222" y="600" width="28" height="18" rx="3" fill="#0d0e12"/>
     </g>
     <rect x="86" y="654" width="74" height="20" rx="4" fill="#120d0b" opacity=".55"/>
   </g>
 
-  <!-- armchair -->
-  <g>
-    <rect x="252" y="712" width="184" height="96" rx="20" fill="#5c3f52"/>
+  <!-- Furniture comes in two passes. The backs and bases are drawn before the
+       crowd so a figure stands *behind* them; the seat cushions are drawn after
+       the crowd so a seated figure's legs disappear into the cushion. That is
+       the whole difference between "someone is sitting on the sofa" and "someone
+       is standing in front of it", and it costs one extra group. -->
+  <g class="v-furniture-back">
+    <!-- armchair -->
     <rect x="252" y="668" width="184" height="64" rx="18" fill="#6f4c63"/>
+    <rect x="252" y="712" width="184" height="96" rx="20" fill="#5c3f52"/>
+    <rect x="238" y="700" width="26" height="86" rx="12" fill="#654459"/>
+    <rect x="424" y="700" width="26" height="86" rx="12" fill="#654459"/>
+
+    <!-- sofa, left of centre -->
+    <rect x="470" y="650" width="390" height="76" rx="20" fill="#96624a"/>
+    <rect x="470" y="700" width="390" height="104" rx="22" fill="url(#v-sofa)"/>
+    <rect x="452" y="690" width="28" height="112" rx="13" fill="#8a5740"/>
+    <rect x="850" y="690" width="28" height="112" rx="13" fill="#8a5740"/>
+
+    <!-- sofa, right -->
+    <rect x="1010" y="672" width="400" height="72" rx="20" fill="#55637c"/>
+    <rect x="1010" y="720" width="400" height="98" rx="22" fill="url(#v-sofa-2)"/>
+    <rect x="992" y="712" width="28" height="106" rx="13" fill="#4c5a70"/>
+    <rect x="1400" y="712" width="28" height="106" rx="13" fill="#4c5a70"/>
+    <!-- throw pillows: the difference between upholstery and a blue slab -->
+    <rect x="1036" y="700" width="58" height="52" rx="12" fill="#6d7c96" transform="rotate(-8 1065 726)"/>
+    <rect x="1330" y="700" width="58" height="52" rx="12" fill="#6d7c96" transform="rotate(7 1359 726)"/>
+    <rect x="548" y="676" width="56" height="50" rx="12" fill="#ad7a5e" transform="rotate(7 576 701)"/>
+  </g>
+
+  <!-- plant -->
+  <g>
+    <path d="M1486 748 q-70 -94 -20 -178 q31 53 26 123 q10 -84 68 -123 q27 97 -48 178 z" fill="#2f4a35"/>
+    <path d="M1438 734 q-60 -58 -36 -134 q45 36 47 100 q5 -65 47 -96 q22 74 -31 130 z" fill="#3a5a40"/>
+    <path d="M1452 744 h104 l-12 68 h-80 z" fill="#5a3a2a"/>
+    <rect x="1444" y="736" width="120" height="17" rx="6" fill="#6b4630"/>
+  </g>
+
+  <!-- the crowd, drawn last so it stands in front of the furniture -->
+  <g class="v-people" id="listen-venue-people"></g>
+
+  <!-- the second furniture pass: seats and legs, in front of the crowd -->
+  <g class="v-furniture-front">
     <rect x="268" y="724" width="152" height="52" rx="14" fill="#7a556f"/>
     <rect x="262" y="800" width="22" height="22" rx="6" fill="#2b1c26"/>
     <rect x="406" y="800" width="22" height="22" rx="6" fill="#2b1c26"/>
-  </g>
 
-  <!-- sofa, left of centre -->
-  <g>
-    <rect x="470" y="700" width="390" height="104" rx="22" fill="url(#v-sofa)"/>
-    <rect x="470" y="650" width="390" height="76" rx="20" fill="#96624a"/>
     <rect x="490" y="712" width="164" height="62" rx="13" fill="#a06a50"/>
     <rect x="664" y="712" width="176" height="62" rx="13" fill="#976349"/>
     <rect x="478" y="792" width="26" height="28" rx="7" fill="#2b1a13"/>
     <rect x="826" y="792" width="26" height="28" rx="7" fill="#2b1a13"/>
-  </g>
 
-  <!-- sofa, right -->
-  <g>
-    <rect x="1010" y="720" width="400" height="98" rx="22" fill="url(#v-sofa-2)"/>
-    <rect x="1010" y="672" width="400" height="72" rx="20" fill="#55637c"/>
     <rect x="1030" y="732" width="168" height="56" rx="13" fill="#5e6d88"/>
     <rect x="1212" y="732" width="180" height="56" rx="13" fill="#57657f"/>
     <rect x="1018" y="806" width="26" height="26" rx="7" fill="#161b23"/>
     <rect x="1376" y="806" width="26" height="26" rx="7" fill="#161b23"/>
   </g>
-
-  <!-- side table + lamp -->
-  <g>
-    <rect x="1430" y="712" width="126" height="13" rx="6" fill="#7a5137"/>
-    <rect x="1484" y="725" width="18" height="76" rx="5" fill="#4a2f20"/>
-    <path d="M1444 684 h96 l-18 -44 h-60 z" fill="#2b2118"/>
-    <ellipse cx="1492" cy="684" rx="38" ry="9" fill="hsl(var(--hue) 90% 66% / .5)"/>
-  </g>
-
-  <!-- plant -->
-  <g>
-    <path d="M1546 742 q-78 -100 -22 -190 q34 56 29 132 q11 -90 74 -132 q29 103 -51 190 z" fill="#2f4a35"/>
-    <path d="M1492 726 q-64 -62 -38 -142 q47 38 49 106 q5 -69 49 -102 q24 78 -33 138 z" fill="#3a5a40"/>
-    <path d="M1508 738 h112 l-13 74 h-86 z" fill="#5a3a2a"/>
-    <rect x="1500" y="730" width="128" height="17" rx="6" fill="#6b4630"/>
-  </g>
-
-  <!-- the crowd, drawn last so it stands in front of the furniture -->
-  <g class="v-people" id="listen-venue-people"></g>
 </svg>`;
 
 /**
@@ -321,22 +330,22 @@ const ROOM_SVG = `
  * the frame, the closer to the viewer, the larger the figure.
  */
 const SPOTS = [
-  // the host works the booth (drawn behind it, so only the top half shows)
-  { x: 228, y: 706, pose: 'dj', layer: 'back', scale: 1.9 },
-  // the armchair
-  { x: 344, y: 762, pose: 'sit', scale: 1.4 },
-  // the left sofa: three seats, then two people standing behind it
-  { x: 556, y: 754, pose: 'sit', scale: 1.38 },
-  { x: 658, y: 750, pose: 'sit', scale: 1.34 },
-  { x: 764, y: 754, pose: 'sit', scale: 1.38 },
+  // The host works the booth (drawn behind it, so only the top half shows).
+  { x: 228, y: 692, pose: 'dj', layer: 'back', scale: 1.62 },
+  // Seats fill across the room rather than along one sofa: a handful of people
+  // crowded onto one couch next to an empty one does not read as a room.
+  { x: 344, y: 774, pose: 'sit', scale: 1.4 },   // armchair
+  { x: 556, y: 768, pose: 'sit', scale: 1.38 },  // left sofa, seat 1
+  { x: 1104, y: 786, pose: 'sit', scale: 1.38 }, // right sofa, seat 1
+  { x: 764, y: 768, pose: 'sit', scale: 1.38 },  // left sofa, seat 3
+  { x: 1304, y: 786, pose: 'sit', scale: 1.38 }, // right sofa, seat 3
+  { x: 658, y: 764, pose: 'sit', scale: 1.34 },  // left sofa, seat 2
+  { x: 1204, y: 782, pose: 'sit', scale: 1.34 }, // right sofa, seat 2
+  { x: 1396, y: 782, pose: 'sit', scale: 1.32 }, // right sofa, seat 4
+  // Standing behind the sofas.
   { x: 500, y: 706, pose: 'stand', layer: 'back', scale: 1.3 },
   { x: 828, y: 702, pose: 'stand', layer: 'back', scale: 1.28 },
-  // the right sofa
-  { x: 1104, y: 772, pose: 'sit', scale: 1.38 },
-  { x: 1204, y: 768, pose: 'sit', scale: 1.34 },
-  { x: 1304, y: 772, pose: 'sit', scale: 1.38 },
-  { x: 1396, y: 768, pose: 'sit', scale: 1.32 },
-  // on the rug, nearest the viewer last
+  // On the rug, nearest the viewer last.
   { x: 936, y: 838, pose: 'dance', scale: 1.75 },
   { x: 796, y: 866, pose: 'stand', scale: 1.86 },
   { x: 1064, y: 858, pose: 'dance', scale: 1.8 },
@@ -358,6 +367,8 @@ const SPOTS = [
  * animation, so a room of one drawing does not look like clones.
  */
 function figureSvg({ x, y, pose, scale, lean, delay, shirt, skin, hair, host, name }) {
+  // A seated figure has no legs to its feet, so at the same scale it would look
+  // like a child. Its scale compensates for the ~46 units of leg it does not use.
   const seated = pose === 'sit';
   const legs = seated
     ? `<path d="M-17 -6 q-4 -14 6 -24 h34 q8 10 4 24 q-6 8 -16 8 h-12 q-10 0 -16 -8z" fill="#1b1f27"/>
@@ -408,7 +419,7 @@ function figureSvg({ x, y, pose, scale, lean, delay, shirt, skin, hair, host, na
  * `show`, `hide`, `paint`, `paintVolume`, `destroy`. Everything else — the
  * crowd, the light, the bubbles, the posters — belongs to this module.
  */
-export function mountVenue(root, { onExit, onMute, onVolume, onShare } = {}) {
+export function mountVenue(root, { onExit, onMute, onVolume, onShare, onStart } = {}) {
   const saved = readSaved();
   let theme = THEMES.some((t) => t.id === saved.theme) ? saved.theme : 'club';
   // `null` means "follow the artwork": the honest default, and the reason the
@@ -426,6 +437,12 @@ export function mountVenue(root, { onExit, onMute, onVolume, onShare } = {}) {
     <div class="venue" data-theme="${theme}" data-light="${hue == null ? 'auto' : 'manual'}">
       <div class="v-scene">
         ${ROOM_SVG}
+        <div class="v-gate" id="listen-venue-gate" hidden>
+          <button class="v-gate-btn" id="listen-venue-start" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg><span>Listen live</span>
+          </button>
+          <p class="v-gate-note">This browser needs a tap before the room can play.</p>
+        </div>
       </div>
 
       <div class="v-now" id="listen-venue-now">
@@ -522,15 +539,12 @@ export function mountVenue(root, { onExit, onMute, onVolume, onShare } = {}) {
     if (!snapshot) return;
     const queue = Array.isArray(snapshot.queue) ? snapshot.queue : [];
     const index = Number.isInteger(snapshot.index) ? snapshot.index : 0;
-    // Alternate behind/ahead so the wall is a mix of memory and anticipation.
-    const behind = queue.slice(0, index).reverse();
-    const ahead = queue.slice(index);
-    const picks = [];
-    for (let i = 0; i < FRAMES.length; i += 1) {
-      const source = i % 2 ? ahead : behind;
-      const track = source[Math.floor(i / 2) % Math.max(1, source.length)];
-      if (track) picks.push(track);
-    }
+    // The wall is hung with the room's own records, current one first, then what
+    // follows, then what already played. Never padded and never repeated: a room
+    // with two tracks has two sleeves, and a room with twenty has seven — a
+    // wall of the same sleeve three times would read as a rendering bug.
+    const ordered = [...queue.slice(index), ...queue.slice(0, index).reverse()];
+    const picks = ordered.slice(0, FRAMES.length);
     const sig = picks.map((t) => t.videoId).join('|');
     if (sig === posterSig) return;
     posterSig = sig;
@@ -589,7 +603,7 @@ export function mountVenue(root, { onExit, onMute, onVolume, onShare } = {}) {
         ...spot,
         // A small per-figure size and lean difference is what stops a crowd of
         // one drawing from reading as clones.
-        scale: spot.scale * (0.95 + noise(i, 2) * 0.1),
+        scale: spot.scale * (spot.pose === 'sit' ? 1.16 : 1) * (0.95 + noise(i, 2) * 0.1),
         lean: (noise(i, 5) - 0.5) * 3,
         delay: (noise(i, 4) * 4).toFixed(2),
         shirt: shirts[i % shirts.length],
@@ -633,7 +647,11 @@ export function mountVenue(root, { onExit, onMute, onVolume, onShare } = {}) {
   }
 
   function paintBubble() {
-    peopleEl.querySelectorAll('.v-bubble').forEach((el) => el.remove());
+    // Remove from the whole room, not just the front layer: the host's bubble
+    // hangs on the host figure, and the host is drawn *behind* the booth, so a
+    // peopleEl-only sweep would leave one bubble behind every 6.5s and stack
+    // them on the same spot for as long as the room is open.
+    root.querySelectorAll('.v-bubble').forEach((el) => el.remove());
     if (!visible || !snapshot) return;
     const lines = bubbleLines();
     if (!lines.length) return;
@@ -648,10 +666,20 @@ export function mountVenue(root, { onExit, onMute, onVolume, onShare } = {}) {
     // child at (0,-118) sits just above its head and inherits the scale. A
     // foreignObject is the one way to put a real, wrapping text box there.
     const width = Math.min(320, 26 + line.text.length * 8.2);
+    const host = target.classList.contains('is-host');
     const bubble = document.createElementNS('http://www.w3.org/2000/svg', 'foreignObject');
-    bubble.setAttribute('class', 'v-bubble');
-    bubble.setAttribute('x', String(-width / 2));
-    bubble.setAttribute('y', '-152');
+    bubble.setAttribute('class', `v-bubble${host ? ' is-host' : ''}`);
+    // The host stands behind the booth under the neon, so its bubble hangs to
+    // the right instead of straight up, where the sign is.
+    // The host's bubble hangs beside the booth, in the empty band of wall above
+    // the wainscot: straight up would cover the neon, and further up would cover
+    // the framed sleeves.
+    // On a wide screen the host's bubble hangs left, into the empty wall above
+    // the booth; on a phone that direction is off the edge of the frame, so it
+    // hangs right instead, over the stage-side floor.
+    const narrow = window.matchMedia('(max-width: 900px)').matches;
+    bubble.setAttribute('x', String(host ? (narrow ? 40 : -width + 34) : -width / 2));
+    bubble.setAttribute('y', String(host ? -196 : -152));
     bubble.setAttribute('width', String(width));
     bubble.setAttribute('height', '34');
     const div = document.createElementNS('http://www.w3.org/1999/xhtml', 'div');
@@ -712,8 +740,8 @@ export function mountVenue(root, { onExit, onMute, onVolume, onShare } = {}) {
     $('.v-now-sub').textContent = next.ended
       ? 'This room has ended'
       : track
-        ? `${track.channel ?? ''}${track.channel ? ' · ' : ''}${listeners} in the room`
-        : `${listeners} in the room, waiting for the host`;
+        ? (track.channel ?? '')
+        : 'Waiting for the host to pick something';
     $('.v-now-people').textContent = `${listeners} in the room`;
     const syncEl = $('.v-now-sync');
     syncEl.textContent = next.ended ? '—' : (next.playing ? 'Live' : 'Paused');
@@ -738,20 +766,103 @@ export function mountVenue(root, { onExit, onMute, onVolume, onShare } = {}) {
     if (visible) paintBubble();
   }
 
+  /**
+   * What the progress line currently shows, so a repaint that would change
+   * nothing costs nothing.
+   *
+   * The player calls this four times a second, and each call used to rewrite
+   * `.v-screen-fill`'s `width` plus five text nodes inside a 1600×1000 SVG with
+   * about eighteen animated figures, gradients and clip paths: an attribute write
+   * on an SVG child forces layout and style work across the whole scene, and on a
+   * mid-range phone that is the frame cost that turns the venue into a slide
+   * show while the progress bar advances. None of these nodes can display a
+   * difference smaller than the values compared here — whole seconds for text,
+   * SVG units for the screen bar, a tenth of a percent for the thin HTML bar —
+   * so the writes that would change nothing are exactly the writes worth
+   * skipping.
+   */
+  let painted = { second: -1, fill: -1, bar: '', total: '', ended: null };
+
   /** The progress line, driven by the player's own clock (not a second timer). */
   function paintProgress({ currentTime = 0, duration = 0, ended = false } = {}) {
     const dur = Number.isFinite(duration) && duration > 0 ? duration : 0;
     const pct = dur ? Math.min(1, currentTime / dur) : 0;
-    // The screen's own progress is in SVG units (660 wide), so it scales with
-    // the room instead of being a separately positioned element that drifts.
-    const fill = $('.v-screen-fill');
-    if (fill) fill.setAttribute('width', String(Math.round(pct * 660)));
-    $('.v-progress i').style.width = `${pct * 100}%`;
-    $('.v-screen-elapsed').textContent = fmt(currentTime);
-    $('.v-screen-total').textContent = dur ? fmt(dur) : '–:––';
-    $('.v-elapsed').textContent = fmt(currentTime);
-    $('.v-total').textContent = dur ? fmt(dur) : '–:––';
-    venue.dataset.ended = ended ? '1' : '0';
+    // Only paint what is on screen: a hidden venue costs nothing per tick, and
+    // `show()` throws the cache away so the first visible frame is always real.
+    if (!visible) return;
+    const second = Math.floor(Math.max(0, Number(currentTime) || 0));
+    const fillWidth = Math.round(pct * 660);
+    const barWidth = `${Math.round(pct * 1000) / 10}%`;
+    const total = dur ? fmt(dur) : '–:––';
+    if (second !== painted.second) {
+      painted.second = second;
+      $('.v-screen-elapsed').textContent = fmt(currentTime);
+      $('.v-elapsed').textContent = fmt(currentTime);
+    }
+    if (fillWidth !== painted.fill) {
+      painted.fill = fillWidth;
+      // The screen's own progress is in SVG units (660 wide), so it scales with
+      // the room instead of being a separately positioned element that drifts.
+      $('.v-screen-fill')?.setAttribute('width', String(fillWidth));
+    }
+    if (barWidth !== painted.bar) {
+      painted.bar = barWidth;
+      $('.v-progress i').style.width = barWidth;
+    }
+    if (total !== painted.total) {
+      painted.total = total;
+      $('.v-screen-total').textContent = total;
+      $('.v-total').textContent = total;
+    }
+    if (ended !== painted.ended) {
+      painted.ended = ended;
+      venue.dataset.ended = ended ? '1' : '0';
+    }
+  }
+
+  /**
+   * The room's count changed without a new snapshot (someone joined, someone
+   * closed the tab). The crowd is the count, so it has to follow immediately —
+   * waiting for the next state frame would leave the room lying about itself
+   * for as long as the host's playhead happens to be still.
+   */
+  function setListeners(n) {
+    if (!snapshot || !Number.isFinite(n)) return;
+    snapshot = { ...snapshot, listeners: n };
+    renderCrowd();
+    $('.v-now-people').textContent = `${n} in the room`;
+    if (!snapshot.ended && snapshot.track) {
+      $('.v-now-sub').textContent = snapshot.track.channel ?? '';
+    }
+    if (visible) paintBubble();
+  }
+
+  /**
+   * The gate, in the venue's own terms.
+   *
+   * The player shows its overlay over the sleeve, but the venue hides that whole
+   * column: a guest who lands here with autoplay blocked would otherwise get
+   * silence and no button. This is the same gate, drawn on the stage.
+   */
+  function paintGate({ needsTap, ended, label, ready }) {
+    const gate = $('#listen-venue-gate');
+    if (!gate) return;
+    // A terminal room still shows the gate, because it is where the reason
+    // lives; it is just no longer something to press. `label` carries the
+    // honest terminal text from the player ('Invite only' for a room that
+    // closed its door), falling back to the ended wording for a plain end.
+    gate.hidden = !(needsTap || ended);
+    if (!needsTap && !ended) return;
+    const text = gate.querySelector('.v-gate-btn span');
+    const btn = gate.querySelector('.v-gate-btn');
+    const terminal = ended ? (label && label !== 'Listen live' ? label : 'Room ended') : (label ?? 'Listen live');
+    if (text) text.textContent = terminal;
+    if (btn) btn.disabled = ended || !ready;
+    gate.querySelector('.v-gate-note').textContent = ended
+      ? (terminal === 'Invite only' ? 'This room is invite only now.' : 'This room has ended.')
+      : ready
+        ? 'This browser needs a tap before the room can play.'
+        : 'Waiting for the host to pick something.';
   }
 
   function paintVolume({ muted, volume }) {
@@ -776,6 +887,10 @@ export function mountVenue(root, { onExit, onMute, onVolume, onShare } = {}) {
     root.hidden = false;
     venue.classList.add('is-live');
     renderBulbs();
+    // A hidden venue skips every progress tick (see paintProgress), so the cache
+    // describes a frame from before it was hidden: throw it away and let the next
+    // tick paint the truth, even if the numbers happen to match.
+    painted = { second: -1, fill: -1, bar: '', total: '', ended: null };
     if (snapshot) paint(snapshot);
     startBubbles();
   }
@@ -808,6 +923,7 @@ export function mountVenue(root, { onExit, onMute, onVolume, onShare } = {}) {
     save();
   });
   $('.v-exit').addEventListener('click', () => onExit?.());
+  $('#listen-venue-start')?.addEventListener('click', () => onStart?.());
   $('#listen-venue-mute')?.addEventListener('click', () => onMute?.());
   $('#listen-venue-volume')?.addEventListener('input', (e) => onVolume?.(Number(e.target.value) / 100));
   $('#listen-venue-queue-toggle')?.addEventListener('click', (e) => {
@@ -833,8 +949,10 @@ export function mountVenue(root, { onExit, onMute, onVolume, onShare } = {}) {
     show,
     hide,
     paint,
+    paintGate,
     paintProgress,
     paintVolume,
+    setListeners,
     destroy,
     get visible() { return visible; },
     get theme() { return theme; },

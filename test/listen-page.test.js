@@ -2,9 +2,10 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { launch, freePort, CHROME } from './helpers/cdp.js';
-import { writeWav } from './helpers/wav.js';
+import { writeSilentM4a } from './helpers/audio-fixture.js';
 
 // The listener page, driven in a real browser.
 //
@@ -18,9 +19,13 @@ import { writeWav } from './helpers/wav.js';
 // rooms-browser.test.js): the failure this guards against is a page that is
 // technically in sync but reads as a bare player.
 
-const DIR = new URL('./.tmp/listen-page/', import.meta.url).pathname;
-const PORT = 8157;
-const BASE = `http://127.0.0.1:${PORT}`;
+// A fresh directory per run, outside the repo: this suite writes audio
+// fixtures and screenshots, and must not be able to collide with (or clean up
+// after) any other suite's scratch space.
+const DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'sonora-listen-page-'));
+// A free port rather than a fixed one: a crashed run must not be able to squat
+// the suite's port and turn a green build red.
+let BASE = '';
 
 // Silent fixtures. 4 minutes each so a full queue is measured in hours and no
 // assertion races the room's (correct) auto-advance.
@@ -38,6 +43,7 @@ const queueOf = (n) => TRACKS.slice(0, n).map(({ videoId, title, channel, durati
 
 let server;
 let browser;
+let PORT = 0;
 
 const startServer = async () => {
   const proc = spawn(process.execPath, ['--no-warnings', 'src/server.js'], {
@@ -66,10 +72,9 @@ const startServer = async () => {
 
 before(async () => {
   if (!CHROME) return;
-  fs.rmSync(DIR, { recursive: true, force: true });
-  for (const [i, t] of TRACKS.entries()) {
-    writeWav(path.join(DIR, 'audio', `${t.videoId}.m4a`), { seconds: SECONDS, freq: 300 + i * 30 });
-  }
+  PORT = await freePort();
+  BASE = `http://127.0.0.1:${PORT}`;
+  for (const t of TRACKS) writeSilentM4a(path.join(DIR, 'audio', `${t.videoId}.m4a`), { seconds: SECONDS });
   server = await startServer();
   browser = await launch(await freePort());
   await browser.addInitScript(`
@@ -112,7 +117,10 @@ const createRoom = async (cookie, body) => {
 };
 
 const command = async (cookie, code, body) => {
-  const state = await (await fetch(`${BASE}/api/public/rooms/${code}/state`)).json();
+  // A relative command (next/prev) must carry the revision it was formed on, so
+  // the helper reads the room as the commanding member — the public view has no
+  // guest cookie here and answers 403.
+  const state = await (await fetch(`${BASE}/api/rooms/${code}/state`, { headers: { cookie } })).json();
   const res = await fetch(`${BASE}/api/rooms/${code}/command`, {
     method: 'POST', headers: { 'content-type': 'application/json', cookie },
     body: JSON.stringify({ rev: state.rev, ...body }),

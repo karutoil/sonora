@@ -123,9 +123,9 @@
 <div class="app">
   <aside class="sidebar">
     <div class="brand" data-page="home"><div class="brand-logo"><svg class="ico" viewBox="0 0 24 24" style="width:22px;height:22px;stroke-width:2.5"><use href="#i-wave"/></svg></div><div class="brand-word">sonora<span class="brand-dot">.</span></div></div>
-    <nav class="nav-group" id="desktop-nav"></nav>
-    <div class="nav-label">Your collection</div>
-    <nav class="nav-group"><button class="nav-btn" id="nav-station" data-page="station"><svg class="ico" viewBox="0 0 24 24"><use href="#i-spark"/></svg><span>Your station</span></button><button class="nav-btn" data-collection="liked"><svg class="ico" viewBox="0 0 24 24"><use href="#i-heart"/></svg><span>Liked songs</span></button><button class="nav-btn" data-collection="recent"><svg class="ico" viewBox="0 0 24 24"><use href="#i-clock"/></svg><span>Recently played</span></button></nav>
+    <nav class="nav-group" id="desktop-nav" aria-label="Main"></nav>
+    <div class="nav-label" id="collection-label">Your collection</div>
+    <nav class="nav-group" aria-labelledby="collection-label"><button class="nav-btn" id="nav-station" data-page="station"><svg class="ico" viewBox="0 0 24 24"><use href="#i-spark"/></svg><span>Your station</span></button><button class="nav-btn" data-collection="liked"><svg class="ico" viewBox="0 0 24 24"><use href="#i-heart"/></svg><span>Liked songs</span></button><button class="nav-btn" data-collection="recent"><svg class="ico" viewBox="0 0 24 24"><use href="#i-clock"/></svg><span>Recently played</span></button></nav>
     <div class="nav-label">Your playlists</div>
     <div class="playlist-links" id="side-playlists"></div>
     <div class="sidebar-bottom"><button class="create-playlist" data-action="create"><svg class="ico" viewBox="0 0 24 24"><use href="#i-plus"/></svg> Create a playlist</button><div class="sidebar-foot"><div class="small-avatar" id="side-avatar">S</div><div><strong id="side-name">Music listener</strong>Personal account</div><button class="icon-btn" id="side-profile-button" data-action="profile" aria-label="Account menu" aria-haspopup="menu" aria-expanded="false"><svg class="ico sm" viewBox="0 0 24 24"><use href="#i-dots"/></svg></button></div></div>

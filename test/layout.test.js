@@ -215,6 +215,71 @@ test('a settings page keeps a reading measure on a 1080p and a 1440p screen', as
   }
 });
 
+test('the sign-in button is on screen on a short phone', async (t) => {
+  if (!need(t)) return;
+  // The P0 this pins: the auth overlay used to be a fixed 100dvh box with
+  // overflow:hidden, and the stacked pitch+form was 120-220px taller. On an
+  // iPhone SE/8 (and many Androids) #auth-submit sat below the screen with no
+  // way to scroll to it, so the app could not be signed into at all.
+  for (const [width, height] of [[320, 568], [360, 640], [375, 667], [390, 664]]) {
+    await browser.eval(`fetch('/api/auth/logout',{method:'POST'}).then(r=>r.status)`).catch(() => {});
+    await browser.viewport({ width, height, mobile: true });
+    await browser.goto(`${BASE}/`);
+    await browser.waitFor(`!document.getElementById('auth-overlay').hidden`, 20_000);
+    await new Promise((r) => setTimeout(r, 200));
+
+    const m = await browser.eval(`(() => {
+      const R = (sel) => { const el = document.querySelector(sel); if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return { top: r.top, bottom: r.bottom, left: r.left, right: r.right }; };
+      const overlay = document.getElementById('auth-overlay');
+      return {
+        vh: innerHeight, vw: innerWidth,
+        submit: R('#auth-submit'),
+        pitch: getComputedStyle(document.querySelector('.auth-pitch')).display,
+        overflowY: getComputedStyle(overlay).overflowY,
+        scrollable: overlay.scrollHeight - overlay.clientHeight,
+        shell: R('.auth-shell'),
+        footer: R('.auth-foot'),
+      };
+    })()`);
+
+    const where = `${width}x${height}`;
+    assert.ok(m.submit, 'the sign-in button is missing');
+    assert.ok(m.submit.bottom <= m.vh + 0.5,
+      `${where}: #auth-submit ends at ${m.submit.bottom}px, below the ${m.vh}px viewport`);
+    assert.ok(m.submit.top >= 0, `${where}: #auth-submit starts above the viewport`);
+    assert.ok(m.submit.left >= 0 && m.submit.right <= m.vw + 0.5,
+      `${where}: #auth-submit (${m.submit.left}-${m.submit.right}) is outside the ${m.vw}px viewport`);
+
+    // The pitch is decoration and must not push the form off a short screen.
+    assert.equal(m.pitch, 'none', `${where}: the auth pitch still takes space above the form`);
+    // And the overlay is a scroll container, so an error message, a passkey
+    // hint or a larger font can never leave anything unreachable.
+    assert.equal(m.overflowY, 'auto', `${where}: the auth overlay cannot scroll`);
+    if (m.shell.bottom > m.vh + 0.5) {
+      assert.ok(m.scrollable > 0, `${where}: the shell is taller than the viewport but the overlay does not scroll`);
+    }
+    assert.ok(m.footer, `${where}: the sign-in footer disappeared`);
+  }
+
+  // A short *desktop* window hides the decorative pitch too; the form must then
+  // take the whole card instead of sitting in column one of a two-column grid.
+  await browser.eval(`fetch('/api/auth/logout',{method:'POST'}).then(r=>r.status)`).catch(() => {});
+  await browser.viewport({ width: 1024, height: 700 });
+  await browser.goto(`${BASE}/`);
+  await browser.waitFor(`!document.getElementById('auth-overlay').hidden`, 20_000);
+  const desktop = await browser.eval(`(() => {
+    const shell = document.querySelector('.auth-shell');
+    const w = (sel) => document.querySelector(sel).getBoundingClientRect().width;
+    const submit = document.getElementById('auth-submit').getBoundingClientRect();
+    return { shell: shell.clientWidth, panel: w('.auth-panel'), submitBottom: submit.bottom, vh: innerHeight };
+  })()`);
+  assert.ok(desktop.panel >= desktop.shell - 1,
+    `a short desktop window left the form in ${desktop.panel}px of a ${desktop.shell}px card`);
+  assert.ok(desktop.submitBottom <= desktop.vh, 'a short desktop window pushed the button off screen');
+});
+
 // A fixed-size tile whose only child is an icon must centre it on both axes.
 // `.auth-point-ico` failed this: a broader `.auth-points span{display:block}`
 // (written for the copy column) also matched the icon span, and being one

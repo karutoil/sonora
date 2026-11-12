@@ -1,11 +1,16 @@
 # sonora — container stack.
 #
-#   podman compose up -d --build      # build + start on http://127.0.0.1:8130
-#   podman compose logs -f            # follow logs
-#   podman compose down               # stop (data stays in ./data)
+#   docker compose up -d --build
+#   podman compose -f compose.yaml -f compose.podman.yaml up -d --build
 #
-# The port is the same 8130 the dev server uses, so every URL, bookmark and
-# tunnel config that works against `npm start` works unchanged against this.
+# Follow logs with the same command plus `logs -f`; use `down` to stop while
+# retaining ./data. The port is the same 8130 the dev server uses, so every URL,
+# bookmark and tunnel config also works unchanged against `npm start`.
+#
+# The image runs as node (uid/gid 1000), so Docker needs ./data writable by that
+# uid. Rootless Podman instead needs compose.podman.yaml: its keep-id mapping maps
+# node to the invoking host account. Without it, container uid 1000 is a subuid and
+# the host-owned bind mount is read-only. See README.md for existing data repairs.
 
 services:
   sonora:
@@ -15,6 +20,16 @@ services:
     image: localhost/sonora:latest
     container_name: sonora
     restart: unless-stopped
+    # The app binds an unprivileged port and never needs Linux capabilities.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Bound fork-bomb damage while leaving ample room for Node, yt-dlp and ffmpeg.
+    pids_limit: 256
+    # Optional resource ceilings, if desired (uncomment and tune for the host):
+    # cpus: 2
+    # mem_limit: 2g
     env_file:
       - .env
     environment:
@@ -33,10 +48,14 @@ services:
       # Same address and port as dev: loopback only, fronted by the tunnel.
       # Set SONORA_BIND=0.0.0.0 in .env to expose it on the LAN instead.
       - "${SONORA_BIND:-127.0.0.1}:8130:8130"
+    # Rootless podman adds the keep-id mapping via compose.podman.yaml. It stays
+    # out of this file because Docker uses ordinary host uid/gid ownership instead.
     volumes:
       # One directory holds the SQLite db, the materialised cookies.txt and the
       # audio cache — the same layout as a plain `npm start`, so the container
-      # and the dev server can share it (not simultaneously).
+      # and the dev server can share it (not simultaneously). Docker writes as
+      # uid/gid 1000; the rootless-Podman override makes writes belong to the
+      # invoking host account instead. See the ownership notes above/README.md.
       - ./data:/app/data
     extra_hosts:
       # Needed on older podman releases; harmless where the alias already exists.

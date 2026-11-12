@@ -19,7 +19,7 @@
 // played through — including the tracks the station itself just introduced
 // them to, which is how the catalogue grows instead of looping the same 30.
 
-import { isCompilation, songKey, normalizeTitle, cleanChannelName } from './search-rank.js';
+import { isCompilation, isSongDuration, songKey, normalizeTitle, cleanChannelName } from './search-rank.js';
 
 /** Long enough to feel like a station, short enough to build in one request. */
 export const STATION_LIMIT = 30;
@@ -47,14 +47,28 @@ export const FAMILIAR_SHARE = 0.66;
 /**
  * One artist cannot fill the queue. Two in a row from the same band is a
  * playlist; a third is a radio that has stopped trying.
+ *
+ * This cap counts every track by that artist on the page, a seed included.
  */
 export const MAX_PER_ARTIST = 2;
 /**
  * "Same artist" and "known artist" are not the same thing. A seed's *own* band
- * is the most repetitive answer the recommender can give, so it is capped
- * harder than the rest of the familiar pool.
+ * is the most repetitive answer the recommender can give — ask YouTube for
+ * "more like this" and half the answer is that band — so it is capped harder
+ * than the rest of the familiar pool: **one recommendation**, where any other
+ * artist may have MAX_PER_ARTIST tracks.
+ *
+ * The seed itself does not spend this narrower budget. It is the song this
+ * person actually played, not the recommender's cheapest guess, and a first
+ * page that refuses the second song by the band they just fell for would be
+ * capped for a fault that is not theirs — so a seed spends a slot of
+ * MAX_PER_ARTIST (like any other track) and nothing of this one.
+ *
+ * It has to stay *below* MAX_PER_ARTIST to mean anything: the check runs after
+ * the generic cap, so while both were 2 this one was unreachable and a seed's
+ * band was capped exactly like every other (08-recommender.md #11).
  */
-export const MAX_PER_SEED_ARTIST = 2;
+export const MAX_PER_SEED_ARTIST = 1;
 
 /**
  * Every track a station hands over answers one of four questions, and which
@@ -108,7 +122,11 @@ export function planPage({ limit = STATION_LIMIT, includeSeeds = false, share = 
   const discovery = Math.min(Math.max(0, n - seeds), discoveryTarget({ limit: n, share }));
   // "Trending in your lane" is a garnish, not a course: one slot in ten is
   // enough to notice, and more than that turns the station into a chart.
-  const trending = Math.max(1, Math.min(Math.round(n * 0.1), Math.floor(discovery / 2)));
+  // A page with no discovery slots has no room for the garnish either —
+  // otherwise planPage({limit: 0}) promised a track on an empty page.
+  const trending = discovery > 0
+    ? Math.max(1, Math.min(Math.round(n * 0.1), Math.floor(discovery / 2)))
+    : 0;
   const adjacent = Math.max(0, discovery - trending);
   const sameArtist = Math.max(0, n - seeds - discovery);
   return {
@@ -165,7 +183,7 @@ export function seedScore(t) {
   return score;
 }
 
-const artistKey = (t) => normalizeTitle(cleanChannelName(t.channel));
+const artistKey = (t) => artistKeyOf(t?.channel);
 
 /** The comparison key for an artist name, exposed so callers can pre-bucket. */
 export const artistKeyOf = (name) => normalizeTitle(cleanChannelName(name));
@@ -182,9 +200,33 @@ export const artistKeyOf = (name) => normalizeTitle(cleanChannelName(name));
  * expressed most clearly, the tail is the long tail of it, and every pass
  * re-reads the evidence (see stationCandidates) so songs they fell for *on the
  * station* have joined the list by the time the cursor comes round again.
+ *
+ * With `count` seeds or fewer nothing is left to rotate: every cursor returns
+ * the same set, only in another order. That is a property of the evidence, not
+ * of this function — see seedDraw, which reports it.
  */
 export function rotateSeeds(seeds = [], { cursor = 0, count = 3 } = {}) {
-  return rotate((seeds ?? []).filter((s) => s?.videoId), cursor, count);
+  return seedDraw(seeds, { cursor, count }).picked;
+}
+
+/**
+ * What a draw can honestly promise, next to the seeds it would expand.
+ *
+ * `rotate` returns `min(count, n)` items, so with `count` seeds or fewer the
+ * *set* is the same for every cursor — only the order of the pools changes, and
+ * two pages built from three seeds expand the same neighbourhood with the same
+ * per-artist caps in force. Saying so is better than shuffling the list to fake
+ * variety: `thin` lets the client tell the listener to play a few more songs
+ * (every play-through adds a seed, so the station widens by itself) instead of
+ * pretending the Rebuild button did something it could not.
+ *
+ * `picked` is exactly `rotateSeeds(...)`, and `available` is how much evidence
+ * there was to draw from, so a caller can distinguish "three seeds, nothing to
+ * vary" from "eight seeds, the cursor moved".
+ */
+export function seedDraw(seeds = [], { cursor = 0, count = 3 } = {}) {
+  const list = (seeds ?? []).filter((s) => s?.videoId);
+  return { picked: rotate(list, cursor, count), available: list.length, thin: list.length <= count };
 }
 
 /** The same rotation, for the artist pools an extension also draws from. */
@@ -192,14 +234,61 @@ export function rotateArtists(artists = [], { cursor = 0, count = 2 } = {}) {
   return rotate((artists ?? []).filter((a) => a?.name), cursor, count);
 }
 
+/**
+ * Client cursors are advice, not trusted arithmetic. Non-finite, fractional and
+ * unsafe values collapse to a finite starting point; route cursors never go
+ * negative. Rotation itself still accepts a safe negative cursor and wraps it,
+ * which is useful to pure callers and preserves the existing helper contract.
+ */
+export function normalizeStationCursor(value) {
+  const raw = Number(value);
+  if (!Number.isFinite(raw)) return 0;
+  const integer = Math.trunc(raw);
+  return Number.isSafeInteger(integer) ? Math.max(0, integer) : 0;
+}
+
+/** Advance a normal page, but wrap before the next integer would be unsafe. */
+export function advanceStationCursor(value, step = 3) {
+  const cursor = normalizeStationCursor(value);
+  const stride = normalizeStationCursor(step);
+  if (!stride) return cursor;
+  return cursor > Number.MAX_SAFE_INTEGER - stride ? 0 : cursor + stride;
+}
+
+function rotationCursor(value) {
+  const raw = Math.trunc(Number(value));
+  return Number.isSafeInteger(raw) ? raw : 0;
+}
+
 function rotate(list, cursor, count) {
   const n = list.length;
   if (!n) return [];
-  const raw = Math.trunc(Number(cursor) || 0);
+  const raw = rotationCursor(cursor);
   const start = ((raw % n) + n) % n;
   const out = [];
   for (let i = 0; i < Math.min(count, n); i++) out.push(list[(start + i) % n]);
   return out;
+}
+
+/**
+ * Read a candidate list from the station's cursor instead of from its first
+ * item. Returns the list untouched when there is no cursor to spend.
+ *
+ * This is what a thin station has instead of a different seed *set*. The seed
+ * list can only be rotated, never varied, while there are three seeds or fewer
+ * (see seedDraw), so a Rebuild at a later cursor expands the same neighbourhood —
+ * and it would keep taking the same first tracks of it, because the per-artist
+ * caps are spent in reading order. Rotating is honest in a way a shuffle is not:
+ * nothing is invented, nothing is random, the same page is reproducible from
+ * `(evidence, cursor)`, and YouTube's own relevance order survives intact within
+ * a pass — the page just starts further down the list the further the station
+ * has travelled. Each pool is rotated on its own length, so a short pool is
+ * never walked past.
+ */
+function rotateFrom(list, cursor) {
+  const n = Math.trunc(Number(cursor));
+  if (!Number.isFinite(n) || n === 0) return list;
+  return rotate(list, n, list.length);
 }
 
 /**
@@ -209,10 +298,10 @@ function rotate(list, cursor, count) {
  * songs, which are included even when they were never played (a song liked from
  * search results is still something this person wants to hear).
  */
-export function rankSeeds({ plays = [], likes = [], disliked = new Set() } = {}, { limit = SEED_LIMIT } = {}) {
+export function rankSeeds({ plays = [], likes = [], disliked = new Set(), dislikedSongs = new Set() } = {}, { limit = SEED_LIMIT } = {}) {
   const byId = new Map();
   const base = (videoId) => ({
-    videoId, title: null, channel: null, thumb: null, durationS: null,
+    videoId, title: null, channel: null, channelId: null, thumb: null, durationS: null,
     completes: 0, skips: 0, starts: 0, deepest: 0, liked: false,
   });
 
@@ -222,6 +311,7 @@ export function rankSeeds({ plays = [], likes = [], disliked = new Set() } = {},
       ...base(p.videoId),
       title: p.title ?? null,
       channel: p.channel ?? null,
+      channelId: p.channelId ?? null,
       thumb: p.thumb ?? null,
       durationS: p.durationS ?? null,
       completes: Number(p.completes) || 0,
@@ -240,6 +330,7 @@ export function rankSeeds({ plays = [], likes = [], disliked = new Set() } = {},
       liked: true,
       title: row.title ?? l.title ?? null,
       channel: row.channel ?? l.channel ?? null,
+      channelId: row.channelId ?? l.channelId ?? null,
       thumb: row.thumb ?? l.thumb ?? null,
       durationS: row.durationS ?? l.durationS ?? null,
     });
@@ -247,20 +338,37 @@ export function rankSeeds({ plays = [], likes = [], disliked = new Set() } = {},
 
   const scored = [...byId.values()]
     .map((t) => ({ ...t, score: seedScore(t) }))
-    // A title is required to show anything, a 4-hour mix is not a seed, and a
-    // dislike is a standing instruction: that track never seeds anything.
-    .filter((t) => t.score > 0 && t.title && !isCompilation(t) && !disliked.has(t.videoId))
+    // A positive score alone is not eligibility: two bare starts or a 30% listen
+    // earned a small score and used to become upstream seeds. Require an actual
+    // positive signal first; the score then orders (and may still veto) it.
+    // Song-level dislikes belong here, before rotation/fanout, not only in the
+    // finished queue: otherwise a refused song's other upload still spends an
+    // up-next request and one of the three seed slots.
+    .filter((t) => t.score > 0 && (t.liked || t.completes > 0 || t.deepest >= 0.6)
+      && t.title && !isCompilation(t) && isSongDuration(t)
+      && !disliked.has(t.videoId) && !dislikedSongs.has(songKey(t)))
     .sort((a, b) => b.score - a.score
-      || String(a.title).localeCompare(String(b.title)));
+      || String(a.title).localeCompare(String(b.title))
+      // Two seeds with the same score and the same title are the same song under
+      // two uploads; the id makes the order a total one, so the same evidence
+      // always produces the same station.
+      || String(a.videoId).localeCompare(String(b.videoId)));
 
   // One artist cannot own the station: a binge would otherwise make every
   // recommendation the same person.
   const perArtist = new Map();
+  const seenSongs = new Set();
   const out = [];
   for (const t of scored) {
+    // Two uploads of one song are one piece of taste evidence. Deduplicate in
+    // ranked order so the stronger upload survives and neither artist nor seed
+    // quotas are spent twice before rotateSeeds() picks its three.
+    const song = songKey(t);
+    if (song && seenSongs.has(song)) continue;
     const key = artistKey(t);
     const n = perArtist.get(key) ?? 0;
     if (key && n >= MAX_SEEDS_PER_ARTIST) continue;
+    if (song) seenSongs.add(song);
     if (key) perArtist.set(key, n + 1);
     out.push(t);
     if (out.length >= limit) break;
@@ -299,25 +407,19 @@ const isValidTrack = (t) => t
   && Boolean(t.title);
 
 /**
- * Where slot `i` of a page wants to land: familiar taste or something new.
- *
- * Two familiar tracks for every discovery one. Written as a rhythm rather than
- * a quota because the *order* is what the listener hears: a station that plays
- * eleven songs by people they know and then two strangers feels like two
- * different stations stapled together. A steady every-third-track keeps the
- * queue recognisable without letting it become a loop.
- */
-export function wantsFamiliar(i) {
-  return (Math.trunc(Number(i) || 0) % 3) !== 2;
-}
-
-/**
  * Turn a plan's per-lane weights into the order the page is actually built in.
  *
  * Weights alone stack the page: eleven familiar tracks in a row before anybody
  * remembers the discovery lane exists. This walks the lanes round-robin by a
  * *weighted* count, so a 14/5/5 page alternates instead of block-sorting and the
  * first track is one this person knows.
+ *
+ * The 2:1 familiar-to-discovery rhythm lives in the *plan* (see FAMILIAR_SHARE
+ * and planPage), not in the slot index: which lanes count as "familiar" depends
+ * on the page — the first page holds seeds, an extension holds none — and a
+ * fixed `i % 3` rhythm (there used to be a `wantsFamiliar(i)` helper) could only
+ * ever disagree with the weights it was interleaving. The weights are the one
+ * place that decides the mix; this function only decides the spread.
  *
  * The walk uses the smooth weighted round-robin every load balancer uses: each
  * turn, every lane's running credit grows by its weight and the highest credit
@@ -370,14 +472,21 @@ export function slotOrder(plan = {}, { limit = STATION_LIMIT, order = ['seed', '
  *  1. Refuse what cannot be delivered: disliked videos and songs, anything in
  *     `exclude` (the queue and everything an earlier page handed over),
  *     duplicates, compilations.
- *  2. Cap each artist, hardest for the seed's own artist. "More of the band you
- *     are already listening to" is the cheapest answer a recommender can give,
- *     and YouTube gives it eagerly — its up-next list for a song is often half
- *     that one artist.
+ *  2. Cap each artist, hardest for the seed's own artist: it gets
+ *     MAX_PER_SEED_ARTIST recommendations where anyone else may have
+ *     MAX_PER_ARTIST tracks (a seed itself spends only the wide cap). "More of
+ *     the band you are already listening to" is the cheapest answer a
+ *     recommender can give, and YouTube gives it eagerly — its up-next list for
+ *     a song is often half that one artist.
  *  3. Hold a ceiling on familiar tracks (FAMILIAR_SHARE), so the page keeps
  *     offering new names instead of circling the same four.
  *  4. Spend the page's slots in an interleaved order (see planPage and
  *     slotOrder) rather than block-sorting by lane.
+ *
+ * `cursor` is the station's own progress, and it is only used to decide where
+ * the *reading* of the candidate pools starts (see rotateFrom). At the default
+ * 0 the pools are read in the order they were handed over, which is what the
+ * tests and the first page rely on.
  *
  * Rules 2–4 are preferences with fallbacks, not hard quotas: when a lane has
  * nothing usable it hands its turn to the others rather than leaving a hole. A
@@ -392,14 +501,22 @@ export function slotOrder(plan = {}, { limit = STATION_LIMIT, order = ['seed', '
 export function buildStation({
   seeds = [], expansions = [], disliked = new Set(), dislikedSongs = new Set(), limit = STATION_LIMIT,
   exclude = new Set(), knownArtists = new Set(), seedArtists = new Set(), share = FAMILIAR_SHARE,
-  plan = null,
+  plan = null, cursor = 0,
 } = {}) {
   const seenVideo = new Set();
   const seenSong = new Set();
   const out = [];
   const perArtist = new Map();
-  const familiarArtists = new Set(Array.from(knownArtists ?? [], (a) => artistKey({ channel: a })));
-  const seedArtistKeys = new Set(Array.from(seedArtists ?? [], (a) => artistKey({ channel: a })));
+  // Recommendations only, and only ever consulted for a seed's artist: this is
+  // what makes MAX_PER_SEED_ARTIST mean "one more from that band" instead of
+  // "one track by that band", which the seed itself would already have spent.
+  const recsByArtist = new Map();
+  const familiarArtists = new Set(
+    Array.from(knownArtists ?? [], (a) => artistKeyOf(a)).filter(Boolean),
+  );
+  const seedArtistKeys = new Set(
+    Array.from(seedArtists ?? [], (a) => artistKeyOf(a)).filter(Boolean),
+  );
 
   const seedPool = { tracks: (seeds ?? []).map((t) => (t ? { ...t, lane: LANE.seed.key } : t)), lane: 'seed' };
   // A pool's lane comes from the tracks themselves when they were tagged (see
@@ -416,7 +533,12 @@ export function buildStation({
     // lane without the caller having to remember how each pool was built.
     return { tracks: raw.map((t) => (t && !t.lane ? { ...t, lane } : t)), lane };
   });
-  const pools = [seedPool, ...tagged].filter((p) => p.tracks.length);
+  // The pools are read from where the last page stopped (see rotateFrom): with
+  // three seeds or fewer the seed *set* cannot vary, so this is the difference a
+  // later cursor can honestly make — which of the *same* candidates survives the
+  // per-artist caps, instead of the identical page with a different fetch order.
+  const pools = rotateFrom([seedPool, ...tagged].filter((p) => p.tracks.length), cursor)
+    .map((p) => ({ ...p, tracks: rotateFrom(p.tracks, cursor) }));
   const discoveryLanes = new Set([LANE.adjacent.key, LANE.trending.key]);
 
   // How many familiar tracks the page may hold at most.
@@ -429,7 +551,11 @@ export function buildStation({
   const isFamiliar = (track, pool) => {
     if (pool?.lane === 'seed') return true;
     if (track?.lane && discoveryLanes.has(track.lane)) return false;
-    return familiarArtists.has(artistKey(track));
+    // An unknown artist is not "one you already play". An empty key used to
+    // count as a match for every other empty key, which made every row without
+    // a channel — and, before the Unicode fix, every non-Latin row — familiar.
+    const key = artistKey(track);
+    return Boolean(key) && familiarArtists.has(key);
   };
 
   /** Can this track be queued at all? Duplicates, refusals and caps live here. */
@@ -442,15 +568,23 @@ export function buildStation({
     if (exclude.has(track.videoId)) return false;
     if (seenVideo.has(track.videoId)) return false;
     if (isCompilation(track)) return false;
+    // A 15-second teaser is not a station track, and a known over-long upload is
+    // a mix whatever its title says. Unknown lengths are allowed: refusing them
+    // would empty whole shelves that carry no duration metadata.
+    if (!isSongDuration(track)) return false;
     const key = songKey(track);
     if (key && dislikedSongs.has(key)) return false;
     if (key && seenSong.has(key)) return false;
-    // One name cannot own the station. The seed's own artist is capped hardest.
+    // One name cannot own the station, and the seed's own artist is capped
+    // hardest: it gets MAX_PER_SEED_ARTIST *recommendations* where anyone else
+    // may have MAX_PER_ARTIST tracks. The seed itself is exempt from the narrow
+    // cap — it is the song this person chose, not the recommender's guess — so
+    // a first page still plays the band they just fell for, twice.
     const artist = artistKey(track);
     if (artist) {
-      const n = perArtist.get(artist) ?? 0;
-      if (n >= MAX_PER_ARTIST) return false;
-      if (seedArtistKeys.has(artist) && n >= MAX_PER_SEED_ARTIST) return false;
+      if ((perArtist.get(artist) ?? 0) >= MAX_PER_ARTIST) return false;
+      if (seedArtistKeys.has(artist) && track.lane !== LANE.seed.key
+        && (recsByArtist.get(artist) ?? 0) >= MAX_PER_SEED_ARTIST) return false;
     }
     return true;
   };
@@ -460,7 +594,12 @@ export function buildStation({
     const key = songKey(track);
     if (key) seenSong.add(key);
     const artist = artistKey(track);
-    if (artist) perArtist.set(artist, (perArtist.get(artist) ?? 0) + 1);
+    if (artist) {
+      perArtist.set(artist, (perArtist.get(artist) ?? 0) + 1);
+      if (track.lane !== LANE.seed.key) {
+        recsByArtist.set(artist, (recsByArtist.get(artist) ?? 0) + 1);
+      }
+    }
     if (isFamiliar(track, pool)) familiarCount++;
     out.push(track);
   };
@@ -479,12 +618,14 @@ export function buildStation({
     const start = laneCursor.get(lane) ?? 0;
     for (let i = 0; i < lanePools.length; i++) {
       const pool = lanePools[(start + i) % lanePools.length];
-      const at = pool.tracks.findIndex(usable);
+      // Look *past* a familiar head that the ceiling refuses. Stopping at the
+      // first usable track and abandoning the pool when it cannot be delivered
+      // used to hand a lane's turn away while non-familiar tracks sat behind
+      // that head, so a page came back short and 100 % familiar with unused
+      // newcomers in the same pool.
+      const at = pool.tracks.findIndex((t) => usable(t)
+        && !(isFamiliar(t, pool) && familiarCount >= familiarCap));
       if (at < 0) continue;
-      // A familiar track may not push the page past its ceiling, whichever lane
-      // it arrived in: a discovery lane can still hand back an artist already in
-      // the history, and that counts against the same budget.
-      if (isFamiliar(pool.tracks[at], pool) && familiarCount >= familiarCap) continue;
       laneCursor.set(lane, (start + i + 1) % lanePools.length);
       commit(pool.tracks.splice(at, 1)[0], pool);
       return true;

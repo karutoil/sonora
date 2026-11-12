@@ -14,7 +14,15 @@
    ═══════════════════════════════════════════════════════════════════════════ */
 
 /* ── page ─────────────────────────────────────────────────────────────────── */
-.room-page{display:grid;gap:22px;max-width:1100px;padding-bottom:26px}
+/* One material for every room panel, derived from the app's own warm charcoal
+   surfaces so a token change moves this sheet with it — each value keeps a
+   literal fallback, so the file is still correct if a token is missing. */
+.room-page{
+  --room-panel:linear-gradient(168deg,var(--card,#24211d),var(--panel,#1e1b18) 78%);
+  --room-sleeve-ring:0 0 0 1px var(--line-2,rgba(255,255,255,.11));
+  --room-sleeve-lift:0 14px 34px rgba(0,0,0,.42);
+  display:grid;gap:22px;max-width:1100px;padding-bottom:26px
+}
 .room-hero{min-height:180px;border-radius:var(--r-lg)}
 
 .room-head{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:14px}
@@ -56,23 +64,40 @@
 /* ── now playing ──────────────────────────────────────────────────────────── */
 .room-now{
   display:grid;gap:18px;padding:16px;border:1px solid var(--line);
-  border-radius:var(--r-lg);background:var(--panel);
+  border-radius:var(--r-lg);background:var(--room-panel,var(--panel));
   box-shadow:0 1px 0 var(--inset) inset
 }
-.room-art{position:relative;border-radius:var(--r-md);overflow:hidden;aspect-ratio:16/9;background:var(--card)}
+/* The artwork is the hero of this panel, so it is framed like a sleeve: the
+   large sleeve radius, a hairline ring, one soft lift — the same frame a shelf
+   tile gets, at hero size. The 16:9 box stays: these are video stills, and a
+   square crop cuts the composition the cover was chosen for.
+
+   The ring is a pseudo-element on top of the still rather than an inset shadow
+   on the frame: the cover fills the box, so a hairline painted under it would
+   be a hairline nobody sees. */
+.room-art{
+  position:relative;border-radius:var(--r-cover-lg,var(--r-md,16px));overflow:hidden;aspect-ratio:16/9;
+  background:var(--card);box-shadow:var(--room-sleeve-lift)
+}
+.room-art::after{
+  content:"";position:absolute;inset:0;border-radius:inherit;
+  box-shadow:inset 0 0 0 1px var(--line-2);pointer-events:none
+}
 .room-art .cover{width:100%;height:100%;object-fit:cover;border-radius:0}
 .room-art-live{
   position:absolute;left:12px;bottom:12px;display:flex;align-items:flex-end;gap:3px;
   height:20px;padding:5px 9px;border-radius:var(--r-pill);
-  background:rgba(13,14,17,.66);backdrop-filter:blur(8px)
+  background:rgba(16,13,11,.66);backdrop-filter:blur(8px)
 }
-.room-art-live i{width:3px;height:6px;border-radius:2px;background:var(--muted)}
+.room-art-live i{width:3px;height:15px;border-radius:2px;background:var(--muted);transform:scaleY(.4);transform-origin:bottom}
 .room-art-live.is-playing i{background:var(--accent)}
 @media (prefers-reduced-motion:no-preference){
+  /* transform, not height: three bars re-laying-out the pill four times a
+     second is a layout pass for a 10px difference. */
   .room-art-live.is-playing i{animation:room-eq 900ms var(--ease-spring) infinite alternate}
   .room-art-live.is-playing i:nth-child(2){animation-delay:.18s}
   .room-art-live.is-playing i:nth-child(3){animation-delay:.36s}
-  @keyframes room-eq{from{height:5px}to{height:15px}}
+  @keyframes room-eq{from{transform:scaleY(.34)}to{transform:scaleY(1)}}
 }
 .room-now-body{min-width:0}
 .room-now-body .eyebrow{color:var(--accent)}
@@ -118,6 +143,20 @@
   font-size:9px;font-weight:800;letter-spacing:.1em;color:var(--accent-2);
   border:1px solid var(--accent-line);border-radius:var(--r-pill);padding:1px 6px
 }
+/* "Make host", next to somebody else's chip in the room sheet.
+   A quiet outline rather than a filled button: handing the room over is a
+   deliberate, occasional act, not the thing to click by reflex — but it still
+   gets the 44px touch height below, because it is the only way out of a room
+   whose host has walked away. */
+.room-promote{
+  min-height:32px;padding:0 10px;border:1px dashed var(--line-2);border-radius:var(--r-pill);
+  background:transparent;color:var(--muted);font-size:11.5px;font-weight:700;cursor:pointer
+}
+.room-promote:hover{color:var(--text-2);border-color:var(--accent-line)}
+.room-promote[disabled]{opacity:.55;cursor:progress}
+@media (hover:none), (pointer:coarse){
+  .room-promote{min-height:44px}
+}
 
 /* ── queue ────────────────────────────────────────────────────────────────── */
 .room-queue-list{list-style:none;margin:0;padding:0;display:grid;gap:2px}
@@ -136,7 +175,10 @@
   font-size:11.5px;font-variant-numeric:tabular-nums
 }
 .room-queue-row.is-current .room-queue-num{color:var(--accent)}
-.room-queue-btn .cover{flex:none;width:40px;height:40px;border-radius:var(--r-xs)}
+/* The queue's 40px cover is the small end of the same sleeve: --r-cover and the
+   hairline ring, no lift — a row is flat, and forty of them lifting would read
+   as a pile of cards. */
+.room-queue-btn .cover{flex:none;width:40px;height:40px;border-radius:var(--r-cover,var(--r-xs,8px));box-shadow:var(--room-sleeve-ring)}
 .room-queue-text{min-width:0;flex:1}
 .room-queue-text strong,
 .room-queue-text span{display:block;width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -146,12 +188,17 @@
 .room-queue-remove{flex:none;width:40px;height:40px;opacity:0}
 .room-queue-row:hover .room-queue-remove,
 .room-queue-remove:focus-visible{opacity:1}
+/* No hover on a touch screen: the remove button would be an invisible tap
+   target sitting exactly where a thumb lands. */
+@media (hover:none){
+  .room-queue-remove{opacity:1}
+}
 .room-empty{margin:0;font-size:12.5px;color:var(--soft);line-height:1.6}
 
 /* ── host settings ────────────────────────────────────────────────────────── */
 .room-host{
   display:grid;gap:16px;padding:16px;border:1px solid var(--line);
-  border-radius:var(--r-lg);background:var(--panel)
+  border-radius:var(--r-lg);background:var(--room-panel,var(--panel))
 }
 .room-setting{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px}
 .room-setting strong{font-size:13px;font-weight:700}
@@ -192,11 +239,12 @@
 /* ── join gate / ended ────────────────────────────────────────────────────── */
 .room-gate{
   justify-items:center;text-align:center;padding:34px 22px;gap:12px;
-  border:1px solid var(--line);border-radius:var(--r-lg);background:var(--panel)
+  border:1px solid var(--line);border-radius:var(--r-lg);background:var(--room-panel,var(--panel))
 }
 .room-gate-eye{
   display:grid;place-items:center;width:62px;height:62px;border-radius:50%;
-  background:var(--accent-soft);color:var(--accent)
+  background:var(--accent-soft);color:var(--accent);
+  box-shadow:0 0 0 1px var(--accent-line) inset
 }
 .room-gate-eye .ico{width:28px;height:28px}
 .room-gate h1{
@@ -253,6 +301,21 @@
   .room-gate{padding:26px 16px}
   .room-setting .segmented{width:100%}
   .room-setting .segment{flex:1}
+}
+
+/* ── the 44px floor, declared last so it wins ─────────────────────────────────
+   app.css has its own touch floor (`@media (hover:none),(pointer:coarse){
+   .icon-btn,…{width:44px;height:44px} }`), but it cannot reach these three:
+   this file loads after it, `.room-invite-list li .icon-btn` is (0,2,1) against
+   `.icon-btn`'s (0,1,0), and the other two are simply later in the cascade. So
+   on a phone the × that removes an invite was 36x36, the × that removes a queue
+   row 40x40 — the row's most destructive control, in the spot a thumb lands by
+   accident, which is what rooms.css:177 is warning about — and Share/Leave were
+   40px tall. Same fix, same shape as notifications.css's touch block. */
+@media (hover:none), (pointer:coarse){
+  .room-invite-list li .icon-btn{width:44px;height:44px}
+  .room-queue-remove{width:44px;height:44px}
+  .room-actions .secondary-btn{min-height:44px}
 }
 
 /* ── reduced motion ───────────────────────────────────────────────────────── */

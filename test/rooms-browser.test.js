@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { launch, freePort, CHROME } from './helpers/cdp.js';
-import { writeWav } from './helpers/wav.js';
+import { writeSilentM4a } from './helpers/audio-fixture.js';
 
 // Listen Together, driven in two (and then three) real Chromium sessions.
 //
@@ -19,20 +19,18 @@ import { writeWav } from './helpers/wav.js';
 // able to listen to a public one.
 
 const DIR = new URL('./.tmp/rooms-browser/', import.meta.url).pathname;
-const PORT = 8154;
-const BASE = `http://127.0.0.1:${PORT}`;
+let PORT = 0;
+let BASE = '';
 
-// Silent fixtures, but long ones: a 40 s track would roll over mid-test and the
-// suite would be measuring the room's (correct) auto-advance instead of the
-// thing under test. 8 kHz mono keeps 150 s at ~2.4 MB, and the directory is
-// removed in `after`.
+// Genuine duration-matched silent AAC/M4A fixtures cannot roll over mid-test and make the
+// suite measure the room's (correct) auto-advance instead of the stated behavior.
 const TRACKS = [
-  { videoId: 'dQw4w9WgXcQ', title: 'Alpha Song', channel: 'The Alphas', durationS: 150, freq: 300 },
-  { videoId: '9bZkp7q19f0', title: 'Beta Song', channel: 'The Betas', durationS: 150, freq: 400 },
-  { videoId: 'kJQP7kiw5Fk', title: 'Gamma Song', channel: 'The Gammas', durationS: 150, freq: 500 },
+  { videoId: 'dQw4w9WgXcQ', title: 'Alpha Song', channel: 'The Alphas', durationS: 150 },
+  { videoId: '9bZkp7q19f0', title: 'Beta Song', channel: 'The Betas', durationS: 150 },
+  { videoId: 'kJQP7kiw5Fk', title: 'Gamma Song', channel: 'The Gammas', durationS: 150 },
 ];
 // What the room is created with, and what the assertions name.
-const QUEUE = TRACKS.map(({ freq, ...t }) => t);
+const QUEUE = TRACKS;
 
 let server;
 let host;
@@ -70,9 +68,11 @@ const startServer = async () => {
 };
 
 before(async () => {
+  PORT = await freePort();
+  BASE = `http://127.0.0.1:${PORT}`;
   if (!CHROME) return;
   fs.rmSync(DIR, { recursive: true, force: true });
-  for (const t of TRACKS) writeWav(path.join(DIR, 'audio', `${t.videoId}.m4a`), { seconds: t.durationS, freq: t.freq });
+  for (const t of TRACKS) writeSilentM4a(path.join(DIR, 'audio', `${t.videoId}.m4a`), { seconds: t.durationS });
   server = await startServer();
   // Three separate profiles: two accounts and one anonymous visitor, each with
   // its own cookie jar, exactly as three different people would be.
@@ -205,6 +205,11 @@ test('two people hear the same second, one with no account at all', { skip: !CHR
   // duration is a thing to wait for, not a thing to assume.
   await guest.waitFor(`document.getElementById('listen-audio').duration > 100`, 25_000);
   await guest.waitFor(`/In sync|Sync \\d|Off by/.test(document.getElementById('listen-sync').textContent)`, 20_000);
+  // The listener count is a live measurement, not a constant: the document
+  // renders it before this guest's stream exists, and the stream's own opening
+  // snapshot is what adds the guest to it. Wait for the measurement rather than
+  // sampling it in the window before it lands.
+  await guest.waitFor(`Number(document.getElementById('listen-listeners').textContent) >= 2`, 20_000);
   const guestView = await guest.eval(`({
     sync: document.getElementById('listen-sync').textContent,
     listeners: Number(document.getElementById('listen-listeners').textContent),
@@ -378,10 +383,13 @@ test('a guest gets one tap, a 5% start and a volume control',
       });
       const code = room.body.code;
       await strict.goto(`${BASE}/l/${code}/live`);
-      await strict.waitFor(`!!document.getElementById('listen-start')`, 15_000);
+      // Under parallel test load a fresh Chromium can take well past 15 s to
+      // finish a cold navigate; the timeouts here buy headroom, they do not
+      // change what is being asserted.
+      await strict.waitFor(`!!document.getElementById('listen-start')`, 30_000);
       // The preload is already in flight by the time we look; give the page a
       // moment to prove it did not start on its own.
-      await strict.waitFor(`/Alpha Song/.test(document.getElementById('listen-title').textContent)`, 10_000);
+      await strict.waitFor(`/Alpha Song/.test(document.getElementById('listen-title').textContent)`, 20_000);
       await new Promise((r) => setTimeout(r, 1200));
 
       const before = await strict.eval(`({
@@ -453,9 +461,11 @@ test('a guest gets one tap, a 5% start and a volume control',
       });
       const pausedCode = paused.body.code;
       await strict.goto(`${BASE}/l/${pausedCode}/live`);
-      await strict.waitFor(`!!document.getElementById('listen-start')`, 15_000);
+      await strict.waitFor(`!!document.getElementById('listen-start')`, 30_000);
       await tap(strict, '#listen-start');
-      await new Promise((r) => setTimeout(r, 2000));
+      // Wait on the real condition (overlay gone) instead of a fixed sleep:
+      // under parallel load 2 s was not always enough and the test flaked.
+      await strict.waitFor(`document.getElementById('listen-overlay').hidden`, 30_000);
       const waiting = await strict.eval(`({
         paused: document.getElementById('listen-audio').paused,
         volume: document.getElementById('listen-audio').volume,
@@ -585,4 +595,429 @@ test('a room follows what you play, survives a restart and comes back on reload'
     assert.deepEqual(rejoined.errors, [], 'with no client errors');
     await host.screenshot(path.join(DIR, 'rejoined.png'));
     if (trackBefore) assert.equal(rejoined.track, trackBefore, 'the same track as before the reload');
+  });
+
+// A guest whose *stream* is gone must not become a request pump. Everything
+// below rides the polling fallback (`/state` every 3 s), which is exactly the
+// path a guest whose SSE died takes — and the one place a room that went
+// private (or whose guest cookie expired) used to spin 'Reconnecting…' forever.
+test('a guest on the polling fallback reaches a terminal state when the room closes',
+  { skip: !CHROME && 'chromium not installed' }, async (t) => {
+    const login = await signIn(host, 'toil', 'hunter2hunter2', 'host-browser');
+    assert.equal(login.status, 200);
+
+    // The server refuses to establish the guest's stream at all: the
+    // constructor throwing is what `openStream` treats as "cannot connect",
+    // which is how the page lands on its polling fallback without a network
+    // failure having to be staged.
+    const dispose = await guest.addInitScript(`
+      const RealES = window.EventSource;
+      window.EventSource = class extends RealES {
+        constructor(url) {
+          if (String(url).includes('/events')) {
+            throw new TypeError('stream unavailable (test)');
+          }
+          super(url);
+        }
+      };
+      // Count the polling requests so the test can prove the poller stops
+      // rather than trust that a 3 s interval happened not to fire.
+      window.__stateFetches = 0;
+      // ... and the guest re-mints, which is how a lost/expired cookie is
+      // supposed to heal instead of ending the page.
+      window.__guestMints = 0;
+      const realFetch = window.fetch;
+      window.fetch = (...args) => {
+        if (String(args[0]).includes('/state')) window.__stateFetches += 1;
+        if (String(args[0]).includes('/guest')) window.__guestMints += 1;
+        return realFetch(...args);
+      };
+    `);
+    try {
+      const room = await createRoom(host, {
+        visibility: 'public', control: 'everyone', playing: true, positionMs: 3000, queue: [QUEUE[0]],
+      });
+      const code = room.body.code;
+      await guest.goto(`${BASE}/l/${code}/live`);
+      await guest.waitFor(`!!document.getElementById('listen-start')`, 30_000);
+      // The badge reads Live either way, so the fallback is proven by its
+      // traffic: an established stream makes no /state requests, the poller
+      // makes one immediately and one every 3 s.
+      await guest.waitFor(`window.__stateFetches >= 2`, 20_000);
+      assert.ok(await guest.eval(`window.__stateFetches >= 2`), 'the fallback polls for state');
+
+      // The host closes the door: every poll now answers 403 PRIVATE, which is
+      // a terminal answer for a guest — the badge must say so and the polling
+      // must stop, not spin as 'Reconnecting…' forever.
+      const patch = await apiIn(host, `
+        const r = await fetch('/api/rooms/${code}', { method: 'PATCH', credentials: 'same-origin',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ visibility: 'private' }) });
+        return r.status;
+      `);
+      assert.equal(patch, 200, 'the host flips the room private');
+      await guest.waitFor(`document.body.dataset.status === 'private'`, 20_000);
+      const privated = await guest.eval(`({
+        badge: document.getElementById('listen-status').textContent.trim(),
+        start: document.getElementById('listen-start').textContent.trim(),
+        paused: document.getElementById('listen-audio').paused,
+      })`);
+      assert.equal(privated.badge, 'Invite only', `the badge reaches the invite-only state (${JSON.stringify(privated)})`);
+      assert.equal(privated.start, 'Invite only', 'and the gate does not offer listening');
+      assert.equal(privated.paused, true, 'the audio stops with the room');
+
+      // The poller stops: no further /state requests once the terminal answer
+      // has been applied (two poll windows of silence is decisive; the old
+      // behaviour would have added ~4 more fetches in that span).
+      const before = await guest.eval(`window.__stateFetches`);
+      await new Promise((r) => setTimeout(r, 7000));
+      const after = await guest.eval(`window.__stateFetches`);
+      assert.equal(after, before, `the poller stopped (state requests went ${before} -> ${after})`);
+
+      // The other side of the same coin: a guest cookie that is simply *gone*
+      // (six hours old, or a cleared jar) must heal rather than end the page.
+      // NO_GUEST is recoverable — the client mints one fresh token and carries
+      // on — while PRIVATE above is not.
+      const room2 = await createRoom(host, {
+        visibility: 'public', control: 'everyone', playing: true, positionMs: 3000, queue: [QUEUE[0]],
+      });
+      await guest.goto(`${BASE}/l/${room2.body.code}/live`);
+      await guest.waitFor(`window.__stateFetches >= 2`, 20_000);
+      await guest.send('Network.enable');
+      const beforeRemint = await guest.eval(`window.__stateFetches`);
+      await guest.send('Network.deleteCookies', { name: 'sonora_guest', url: BASE });
+      // The next poll answers 403 NO_GUEST, the engine re-mints, and the room
+      // is followed again: the fetch counter keeps moving and the badge is not
+      // a terminal one.
+      await guest.waitFor(`window.__guestMints >= 1`, 20_000);
+      await guest.waitFor(`window.__stateFetches > ${beforeRemint + 1}`, 20_000);
+      const recovered = await guest.eval(`({
+        status: document.body.dataset.status,
+        badge: document.getElementById('listen-status').textContent.trim(),
+        error: document.getElementById('listen-error').hidden ? null : document.getElementById('listen-error').textContent,
+        mints: window.__guestMints,
+      })`);
+      assert.notEqual(recovered.status, 'ended', `a lost cookie is not the end of the room (${JSON.stringify(recovered)})`);
+      assert.notEqual(recovered.status, 'private');
+      assert.equal(recovered.badge, 'Live', `the page says it is following the room again (${JSON.stringify(recovered)})`);
+      assert.equal(recovered.error, null, 'and shows no terminal error');
+      assert.ok(recovered.mints >= 1, 'the guest credential was minted again');
+      await guest.screenshot(path.join(DIR, 'guest-terminal.png'));
+    } finally {
+      dispose();
+    }
+  });
+
+// The sync engine's own logic, driven in-page (`import('/rooms.js')`) against a
+// scripted transport and a fake EventSource: fast, deterministic versions of
+// the error-path behaviours that would take minutes of wall-clock play to
+// provoke in a real room. The real-server side of these paths is covered above
+// and in test/rooms.test.js; what is under test here is the client's.
+test('the sync engine survives refused commands, dead streams and stale events',
+  { skip: !CHROME && 'chromium not installed' }, async (t) => {
+    const login = await signIn(host, 'toil', 'hunter2hunter2', 'host-browser');
+    assert.equal(login.status, 200);
+    const room = await createRoom(host, {
+      visibility: 'public', control: 'everyone', playing: true, positionMs: 3000, queue: [QUEUE[0]],
+    });
+    assert.equal(room.status, 200);
+
+    // Any real page will do as the host for the module context.
+    await host.goto(`${BASE}/#/room/${room.body.code}`);
+    await host.waitFor(`!!document.querySelector('[data-room="${room.body.code}"]')`, 30_000);
+
+    const out = await host.eval(`(async () => {
+      const mod = await import('/rooms.js');
+      const log = { streams: 0, status: [], commands: [], seeks: [], snapshotRevs: [], notes: [] };
+
+      // A scriptable stand-in for the browser's EventSource: it never fires on
+      // its own; the test drives onopen/onerror/event delivery by hand.
+      const streams = [];
+      class FakeES {
+        constructor(url) { this.url = url; this.readyState = 0; this.listeners = {}; streams.push(this); }
+        addEventListener(type, fn) { (this.listeners[type] ??= []).push(fn); }
+        emit(type, data) { for (const fn of this.listeners[type] ?? []) fn({ data: JSON.stringify(data) }); }
+        close() { this.readyState = 2; }
+      }
+      FakeES.CONNECTING = 0; FakeES.OPEN = 1; FakeES.CLOSED = 2;
+      const RealES = window.EventSource;
+      window.EventSource = FakeES;
+
+      // A transport that answers every read from the canned snapshot and every
+      // command from a policy the scenarios swap in.
+      const TRACK = { videoId: 'dQw4w9WgXcQ', title: 'Unit Song', channel: '', thumb: null, durationS: 150 };
+      let rev = 10;
+      let positionMs = 3000;
+      const snap = (over = {}) => ({
+        code: 'unitroom01', host: { id: 1, name: 'h' }, visibility: 'public', control: 'everyone',
+        joined: true, rev, now: Date.now(), at: Date.now(), positionMs, playing: false,
+        ended: false, index: 0, queue: [TRACK], track: TRACK, members: [], guests: 0, listeners: 1, ...over,
+      });
+      let behavior = null;
+      const api = async (path, opts = {}) => {
+        const method = opts.method ?? 'GET';
+        if (method === 'GET') log.gets = (log.gets ?? 0) + 1;
+        if (method === 'POST') {
+          log.commands.push({ type: opts.body?.type, auto: Boolean(opts.body?.auto) });
+        }
+        if (behavior) return behavior(path, method, opts);
+        return snap();
+      };
+      const httpError = (status, code, message) => {
+        const err = new Error(message);
+        err.status = status;
+        err.body = { error: message, code };
+        return err;
+      };
+
+      let currentId = null;
+      const hooks = {
+        currentTrackId: () => currentId,
+        isLoaded: (id) => id === currentId,
+        loadTrack: (s) => { currentId = s.track?.videoId ?? currentId; log.loads = (log.loads ?? 0) + 1; },
+        seek: (s) => log.seeks.push(s),
+        play: () => { log.plays = (log.plays ?? 0) + 1; }, pause: () => {}, setRate: () => {},
+        onSnapshot: (s) => log.snapshotRevs.push(s?.rev),
+        onStatus: (s) => log.status.push(s.status),
+        onDrift: () => {}, notify: (m, l) => log.notes.push({ m, l }),
+      };
+      // The correction loop only ever reads these four properties, so a plain
+      // object is a faithful (and controllable) audio element for a unit test.
+      const fakeAudio = (over = {}) => ({ paused: true, currentTime: 0, playbackRate: 1, ...over });
+      const fresh = () => {
+        const sync = mod.createRoomSync({ api, audio: document.createElement('audio'), hooks });
+        return sync;
+      };
+
+      // ── refused auto-next is remembered until the room moves ──────────
+      {
+        const sync = fresh();
+        await sync.load('unitroom01');
+        behavior = (path, method) => {
+          if (method === 'POST') throw httpError(403, 'NOT_ENDED', 'That track has not finished yet.');
+          return snap();
+        };
+        await sync.command('next', { auto: true });
+        await sync.command('next', { auto: true });
+        await sync.command('next', { auto: true });
+        const suppressed = log.commands.filter((c) => c.auto).length;
+        await sync.command('next'); // a person pressing next is never suppressed
+        const userNext = log.commands.filter((c) => c.type === 'next' && !c.auto).length;
+        // The room moving (a state event with a new rev) re-arms auto: the
+        // refusal was about *this* playhead, not about auto-advance forever.
+        rev = 11; positionMs = 4000;
+        streams.at(-1).emit('state', snap());
+        await sync.command('next', { auto: true });
+        const reArmed = log.commands.filter((c) => c.auto).length;
+        await sync.command('next', { auto: true });
+        sync.destroy();
+        log.autoNext = { firstRev: suppressed, userNext, reArmed, afterNewRev: log.commands.filter((c) => c.auto).length - reArmed };
+        log.statusAfterRefusal = log.status.at(-1);
+      }
+
+      // ── a live stream recovers its badge, and a retry starts clean ────
+      {
+        const beforeScenario = streams.length;
+        const sync = fresh();
+        await sync.load('unitroom01');
+        const es1 = streams.at(-1);
+        // Three blind errors (readyState CONNECTING, the network-blip shape)
+        // demote the stream to polling.
+        for (let i = 0; i < 3; i += 1) es1.onerror();
+        log.fallbackStatus = sync.status;
+        // A fresh attempt (what the 30 s retry timer does): the failure count
+        // from the dead stream must not ride along, or the new stream is
+        // one strike from the same fallback forever.
+        await sync.load('unitroom01');
+        const es2 = streams.at(-1);
+        es2.onerror(); // one hiccup — must survive it now
+        log.retrySurvivedOneError = sync.status !== 'polling';
+        es2.emit('snapshot', snap());
+        log.recoveredStatus = sync.status;
+        // A refused command parks the badge on 'error'; the next state the
+        // (still live) stream delivers must restore it.
+        behavior = (path, method) => {
+          if (method === 'POST') throw httpError(403, 'HOST_ONLY', 'Only the host controls this room.');
+          return snap();
+        };
+        await sync.command('seek', { positionMs: 5000 });
+        log.afterRefusedCommand = sync.status;
+        rev = 12; positionMs = 5500;
+        es2.emit('state', snap());
+        log.afterNextState = sync.status;
+        sync.destroy();
+        log.streamAttempts = streams.length - beforeScenario;
+        behavior = null;
+      }
+
+      // ── a stale state event must not rewind the playhead ─────────────
+      {
+        rev = 20; positionMs = 60000;
+        const sync = fresh();
+        await sync.load('unitroom01');
+        const es = streams.at(-1);
+        es.emit('state', snap({ rev: 18, positionMs: 9000 })); // queued behind a newer answer
+        log.staleApplied = sync.room.rev === 18;
+        log.stalePosition = sync.positionOf();
+        es.emit('state', snap({ rev: 21, positionMs: 61000 })); // genuinely newer
+        log.freshApplied = sync.room.rev === 21;
+        log.freshPosition = sync.positionOf();
+        // A hold armed by a *previous* room must not delay this one's first
+        // correction: rejoin the same room with the thumb mid-drag. The
+        // observable is the correction itself — a paused room 60 s behind the
+        // fresh snapshot gets seeked to it the moment corrections are allowed.
+        sync.hold(8000);
+        const seeksBefore = log.seeks.length;
+        await sync.load('unitroom01');
+        log.holdSurvivesReload = log.seeks.length === seeksBefore;
+        sync.destroy();
+      }
+
+      // ── an older command response must not drag the room back ─────────
+      {
+        rev = 30; positionMs = 30000;
+        currentId = null;
+        const sync = fresh();
+        await sync.load('unitroom01');
+        log.loadsAfterOpen = log.loads ?? 0;
+        // Someone else moved the room while this command was in flight; the
+        // answer that lost the race describes an older, different room.
+        behavior = (path, method) => (method === 'POST'
+          ? snap({ rev: 29, index: 1, queue: [TRACK, { ...TRACK, videoId: '9bZkp7q19f0', title: 'Other' }],
+            track: { ...TRACK, videoId: '9bZkp7q19f0', title: 'Other' }, positionMs: 1000 })
+          : snap());
+        await sync.command('seek', { positionMs: 1000 });
+        log.staleCommandRev = sync.room.rev;
+        log.staleCommandIndex = sync.room.index;
+        log.staleCommandReloads = (log.loads ?? 0) - log.loadsAfterOpen;
+        behavior = null;
+        sync.destroy();
+      }
+
+      // ── a track that has ended is paused, not restarted once a second ──
+      {
+        rev = 40;
+        currentId = 'dQw4w9WgXcQ';
+        const audio = fakeAudio({ paused: true, currentTime: 150 });
+        const seeks = [];
+        let plays = 0;
+        let localId = 'dQw4w9WgXcQ';
+        const endedSnap = snap({ rev: 40, playing: true, positionMs: 150000, ended: false });
+        const sync = mod.createRoomSync({
+          api: async () => endedSnap,
+          audio,
+          hooks: {
+            ...hooks,
+            currentTrackId: () => localId,
+            isLoaded: (id) => id === localId,
+            loadTrack: (s) => { localId = s.track?.videoId ?? localId; },
+            play: () => { plays += 1; },
+            seek: (s) => seeks.push(s),
+          },
+        });
+        await sync.load('unitroom01');
+        sync.correct(); sync.correct(); sync.correct();
+        log.endedPlays = plays;
+        log.endedSeeks = seeks.length;
+        log.endedMaxSeek = seeks.length ? Math.max(...seeks) : 0;
+        log.endedPosition = sync.positionOf();
+        sync.destroy();
+      }
+
+      // ── a refused auto-next is retried once the boundary has passed ───
+      {
+        rev = 50; positionMs = 3000;
+        currentId = null;
+        const autoCount = () => log.commands.filter((c) => c.auto).length;
+        const sync = fresh();
+        await sync.load('unitroom01');
+        behavior = (path, method) => {
+          if (method === 'POST') throw httpError(403, 'NOT_ENDED', 'That track has not finished yet.');
+          return snap();
+        };
+        const start = autoCount();
+        await sync.command('next', { auto: true }); // refused: 3 s into a 150 s track
+        const refused = autoCount();
+        await sync.command('next', { auto: true }); // still nowhere near the end
+        const suppressed = autoCount();
+        // The room's own derived position is now the end, so the refusal no
+        // longer describes the playhead this client is looking at.
+        streams.at(-1).emit('state', snap({ rev: 50, positionMs: 150000, playing: false, ended: true }));
+        await sync.command('next', { auto: true }); // one retry, allowed
+        const retried = autoCount();
+        behavior = null;
+        sync.destroy();
+        log.autoRetry = { start, refused, suppressed, retried };
+      }
+
+      // ── a full room says so instead of retrying the door forever ──────
+      {
+        rev = 60; positionMs = 3000;
+        currentId = null;
+        const sync = fresh();
+        // This scenario shares the page with the app's own room sync, so it
+        // must look at the stream THIS engine opened, not the last one globally.
+        const before = streams.length;
+        await sync.load('unitroom01');
+        const es = streams.slice(before).at(-1);
+        const getsBefore = log.gets ?? 0;
+        es.emit('room', { ended: false, error: 'This room has too many listeners.' });
+        log.capacityStatus = sync.status;
+        log.capacityNotes = log.notes.filter((n) => /too many listeners/.test(n.m)).length;
+        await new Promise((r) => setTimeout(r, 150));
+        log.capacityClosed = es.readyState === 2;
+        log.capacityPolls = (log.gets ?? 0) - getsBefore;
+        log.capacityError = sync.error;
+        sync.destroy();
+      }
+
+      window.EventSource = RealES;
+      return log;
+    })()`);
+
+    // ── auto-next suppression ─────────────────────────────────────────
+    assert.equal(out.autoNext.firstRev, 1, `at most one auto command per rev (${JSON.stringify(out.autoNext)})`);
+    assert.equal(out.autoNext.userNext, 1, 'a user-initiated next is never suppressed');
+    assert.equal(out.autoNext.reArmed, 2, 'a new rev re-arms auto-next (1 + 1 new)');
+    assert.equal(out.autoNext.afterNewRev, 0, 'the next refusal is suppressed again (no request at all)');
+    assert.equal(out.statusAfterRefusal, 'error', 'a refused command parks the badge on error');
+
+    // ── stream recovery ───────────────────────────────────────────────
+    assert.equal(out.fallbackStatus, 'polling', 'three blind errors demote the stream to polling');
+    assert.equal(out.retrySurvivedOneError, true, 'a retry starts with a clean failure count');
+    assert.equal(out.recoveredStatus, 'live', 'and the stream carries the room again');
+    assert.equal(out.afterRefusedCommand, 'error', 'a refused command parks the badge on error');
+    assert.equal(out.afterNextState, 'live', 'the next state from the live stream restores it');
+    assert.equal(out.streamAttempts, 2, 'the stream re-established within two attempts');
+
+    // ── stale state and stale holds ───────────────────────────────────
+    assert.equal(out.staleApplied, false, 'an out-of-order state event is ignored');
+    assert.equal(out.stalePosition, 60000, `the playhead did not jump back (${out.stalePosition})`);
+    assert.equal(out.freshApplied, true, 'a genuinely newer state is applied');
+    assert.equal(out.freshPosition, 61000, `and moves the playhead forward (${out.freshPosition})`);
+    assert.equal(out.holdSurvivesReload, false, 'a hold from the previous visit does not outlive load()');
+
+    // ── an older command response is ignored ──────────────────────────
+    assert.equal(out.staleCommandRev, 30, `a stale command response does not rewind the room (${out.staleCommandRev})`);
+    assert.equal(out.staleCommandIndex, 0, 'nor change the track it is playing');
+    assert.equal(out.staleCommandReloads, 0, 'so the player is not told to load the previous song');
+
+    // ── the end of a track is a pause, not a loop ─────────────────────
+    assert.equal(out.endedPosition, 150000, `the derived position is clamped to the duration (${out.endedPosition})`);
+    assert.equal(out.endedPlays, 0, 'an ended track is never re-played (play() from the end restarts it)');
+    assert.equal(out.endedSeeks, 0, 'and nothing seeks past the end');
+    assert.ok(out.endedMaxSeek <= 150, `no correction target exceeds the duration (${out.endedMaxSeek})`);
+
+    // ── an auto-next is retried once the boundary has passed ───────────
+    assert.equal(out.autoRetry.refused, out.autoRetry.start + 1, 'the first auto-next is sent');
+    assert.equal(out.autoRetry.suppressed, out.autoRetry.refused, 'a second one is suppressed while the boundary is far away');
+    assert.equal(out.autoRetry.retried, out.autoRetry.suppressed + 1,
+      'and exactly one retry happens once the room says the track ended');
+
+    // ── a full room ends the retry, not the page ──────────────────────
+    assert.equal(out.capacityNotes, 1, `the listener is told once (${out.capacityNotes})`);
+    assert.equal(out.capacityStatus, 'polling', `and the room keeps following by polling (${out.capacityStatus})`);
+    assert.equal(out.capacityClosed, true, 'the unanswered stream is closed instead of retried');
+    assert.ok(out.capacityPolls >= 1, `and the room is followed by polling (${out.capacityPolls} state reads)`);
+    assert.match(out.capacityError ?? '', /too many listeners/i, `the badge carries the reason (${out.capacityError})`);
   });

@@ -4,13 +4,16 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { freePort } from './helpers/cdp.js';
+import { monitorProcess, stopServerProcess } from './helpers/process.js';
+import { isUpstreamBotGate } from './helpers/upstream-gate.js';
 
 // Boots the REAL server as a child process and talks to it over HTTP.
 // This is the test that matters: it proves login, search, radio and audio
 // delivery work end to end against live YouTube — what unit tests cannot see.
 
-const PORT = 8141;
-const BASE = `http://127.0.0.1:${PORT}`;
+let PORT = 0;
+let BASE = '';
 const DB = new URL(`./.tmp/e2e-${Date.now()}.db`, import.meta.url).pathname;
 // A per-run temp dir: node --test runs files concurrently, and two servers
 // sharing one audio cache would confuse the cache-hit assertions.
@@ -22,6 +25,7 @@ const AUDIO = fs.mkdtempSync(path.join(os.tmpdir(), 'sonora-audio-'));
 const SONG_QUERY = 'aphex%20twin%20xtal';
 
 let proc;
+let monitor;
 let cookie = '';
 
 const jfetch = async (path, opts = {}) => {
@@ -50,6 +54,8 @@ async function songIds(count = 3) {
 }
 
 before(async () => {
+  PORT = await freePort();
+  BASE = `http://127.0.0.1:${PORT}`;
   proc = spawn(process.execPath, ['--no-warnings', 'src/server.js'], {
     cwd: new URL('..', import.meta.url).pathname,
     env: {
@@ -64,13 +70,14 @@ before(async () => {
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  monitor = monitorProcess(proc);
   const logs = [];
   proc.stdout.on('data', (d) => logs.push(d.toString()));
   proc.stderr.on('data', (d) => logs.push(d.toString()));
 
-  for (let i = 0; i < 120; i++) {
+  for (let i = 0; i < 120 && !monitor.settled; i++) {
     try {
-      const r = await fetch(`${BASE}/api/health`);
+      const r = await fetch(`${BASE}/api/health`, { signal: AbortSignal.timeout(1000) });
       // A server left over from an earlier run answers health too, on the
       // previous run's database — every count-based assertion then fails for a
       // reason that has nothing to do with the code. Only our pid counts.
@@ -82,9 +89,17 @@ before(async () => {
   throw new Error(`server did not start:\n${logs.join('')}`);
 });
 
-after(() => {
-  proc?.kill('SIGTERM');
-  try { fs.rmSync(AUDIO, { recursive: true, force: true }); } catch {}
+after(async () => {
+  if (!proc) return;
+  const failure = await stopServerProcess(proc, monitor, {
+    dir: AUDIO, label: 'e2e test server',
+  }).then(() => null, (error) => error);
+  for (const suffix of ['', '-shm', '-wal']) {
+    try { await fs.promises.rm(`${DB}${suffix}`, { force: true }); }
+    // Preserve a real stop/remove failure rather than hiding it in cleanup.
+    catch (error) { throw failure ? new AggregateError([failure, error], 'e2e teardown failed') : error; }
+  }
+  if (failure) throw failure;
 });
 
 test('health is public, API requires auth', async () => {
@@ -139,33 +154,68 @@ test('bad video id is rejected before touching YouTube', async () => {
 
 
 // Live streaming can be blocked by YouTube itself ("sign in to confirm you are
-// not a bot"). That is an external condition, not a regression, so the
-// streaming tests report a skip with the reason instead of a false failure.
-// The range/seek logic is covered deterministically in proxy.test.js.
+// not a bot"). That is an external condition, not a regression, so the streaming
+// tests report a skip with the reason instead of a false failure. The range/seek
+// logic is covered deterministically in proxy.test.js.
+//
+// A 502 is NOT that condition. It is this server's own "Could not fetch audio" —
+// the code path the cold-download bug produced — so it must fail the suite. It
+// used to skip, which is how a downloader that answered 502 on every uncached
+// first play stayed green across all eight live streaming tests. Up to three
+// search results are sampled first, so one unavailable upload cannot fail the
+// run; a broken downloader fails all three.
 let gateState = null;
 async function streamingGate(t) {
   if (gateState === null) {
-    const { body: s } = await jfetch(`/api/search?q=${SONG_QUERY}`);
-    const ids = (s.tracks || []).filter((x) => x.durationS > 30 && x.durationS < 600);
-    if (!ids.length) { gateState = { gated: true, reason: "no playable search results" }; }
-    else {
-      const res = await fetch(`${BASE}/api/stream/${ids[0].videoId}`, { headers: { cookie, Range: "bytes=0-1023" } });
-      if (res.status === 503) {
-        gateState = { gated: true, reason: "YouTube is bot-gating this IP (LOGIN_REQUIRED)" };
-      } else if (res.status === 502) {
-        // Upstream refused the download outright ("Could not fetch audio for
-        // that video."). That is YouTube, not the proxy: the proxy's own
-        // behaviour is pinned by the range/cache tests, which do not need a
-        // live download. Skip with the reason rather than reporting a
-        // regression for a network condition.
+    const { res: searchResponse, body: s } = await jfetch(`/api/search?q=${SONG_QUERY}`);
+    const ids = (s?.tracks || []).filter((x) => x.durationS > 30 && x.durationS < 600);
+    if (!searchResponse.ok || !ids.length) {
+      // Empty/malformed/search-error responses are not evidence of a bot gate.
+      // In particular, never turn a broken authenticated server into a skip.
+      gateState = {
+        kind: 'fail',
+        reason: `search returned HTTP ${searchResponse.status} with ${ids.length} playable tracks`,
+      };
+    } else {
+      let lastError = null;
+      for (const id of ids.slice(0, 3)) {
+        const res = await fetch(`${BASE}/api/stream/${id.videoId}`, {
+          headers: { cookie, Range: 'bytes=0-1023' },
+        });
+        if (res.status === 503) {
+          const body = await res.json().catch(() => ({}));
+          if (isUpstreamBotGate(res.status, body)) {
+            gateState = { kind: 'skip', reason: 'YouTube is bot-gating this IP (BOT_GATED)' };
+          } else {
+            gateState = {
+              kind: 'fail',
+              reason: `HTTP 503 ${body?.code ?? 'without an error code'} (${body?.error ?? 'no error detail'})`,
+            };
+          }
+          break;
+        }
+        if (res.status !== 502) {
+          await res.arrayBuffer();
+          // Playback responses are ranged 206. Anything else must reach the
+          // assertion below rather than being treated as permission to skip.
+          gateState = res.status === 206
+            ? { kind: 'run' }
+            : { kind: 'fail', reason: `unexpected HTTP ${res.status}` };
+          break;
+        }
         const body = await res.json().catch(() => ({}));
-        gateState = { gated: true, reason: `YouTube refused the download (${body?.error ?? 'HTTP 502'})` };
-      } else {
-        gateState = { gated: false };
+        lastError = body?.error ?? `HTTP ${res.status}`;
+      }
+      if (gateState === null) {
+        gateState = {
+          kind: 'fail',
+          reason: `every sampled track answered 502 (${lastError}): that is the cold-download path failing`,
+        };
       }
     }
   }
-  if (gateState.gated) { t.skip(gateState.reason); return true; }
+  if (gateState.kind === 'skip') { t.skip(gateState.reason); return true; }
+  if (gateState.kind === 'fail') assert.fail(`stream probe failed: ${gateState.reason}`);
   return false;
 }
 

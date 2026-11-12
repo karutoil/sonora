@@ -21,7 +21,8 @@
 
 import { createAudioSession } from './audio-session.js';
 import { artSrc, createMediaSession } from './media-session.js';
-import { isLoopWrap } from './playback.js';
+import { handoffTrack, isLoopWrap } from './playback.js';
+import { planTrackIds, locate, planOffsetFor, streamSrc, freezesWhenHidden } from './queue-stream.js';
 import { createRoomSync } from './rooms.js';
 
 const $ = (id) => document.getElementById(id);
@@ -48,6 +49,9 @@ const store = {
   },
   set(key, value) {
     try { localStorage.setItem(`sonora.${key}`, JSON.stringify(value)); } catch {}
+  },
+  remove(key) {
+    try { localStorage.removeItem(`sonora.${key}`); } catch {}
   },
 };
 
@@ -185,6 +189,27 @@ const state = {
   // One-shot guard so `seeking` and `timeupdate` cannot both advance the queue
   // for the same loop wrap.
   ending: false,
+  // When the last room auto-next was commanded: the wrap detector fires again
+  // on every timeupdate while the element loops a finished room track, so this
+  // timestamp is the cool-down that throttles retries of a failed auto-next.
+  roomNextAt: 0,
+  // The queue as one continuous server stream (public/queue-stream.js): the
+  // plan armed while the page is visible, and the stream the element is playing
+  // while it is hidden. `streaming` is non-null only between enterQueueStream()
+  // and leaveQueueStream().
+  queuePlan: null,
+  streaming: null,
+  streamSeekNonce: 0,
+  streamWatch: null,
+  streamBlocked: false,
+  streamPlayedOnce: false,
+  /** When the current stream src was assigned: the ceiling on its clock. */
+  streamLoadAt: 0,
+  streamFails: 0,
+  streamCooldownUntil: 0,
+  streamTrack: null,
+  streamOffsetMs: 0,
+  streamDurationMs: 0,
   // True while playIndex swaps the source: the pause that a src change emits
   // is not the user pausing, so it must not be saved as a new position.
   switching: false,
@@ -205,6 +230,15 @@ const state = {
   // (a call, Siri, another app). Coming back to the page resumes instead of
   // waiting for a tap; a lock-screen pause is deliberate and sets `userPause`.
   resumeOnVisible: false,
+  // Playback is wanted but the element is not running, for a reason that was
+  // not the listener. `state.playing` cannot carry this: the rejected-play
+  // paths deliberately set it false so the transport stays honest, and that is
+  // exactly when the intent must survive — an interruption that pauses a swap
+  // in flight used to leave nothing that remembered the music was supposed to
+  // be on (measured: switching to Discord silenced the phone for good).
+  resumeWanted: false,
+  // Consecutive refused resume attempts (see resumeAfterInterruption).
+  resumeAttempts: 0,
   userPause: false,
   failures: 0,
   savedAt: 0,
@@ -268,8 +302,13 @@ const state = {
 // Declared up here so any early render can read it without a temporal-dead-zone
 // throw; the gesture itself is set up much later.
 let queueDrag = null;
+// The queued frame of a drag in flight (see "queue reorder" below): pointer
+// events outrun paint, so the gesture is coalesced to one update per frame.
+let queueDragFrame = 0;
 let queueSaveTimer = null;
 let queueSuppressClick = 0;
+// Volume drags persist at most every 150 ms instead of on every input event.
+let volumeSaveTimer = null;
 
 // ── preferences ─────────────────────────────────────────────────────────
 // Pinned shared interface (see .tmp/plan/brief.md): other features extend
@@ -321,7 +360,14 @@ let refreshing = null;
 function refreshSession() {
   if (refreshing) return refreshing;
   refreshing = fetch('/api/auth/refresh', { method: 'POST', credentials: 'same-origin' })
-    .then((res) => res.ok)
+    .then(async (res) => {
+      // This request's boolean answer still owns a response body. Consume that
+      // small JSON payload before settling; discarded 401 streams from two
+      // concurrent refresh owners can otherwise keep Chromium's initial worker
+      // network job alive and leave a subsequent registration.update() pending.
+      await res.arrayBuffer();
+      return res.ok;
+    })
     .catch(() => false)
     .finally(() => { refreshing = null; });
   return refreshing;
@@ -446,7 +492,15 @@ const rooms = createRoomSync({
       if (snapshot?.invites) state.roomInvites = snapshot.invites;
       if (snapshot?.members) state.roomMembers = snapshot.members;
       if (Number.isFinite(snapshot?.guests)) state.roomGuests = snapshot.guests;
-      if (!snapshot) { state.roomMembers = []; state.roomGuests = 0; state.roomDriftMs = 0; }
+      if (!snapshot) {
+        state.roomMembers = [];
+        state.roomGuests = 0;
+        state.roomDriftMs = 0;
+        // Leaving the room can happen mid auto-next round trip, while `ending`
+        // is still armed as the wrap guard. The queue is personal again, so a
+        // stale armed flag must not swallow its next natural wrap.
+        state.ending = false;
+      }
       // A room that ended is not one to come back to on the next reload.
       if (snapshot?.ended) rememberRoom(null);
       updateRoomPill();
@@ -502,6 +556,9 @@ function completeTrack(t) {
     // Carried through so "Open album" works for anything already in a queue,
     // not only for rows freshly rendered from a catalogue search.
     albumId: t.albumId || known.albumId || null,
+    // Which edit of the song this is (see trackVersion on the server). Kept so
+    // the queue and the now-playing sheet can badge a clean edit as clean.
+    version: t.version ?? known.version ?? null,
   };
 }
 
@@ -580,16 +637,32 @@ function routeFromLocation() {
   return null;
 }
 
+/** Same page, same collection, same mood — the three things an entry names. */
+const sameRoute = (a, b) => a?.page === b?.page
+  && (a?.collection ?? null) === (b?.collection ?? null)
+  && (a?.mood ?? null) === (b?.mood ?? null);
+
 async function playSharedTrack(videoId) {
   try {
     const { track } = await api(`/api/track/${encodeURIComponent(videoId)}`);
+    // A shared link is a different queue, not an addition to the endless
+    // station: leaving it first stops the station from topping the shared
+    // song up with (or repeating) recommendations.
+    leaveStation();
     state.queue = [completeTrack(track)];
-    playIndex(0, { claim: true });
+    playIndex(0, { claim: true, queueChanged: true });
     notify(`Playing ${track.title ?? 'shared track'}`, 'info');
   } catch (err) {
-    notify(err.message === 'Unknown track.'
-      ? 'That link points to a track sonora has not seen yet.'
-      : err.message, 'error');
+    // The server refuses an id it has never seen; a share link is still a play
+    // intent, so fall back to the minimal track the player can play.
+    if (err.message === 'Unknown track.' || err.status === 404) {
+      leaveStation();
+      state.queue = [completeTrack({ videoId })];
+      playIndex(0, { claim: true, queueChanged: true });
+      notify('Playing shared track', 'info');
+      return;
+    }
+    notify(err.message, 'error');
   }
 }
 
@@ -613,7 +686,15 @@ function pageTitle() {
   return `${PAGE_TITLES[state.page] ?? 'Discover'} · sonora`;
 }
 
+/** Remember where the page being left was scrolled, so Back can return there. */
+function captureScroll() {
+  const entry = historyEntries[historyCursor.index];
+  const el = $('main-scroll');
+  if (entry && el) entry.scroll = el.scrollTop;
+}
+
 function pushRoute(entry) {
+  captureScroll();
   historyEntries.splice(historyCursor.index + 1);
   historyEntries.push(entry);
   historyCursor.index = historyEntries.length - 1;
@@ -624,6 +705,12 @@ function pushRoute(entry) {
 function navigate(page, collection = null, addHistory = true, mood = null) {
   if (page === 'collection' && collection) return openCollection(collection, { history: addHistory ? 'push' : 'none' });
   const entry = { page, collection, ...(mood ? { mood } : {}) };
+  // Clicking the nav item for the page already showing is not a navigation:
+  // pushing a duplicate entry made the in-app Back look dead once.
+  const current = historyEntries[historyCursor.index];
+  if (addHistory && current && current.page === entry.page
+    && (current.collection ?? null) === (entry.collection ?? null)
+    && (current.mood ?? null) === (entry.mood ?? null)) return;
   if (addHistory) {
     pushRoute(entry);
   } else {
@@ -632,10 +719,12 @@ function navigate(page, collection = null, addHistory = true, mood = null) {
     // lands on the page actually being shown.
     try { history.replaceState({ i: historyCursor.index }, '', routePath(page, collection, mood)); } catch {}
   }
-  applyRoute(entry, { scroll: true });
+  // A fresh navigation starts at the top; Back/Forward restore the scroll the
+  // entry was left at, so the gesture never loses your place in a long page.
+  applyRoute(entry, { scroll: addHistory, scrollTop: addHistory ? 0 : (entry.scroll ?? 0) });
 }
 
-function applyRoute({ page, collection, mood = null }, { scroll = false } = {}) {
+function applyRoute({ page, collection, mood = null }, { scroll = false, scrollTop = 0 } = {}) {
   if (page === 'admin' && !isAdmin()) {
     notify('Administrator access required.', 'error');
     page = 'home';
@@ -648,13 +737,21 @@ function applyRoute({ page, collection, mood = null }, { scroll = false } = {}) 
   document.title = pageTitle();
   const announcer = $('route-announcer');
   if (announcer) announcer.textContent = document.title.replace(' · sonora', '');
-  if (scroll) $('main-scroll').scrollTop = 0;
+  const target = scroll ? 0 : scrollTop;
+  const restoreScroll = () => { const el = $('main-scroll'); if (el) el.scrollTop = target; };
+  restoreScroll();
+  // The content was just replaced, so a second pass after layout makes the
+  // position stick even when images or a skeleton changed the page height.
+  requestAnimationFrame(restoreScroll);
   if (page === 'search' && window.matchMedia('(min-width: 811px)').matches) {
     setTimeout(() => $('primary-search')?.focus({ preventScroll: true }), 60);
   }
   // A mood needs its playlists; load once per mood, including on deep links
   // and when the phone's back gesture lands here.
   if (page === 'mood' && mood && state.mood?.q !== mood) loadMood(mood);
+  // A search debounce must not outlive the page that started it: a pending
+  // query fired after navigating away raised an error toast on the new page.
+  if (page !== 'search') clearTimeout(searchTimer);
   // An artist page is one upstream call and is cached server-side; opening it
   // again (back gesture, reload) reuses the copy already in state.
   if (page === 'artist' && collection && state.artist?.key !== collection) loadArtist(collection);
@@ -670,21 +767,46 @@ function applyRoute({ page, collection, mood = null }, { scroll = false } = {}) 
 }
 
 window.addEventListener('popstate', (e) => {
+  // Remember where the entry being left was scrolled before the cursor moves.
+  captureScroll();
   const i = e.state?.i;
-  if (Number.isInteger(i) && historyEntries[i]) {
+  // The route the address bar names — null when there is no hash at all.
+  const route = routeFromLocation();
+  // The index on the entry is only trustworthy when the entry it names is the
+  // page the address bar names. A reload keeps the old {i} but rebuilds the
+  // roster from scratch, so index 0 can hold the boot route while the browser
+  // has gone back to a page written before it; following the integer there
+  // showed one page under another page's URL. A mismatch reads the route from
+  // the hash instead (the adoption below), which is the record a reload cannot
+  // corrupt.
+  if (Number.isInteger(i) && historyEntries[i] && (!route || sameRoute(historyEntries[i], route))) {
     historyCursor.index = i;
     const entry = historyEntries[i];
+    const entryScroll = entry.scroll ?? 0;
     if (entry.page === 'collection' && entry.collection) {
-      return openCollection(entry.collection, { history: 'none' });
+      return openCollection(entry.collection, { history: 'none', scrollTop: entryScroll });
     }
-    return applyRoute(entry, { scroll: true });
+    return applyRoute(entry, { scrollTop: entryScroll });
   }
-  const route = routeFromLocation();
   if (!route) return;
   if (route.page === 'track') return playSharedTrack(route.videoId);
+  // Two kinds of entry reach this fallback instead of the indexed path above:
+  // one nobody in this document wrote (state===null — anything outside the
+  // router set location.hash, notifications.js does), and one whose index
+  // historyEntries no longer holds (a reload keeps the old {i} but rebuilds the
+  // roster from scratch). Inserting them at the cursor stacked a fresh duplicate
+  // of the same page on every re-entry and walked the cursor off the real
+  // stack, so adopt the entry in place instead: drop whatever sat ahead of the
+  // cursor and take its slot. Nothing is lost but a scroll position — every
+  // route is recoverable from its own hash.
+  historyEntries.splice(historyCursor.index + 1);
+  historyEntries.push(route);
+  historyCursor.index = historyEntries.length - 1;
+  // Tag the entry so coming back to it takes the indexed path above, which is
+  // what stops the duplicates in the first place. url is the current href, so
+  // the address bar keeps the hash the route was read from.
+  try { history.replaceState({ ...(e.state ?? {}), i: historyCursor.index }, '', location.href); } catch {}
   if (route.page === 'collection') return openCollection(route.collection, { history: 'none' });
-  historyEntries.splice(historyCursor.index + 1, 0, route);
-  historyCursor.index += 1;
   applyRoute(route, { scroll: true });
 });
 
@@ -715,7 +837,7 @@ function renderNav() {
   $('profile-yt').hidden = !isAdmin();
   $('desktop-nav').innerHTML = nav.map(([page, ic, label]) => `
     <button class="nav-btn ${activeRoute(page) ? 'active' : ''}" data-page="${page}"${activeRoute(page) ? ' aria-current="page"' : ''}>
-      ${icon(ic)}<span>${label}</span>${page === 'radio' ? '<span class="tiny-new">NEW</span>' : ''}
+      ${icon(ic)}<span>${label}</span>
     </button>`).join('');
 
   $('mobile-nav').innerHTML = mobileNav.map(([page, ic, label, short]) => `
@@ -731,9 +853,8 @@ function renderNav() {
     stationBtn.classList.toggle('active', stationOn);
     if (stationOn) stationBtn.setAttribute('aria-current', 'page');
     else stationBtn.removeAttribute('aria-current');
-    const label = stationBtn.querySelector('span');
-    if (label) label.textContent = state.station?.name ?? `${state.user?.name ?? 'Your'}'s station`;
   }
+  syncStationNavLabel();
 
   const dots = ['#ff997b', '#988ae0', '#92c1bd', '#ca7b9d', '#e4b985'];
   $('side-playlists').innerHTML = state.playlists.map((p, i) => `
@@ -744,78 +865,194 @@ function renderNav() {
     || '<div class="side-empty">No playlists yet</div>';
 }
 
-function sectionHeader(title, desc = '', button = 'See all', go = 'library') {
-  return `<div class="section-head"><div><h2>${esc(title)}</h2>${desc ? `<p>${esc(desc)}</p>` : ''}</div>
-    ${button ? `<button class="text-link" data-page="${go}">${esc(button)}${icon('arrow-right')}</button>` : ''}</div>`;
+/**
+ * The station's name in the sidebar, in one place.
+ *
+ * It reads live state (`state.station` arrives after the first paint), so the
+ * silent station load patches the label instead of repainting the nav.
+ */
+function syncStationNavLabel() {
+  const label = $('nav-station')?.querySelector('span');
+  if (!label) return;
+  const name = state.station?.name ?? `${state.user?.name ?? 'Your'}'s station`;
+  if (label.textContent !== name) label.textContent = name;
 }
 
+/**
+ * One section heading, shared by every routed page.
+ *
+ * `.shelf-head` is the v2 vocabulary (copy block + optional link). It keeps
+ * carrying `.section-head` as well: the search suite counts section heads, and
+ * other surfaces still style the older class, so both keep working.
+ */
+function sectionHeader(title, desc = '', button = 'See all', go = 'library') {
+  return `<div class="shelf-head section-head"><div class="shelf-head-copy">
+    <h2>${esc(title)}</h2>${desc ? `<p>${esc(desc)}</p>` : ''}</div>
+    ${button ? `<button class="text-link shelf-link" data-page="${go}">${esc(button)}${icon('arrow-right')}</button>` : ''}</div>`;
+}
+
+/**
+ * An artwork tile with a title, a sub-line and a play affordance.
+ *
+ * `.music-card` stays on the element because the app's card grid, the tests
+ * and the context menus key off it; `.sleeve-tile` is the shared geometry that
+ * makes library, search and artist tiles read as one object.
+ */
 function card(c) {
-  return `<button class="music-card" data-collection="${esc(c.collection)}" aria-label="${esc(c.title)}">
-    <div class="cover-wrap">${cover(null, 'cover', c.art)}<span class="cover-play">${icon('play')}</span></div>
-    <div class="music-card-title">${esc(c.title)}</div>
-    <div class="music-card-sub">${esc(c.sub)}</div></button>`;
+  return `<button class="music-card sleeve-tile" data-collection="${esc(c.collection)}" aria-label="${esc(c.title)}">
+    <div class="cover-wrap sleeve-tile-art">${cover(null, 'cover', c.art)}<span class="cover-play sleeve-tile-play">${icon('play')}</span></div>
+    <div class="music-card-title sleeve-tile-title">${esc(c.title)}</div>
+    <div class="music-card-sub sleeve-tile-sub">${esc(c.sub)}</div></button>`;
 }
 
 // ── pages ───────────────────────────────────────────────────────────────
+
+/**
+ * The sleeve: the track this device last played, with its real artwork and its
+ * real playhead. Returns `null` when nothing has been played here yet — a
+ * normal first-run state, not an error, so the hero offers a start rather than
+ * inventing a cover for a song the listener never chose.
+ */
+function sleeveFeatured() {
+  const track = state.home.featured;
+  if (!track) return null;
+  // Under five seconds there is nothing to pick up: a resume chip reading
+  // "0:02 in" is noise, and the button already resumes from the top.
+  const at = Math.round((state.home.featuredPos || 0) / 1000);
+  return { track, at: at >= 5 ? at : 0 };
+}
+
+/**
+ * The hero. Sleeve-first: the artwork of the actual last track fills the card,
+ * the track's own title and channel sit on it, and one button continues it.
+ * The fallback (no history) keeps the brand wash and offers a start.
+ *
+ * The class names `.hero`, `.hero-content`, `.hero-footer` and `.hero-meta` are
+ * load-bearing: layout and resume tests measure the footer's two actions and
+ * the mobile caption. `.sleeve-*` is the new sleeve vocabulary on top.
+ */
+function homeHero() {
+  const sleeve = sleeveFeatured();
+  const remote = state.resumeFrom ? String(state.resumeFrom) : null;
+  const likedRecent = `${state.liked.size} liked · ${state.home.recent.length} recent`;
+
+  if (!sleeve) {
+    return `<div class="hero sleeve-hero is-empty">
+  <div class="hero-art" aria-hidden="true"><div class="hero-orb"></div><div class="ring"></div><div class="ring r2"></div><div class="ring r3"></div></div>
+  <div class="hero-fade"></div><div class="hero-noise"></div>
+  <div class="hero-content"><div class="hero-tag">THE EVENING EDIT · VOL. 01</div>
+    <h1>Find your <em>afterglow.</em></h1>
+    <p>For slow evenings, long drives, and whatever comes next. Start with a song and sonora builds the rest.</p>
+    <div class="hero-footer">
+      <button class="play-btn" data-action="surprise">${icon('play')}Start listening</button>
+      <button class="secondary-btn" data-page="search">Find a song ${icon('arrow-right', 'sm')}</button>
+      <span class="hero-meta">${likedRecent}</span>
+    </div></div></div>`;
+  }
+
+  const t = sleeve.track;
+  // A real cover when the catalogue gave us one; the brand wash when the
+  // artwork proxy has nothing to show. Never a painted-on fake sleeve.
+  const art = t.thumb
+    ? cover(null, 'sleeve-hero-img', t.thumb, 'eager', true)
+    : `<div class="hero-orb"></div><div class="ring"></div><div class="ring r2"></div>`;
+
+  return `<div class="hero sleeve-hero">
+  <div class="hero-art sleeve-hero-art${t.thumb ? '' : ' is-artless'}" aria-hidden="true">${art}</div>
+  <div class="hero-fade"></div>${t.thumb ? '' : '<div class="hero-noise"></div>'}
+  <div class="hero-content">
+    <div class="hero-tag">${remote
+      ? `UP NEXT · FROM YOUR ${esc(remote.toUpperCase())}`
+      : 'PICK UP WHERE YOU LEFT OFF'}</div>
+    <h1>Keep the <em>feeling.</em></h1>
+    <p class="sleeve-hero-now"><strong>${esc(t.title ?? 'Your last track')}</strong><span>${esc(t.channel ?? '')}</span>${sleeve.at
+      ? `<em class="sleeve-hero-resume">${fmt(sleeve.at)} in</em>` : ''}</p>
+    <div class="hero-footer">
+      <button class="play-btn" data-action="play-featured">${icon('play')}${remote ? 'Continue here' : 'Resume listening'}</button>
+      <button class="secondary-btn" data-collection="recent">See history ${icon('arrow-right', 'sm')}</button>
+      <span class="hero-meta">${likedRecent}</span>
+    </div></div></div>`;
+}
+
+/**
+ * Back in rotation: a compact, artwork-first shelf of what was played here
+ * recently. Each tile is the same `data-track` control the rest of the app
+ * uses, so a tap plays the track and keeps the recent list as the queue.
+ *
+ * No history is a first-run state, not an empty page: one quiet line and a way
+ * to find music, never a full-height empty-state block.
+ */
+function homeShelfHead() {
+  return `<div class="shelf-head sleeve-shelf-head">
+    <div class="shelf-head-copy"><h2>Back in rotation</h2></div>
+    <button class="text-link sleeve-shelf-link shelf-link" data-collection="recent">All history ${icon('arrow-right', 'sm')}</button>
+  </div>`;
+}
+
+/** The shelf body only, so a playing track can repaint it without the head. */
+function homeShelfBody() {
+  const recent = (state.home.recent ?? []).slice(0, 6);
+  if (!recent.length) {
+    return `<div class="sleeve-shelf-empty">
+      <span>${icon('clock', 'sm')} Nothing played here yet.</span>
+      <button class="text-link" data-page="search">Find music ${icon('arrow-right', 'sm')}</button>
+    </div>`;
+  }
+
+  return `<div class="sleeve-shelf shelf">${recent.map((t) => `
+    <button class="sleeve-tile sleeve-shelf-item" data-track="${esc(t.videoId)}" aria-label="Play ${esc(t.title ?? t.videoId)}">
+      <span class="sleeve-shelf-art sleeve-tile-art">${cover(null, 'cover', t.thumb)}<span class="sleeve-tile-play" aria-hidden="true">${icon('play', 'sm')}</span></span>
+      <span class="sleeve-shelf-title sleeve-tile-title">${esc(t.title ?? '')}</span>
+      <span class="sleeve-tile-sub">${esc(t.channel ?? '')}</span></button>`).join('')}</div>`;
+}
+
+function homeShelf() {
+  return `${homeShelfHead()}${homeShelfBody()}`;
+}
+
+/**
+ * The station, secondary on the sleeve home: one quiet strip that names the
+ * station, says what it is, opens it, and can start it without a detour.
+ */
+function homeStationStrip() {
+  const s = state.station;
+  const name = s?.name ?? `${state.user?.name ?? 'Your'}'s station`;
+  const empty = !s || s.empty;
+  return `<div class="sleeve-station" role="group" aria-label="${esc(name)}">
+    <button class="sleeve-station-main" data-page="station">
+      <span class="sleeve-station-mark" aria-hidden="true">${icon('spark')}</span>
+      <span class="sleeve-station-copy"><strong>${esc(name)}</strong>
+        <small>${empty ? 'Play something and it starts building.' : 'Built from the songs you finish.'}</small></span>
+      <span class="sleeve-station-go" aria-hidden="true">${icon('arrow-right', 'sm')}</span>
+    </button>
+    <button class="sleeve-station-play icon-btn" data-action="play-station" aria-label="Play ${esc(name)}">${icon('play')}</button>
+  </div>`;
+}
+
 function homePage() {
   const h = state.home;
   const hour = new Date().getHours();
   const greeting = hour < 12 ? 'morning' : hour < 17 ? 'afternoon' : 'evening';
   const date = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
-  const featured = h.featured;
 
-  const quick = h.recent.slice(0, 6);
   const mixes = state.playlists.slice(0, 4);
 
+  // Sleeve-first order: who you are, the song you were in, what is still warm,
+  // then the station as the quiet second door. Playlists and discovery follow
+  // below the fold, where browsing belongs.
   return `
 <div class="page-head"><div><span class="page-overline">Made for your ears</span>
-  <h1 class="page-title">Good ${greeting}<span class="accent">.</span></h1></div>
+  <h1 class="page-title">Good ${greeting}<span class="accent">.</span></h1>
   <span class="date-text">${esc(date)}</span></div>
+  <div class="page-head-actions">
+    <button class="secondary-btn page-head-play" data-action="play-station" aria-label="Play station" title="Play station">${icon('play', 'sm')}<span class="btn-label">Play station</span></button>
+  </div></div>
 
-<div class="hero"><div class="hero-art"><div class="hero-orb"></div><div class="ring"></div><div class="ring r2"></div><div class="ring r3"></div></div>
-  <div class="hero-fade"></div><div class="hero-noise"></div>
-  <div class="hero-content"><div class="hero-tag">${featured ? (state.resumeFrom ? `UP NEXT · FROM YOUR ${esc(String(state.resumeFrom).toUpperCase())}` : 'UP NEXT · YOUR SESSION') : 'THE EVENING EDIT · VOL. 01'}</div>
-    <h1>${featured ? `Keep the <em>feeling.</em>` : 'Find your <em>afterglow.</em>'}</h1>
-    <p>${featured
-      ? `${esc(featured.channel || 'Your last track')} — ${state.resumeFrom
-        ? `pick up on this device where your ${esc(state.resumeFrom)} left off.`
-        : 'pick up exactly where you left off.'}`
-      : 'For slow evenings, long drives, and whatever comes next. Start with a song and sonora builds the rest.'}</p>
-    <div class="hero-footer">
-      ${featured
-        ? `<button class="play-btn" data-action="play-featured">${icon('play')}${state.resumeFrom ? 'Continue here' : 'Resume session'}</button>
-           <button class="secondary-btn" data-collection="recent">See history ${icon('arrow-right', 'sm')}</button>
-           <span class="hero-meta">${esc(featured.title).slice(0, 34)}</span>`
-        : `<button class="play-btn" data-action="surprise">${icon('play')}Start listening</button>
-           <button class="secondary-btn" data-page="search">Find a song ${icon('arrow-right', 'sm')}</button>
-           <span class="hero-meta">${state.liked.size} liked · ${h.recent.length} recent</span>`}
-    </div></div></div>
+${homeHero()}
 
-${sectionHeader('Your station', 'Pinned and endless. Built from what you listen through and like, then widened to their neighbours and to what is big in the same lane — it keeps generating as you listen.', 'Open station', 'station')}
-<div class="station-card" role="group" aria-label="${esc(state.station?.name ?? 'Your station')}">
-  <div class="station-card-art" aria-hidden="true">${state.station?.tracks?.find((t) => t.thumb)
-    ? cover(null, 'cover', state.station.tracks.find((t) => t.thumb).thumb)
-    : `<span class="station-card-mark">${icon('spark')}</span>`}</div>
-  <div class="station-card-copy">
-    <strong>${esc(state.station?.name ?? `${state.user?.name ?? 'Your'}'s station`)}</strong>
-    <p>${esc(state.station?.blurb ?? 'Built from what you play through and like, then widened to their neighbours and the same lane.')}
-      ${state.station && !state.station.empty ? '<span class="station-card-endless">Never runs out.</span>' : ''}</p>
-  </div>
-  <div class="station-card-actions">
-    <button class="play-btn" data-action="play-station">${icon('play')}Play</button>
-    <button class="secondary-btn" data-action="shuffle-station">${icon('shuffle', 'sm')}Shuffle</button>
-  </div>
-</div>
+${homeShelf()}
 
-${sectionHeader('Jump back in', state.liked.size || h.recent.length ? 'Pick up right where you left off.' : 'Your recent tracks will appear here.', '', 'library')}
-${quick.length
-    ? `<div class="quick-grid">${quick.map((t) => `
-      <button class="quick-card" data-track="${esc(t.videoId)}" aria-label="Play ${esc(t.title ?? t.videoId)}">
-        ${cover(null, 'cover', t.thumb)}<span class="quick-title">${esc(t.title)}</span>
-        <span class="mini-play">${icon('play')}</span></button>`).join('')}</div>`
-    : emptyState({ art: 'clock', title: 'Nothing played yet',
-      text: 'Play something and your recent tracks will wait for you here.',
-      actions: '<button class="secondary-btn" data-page="search">Find music</button>' })}
+${homeStationStrip()}
 
 ${sectionHeader('Made for the moment', 'Your own playlists, ready when you are.', 'Browse library')}
 ${mixes.length
@@ -826,16 +1063,6 @@ ${mixes.length
     : emptyState({ art: 'plus', title: 'No playlists yet',
       text: 'Group the songs you keep coming back to.',
       actions: `<button class="play-btn" data-action="create">${icon('plus')} New playlist</button>` })}
-
-${sectionHeader('Liked songs', 'The ones you keep coming back to.', 'Open', 'library')}
-<div class="quick-grid">
-  <button class="quick-card" data-collection="liked">
-    <span class="cover" style="display:grid;place-items:center;background:linear-gradient(135deg,#d59976,#8e5c83);color:#fff">${icon('heart')}</span>
-    <span class="quick-title">Liked songs</span><span class="mini-play">${icon('play')}</span></button>
-  <button class="quick-card" data-collection="recent">
-    <span class="cover" style="display:grid;place-items:center;background:#25262c;color:#9b9ca5">${icon('clock')}</span>
-    <span class="quick-title">Recently played</span><span class="mini-play">${icon('play')}</span></button>
-</div>
 
 ${sectionHeader('A little discovery', 'Find something you did not know you needed.', 'Browse radio', 'radio')}
 <div class="wide-feature">${cover(null, 'cover', h.radio[0]?.thumb, 'eager')}
@@ -848,7 +1075,8 @@ ${sectionHeader('A little discovery', 'Find something you did not know you neede
 
 function searchPage() {
   return `<div class="page-head"><div><span class="page-overline">Explore something new</span>
-    <h1 class="page-title">Search the sound<span class="accent">.</span></h1></div></div>
+    <h1 class="page-title">Search the sound<span class="accent">.</span></h1></div>
+    <div class="page-head-actions"></div></div>
   <div class="search-shell" role="search">
     <div class="search-box">${icon('search')}
       <input id="primary-search" autocomplete="off" autocapitalize="none" spellcheck="false"
@@ -895,7 +1123,7 @@ function searchFilterBar() {
   const counts = state.searchCounts ?? {};
   const active = searchFilterKey();
   const total = SEARCH_FILTERS.reduce((n, f) => n + (f.count ? counts[f.count] ?? 0 : 0), 0);
-  return `<div class="search-filters" role="tablist" aria-label="Filter results by type">
+  return `<div class="search-filters segmented" role="tablist" aria-label="Filter results by type">
     ${SEARCH_FILTERS.map((f) => {
     const n = f.count ? counts[f.count] ?? 0 : total;
     const selected = active === f.key;
@@ -906,8 +1134,8 @@ function searchFilterBar() {
 }
 
 /** One shelf: a header carrying the shelf's own count, then its contents. */
-const searchShelf = (title, count, body) => `<div class="section-head">
-    <h2>${esc(title)} <span class="section-count">${count}</span></h2></div>${body}`;
+const searchShelf = (title, count, body) => `<div class="shelf-head section-head">
+    <div class="shelf-head-copy"><h2>${esc(title)} <span class="section-count">${count}</span></h2></div></div>${body}`;
 
 /**
  * A catalogue release as a card. `a` + the browse id is the collection route
@@ -1010,13 +1238,13 @@ function searchBody() {
   if (shows('album')) {
     sections.push(albums.length
       ? searchShelf('Albums', counts.albums ?? albums.length,
-        `<div class="library-grid">${albums.map(searchAlbumCard).join('')}</div>`)
+        `<div class="library-grid shelf">${albums.map(searchAlbumCard).join('')}</div>`)
       : (active === 'album' ? shelfEmpty('Albums') : ''));
   }
   if (shows('playlist')) {
     sections.push(playlists.length
       ? searchShelf('Playlists', counts.playlists ?? playlists.length,
-        `<div class="library-grid">${playlists.map(searchPlaylistCard).join('')}</div>`)
+        `<div class="library-grid shelf">${playlists.map(searchPlaylistCard).join('')}</div>`)
       : (active === 'playlist' ? shelfEmpty('Playlists') : ''));
   }
 
@@ -1044,7 +1272,7 @@ function libraryPage() {
   }
   else if (tab === 'Playlists') {
     body = playlists.length || state.liked.size
-      ? `<div class="library-grid">${likedCard}${playlists.map((p) => card({
+      ? `<div class="library-grid shelf">${likedCard}${playlists.map((p) => card({
         collection: `p${p.id}`,
         art: p.artVideo ? `https://i.ytimg.com/vi/${p.artVideo}/hqdefault.jpg` : null,
         title: p.title, sub: `${p.trackCount} ${p.trackCount === 1 ? 'song' : 'songs'}`,
@@ -1068,18 +1296,18 @@ function libraryPage() {
       .map((a) => ({ ...a, following: false }));
     const all = [...followed, ...known];
     body = all.length
-      ? `<div class="library-grid">${all.map((a) => `
-          <button class="music-card" data-action="artist" data-artist="${esc(/^UC[\w-]{20,}$/.test(a.id ?? '') ? a.id : a.title)}" aria-label="${esc(a.title)}">
-            <div class="cover-wrap artist-wrap">${cover(null, 'cover artist-avatar', a.thumb)}</div>
+      ? `<div class="library-grid shelf">${all.map((a) => `
+          <button class="music-card sleeve-tile" data-action="artist" data-artist="${esc(/^UC[\w-]{20,}$/.test(a.id ?? '') ? a.id : a.title)}" aria-label="${esc(a.title)}">
+            <div class="cover-wrap artist-wrap sleeve-tile-art">${cover(null, 'cover artist-avatar', a.thumb)}</div>
             ${a.following ? '<span class="following-tag">Following</span>' : ''}
-            <div class="music-card-title">${esc(a.title)}</div>
-            <div class="music-card-sub">${esc(a.subscribers || 'Artist')}</div></button>`).join('')}</div>`
+            <div class="music-card-title sleeve-tile-title">${esc(a.title)}</div>
+            <div class="music-card-sub sleeve-tile-sub">${esc(a.subscribers || 'Artist')}</div></button>`).join('')}</div>`
       : emptyState({ art: 'headphones', title: 'No artists yet',
         text: 'Artists you follow — and the ones you play enough of — collect here.',
         actions: '<button class="secondary-btn" data-page="search">Find an artist</button>' });
   } else {
     body = items.length
-      ? `<div class="library-grid">${items.map((a) => card({
+      ? `<div class="library-grid shelf">${items.map((a) => card({
           collection: `a${a.id}`, art: a.thumb, title: a.title, sub: a.author || 'Album',
         })).join('')}</div>`
       : emptyState({ art: 'wave', title: 'No albums yet',
@@ -1089,7 +1317,9 @@ function libraryPage() {
 
   return `<div class="page-head"><div><span class="page-overline">Your music, your way</span>
       <h1 class="page-title">Your library<span class="accent">.</span></h1></div>
-    <button class="secondary-btn" data-action="create">${icon('plus', 'sm')} New playlist</button></div>
+    <div class="page-head-actions">
+      <button class="secondary-btn" data-action="create">${icon('plus', 'sm')} New playlist</button>
+    </div></div>
   <div class="toolbar-row"><div class="segmented" role="tablist" aria-label="Library sections">
     ${['Playlists', 'Albums', 'Artists'].map((t) =>
       `<button role="tab" aria-selected="${tab === t}" class="segment ${tab === t ? 'is-active' : ''}" data-library-tab="${esc(t)}">${esc(t)}</button>`).join('')}
@@ -1109,7 +1339,10 @@ function radioPage() {
   ];
   const featureSeed = seeds[0];
   return `<div class="page-head"><div><span class="page-overline">Always something on</span>
-      <h1 class="page-title">Turn it up<span class="accent">.</span></h1></div></div>
+      <h1 class="page-title">Turn it up<span class="accent">.</span></h1></div>
+    <div class="page-head-actions">
+      <button class="secondary-btn" data-action="${featureSeed ? 'play-seed' : 'go-search'}">${icon(featureSeed ? 'play' : 'search', 'sm')} ${featureSeed ? 'Play radio' : 'Find a seed'}</button>
+    </div></div>
   <div class="radio-feature"><div class="radio-copy" style="position:relative;z-index:1">
     <span class="radio-live"><span class="live-dot"></span> ON AIR · SONORA RADIO</span>
     <h2>Good music.<br>All day long.</h2>
@@ -1140,7 +1373,9 @@ function moodPage() {
   if (!m) return collectionSkeleton();
   const head = `<div class="page-head"><div><span class="page-overline">Browse by feeling</span>
       <h1 class="page-title">${esc(m.name)}<span class="accent">.</span></h1></div>
-      <button class="text-link" data-page="search">All feelings ${icon('arrow-right')}</button></div>`;
+      <div class="page-head-actions">
+        <button class="text-link" data-page="search">All feelings ${icon('arrow-right')}</button>
+      </div></div>`;
 
   if (m.error) {
     return `${head}${emptyState({
@@ -1156,7 +1391,7 @@ function moodPage() {
   const listSection = `${sectionHeader('Playlists for this feeling',
     'Real track lists — open one and choose the songs you want.', '', '')}
     ${loading ? skCards(6) : playlists.length
-    ? `<div class="library-grid">${playlists.map((p) => card({
+    ? `<div class="library-grid shelf">${playlists.map((p) => card({
       collection: `a${p.id}`, art: p.thumb, title: p.title,
       sub: [p.trackCount ? `${p.trackCount} songs` : null, p.author].filter(Boolean).join(' · ') || 'Playlist',
     })).join('')}</div>`
@@ -1201,6 +1436,10 @@ async function loadMood(q) {
 // the releases they belong to, the videos, and the artists YouTube files next
 // to them. Opening it is how a song becomes a body of work.
 
+// The artist page leads with its own hero, which already carries the name and
+// the "Artist" overline. It used to prepend a second page-head with both, so
+// every artist route shipped two <h1>s and the same caps label twice.
+
 function artistView() {
   const a = state.artist;
   if (!a) {
@@ -1210,11 +1449,11 @@ function artistView() {
           <div class="sk sk-line w-60"></div></div></div>${skRows(6)}`;
   }
   if (a.error) {
-    return emptyState({
+    return `${emptyState({
       art: 'close', title: 'Could not load this artist', text: a.error,
       actions: `<button class="secondary-btn" data-action="retry-artist" data-id="${esc(a.key)}">Try again</button>
         <button class="secondary-btn" data-page="search">Back to search</button>`,
-    });
+    })}`;
   }
 
   const songs = a.songs ?? [];
@@ -1231,7 +1470,7 @@ function artistView() {
 
   const albumGrid = (list, label, blurb = '') => (list.length
     ? `${sectionHeader(label, blurb, '', '')}
-      <div class="library-grid">${list.map((x) => card({
+      <div class="library-grid shelf">${list.map((x) => card({
         collection: `a${x.id}`, art: x.thumb, title: x.title,
         sub: [x.type, x.year].filter(Boolean).join(' · ') || 'Album',
       })).join('')}</div>`
@@ -1407,12 +1646,21 @@ async function openAlbumFor(videoId, trigger = null) {
 // same artists, their neighbours, and what is big in the same lane. The mix is
 // deliberate: two familiar tracks for every discovery one (see src/station.js).
 
+/**
+ * The line under "The station queue".
+ *
+ * One function because two places write it: the page render, and the in-place
+ * repaint after the queue window is trimmed behind the playhead.
+ */
+const stationQueueNote = (n) => `${n} songs in the queue and more arriving as you listen. Every skip and every play-through re-seeds the next stretch — the station grows instead of looping.`;
+
 function stationPage() {
   const s = state.station;
   const name = s?.name ?? 'Your station';
-  const head = `<div class="page-head"><div><span class="page-overline">Made for your ears</span>
+  const head = `<div class="page-head"><div><span class="page-overline">Your station</span>
       <h1 class="page-title">${esc(name)}<span class="accent">.</span></h1></div>
-      ${s && !s.empty ? `<button class="secondary-btn" data-action="rebuild-station">${icon('shuffle', 'sm')} Rebuild</button>` : ''}</div>`;
+      <div class="page-head-actions">${s && !s.empty
+    ? `<button class="secondary-btn" data-action="rebuild-station">${icon('shuffle', 'sm')} Rebuild</button>` : ''}</div></div>`;
 
   if (state.stationError) {
     return `${head}${emptyState({
@@ -1463,7 +1711,7 @@ function stationPage() {
     </div>
   </div>
   ${sectionHeader(live ? 'The station queue' : 'Up next', live
-    ? `${rows.length} songs so far, and more arriving as you listen. Every skip and every play-through re-seeds the next stretch — the station grows instead of looping.`
+    ? stationQueueNote(rows.length)
     : 'Your songs, then more from the artists you play, then their neighbours and what is big in the same lane. It keeps going: what you play through here becomes a seed for the next stretch.', '', '')}
   ${trackRows(rows, true, 'station')}`;
 }
@@ -1481,7 +1729,22 @@ async function loadStation({ force = false, silent = false } = {}) {
   } finally {
     state.stationLoading = false;
   }
-  if (state.page === 'station' || (silent && state.page === 'home')) render();
+  // The station page is built from this answer, so it is rebuilt.
+  if (state.page === 'station') { render(); return; }
+  // The silent load exists to fill the home page's station strip — the name, and
+  // whether it is still building. It used to call render(), so a cold boot
+  // painted home and then repainted the whole page a few hundred milliseconds
+  // later (the flash the review saw), and it threw away any scroll or focus the
+  // listener had already gained in between. Patch the strip and the one nav
+  // label that reads the same state.
+  if (silent && state.page === 'home') patchHomeStationStrip();
+}
+
+/** Repaint the home page's station strip in place (see loadStation). */
+function patchHomeStationStrip() {
+  syncStationNavLabel();
+  const strip = $('page-root')?.querySelector('.sleeve-station');
+  if (strip) strip.outerHTML = homeStationStrip();
 }
 
 // ── instance admin ──────────────────────────────────────────────────────
@@ -1589,7 +1852,9 @@ function adminPage() {
   return `<div class="page-head"><div><span class="page-overline">Owner controls</span>
       <h1 class="page-title">Instance control<span class="accent">.</span></h1>
       <p class="admin-lede">Accounts, content, storage and the YouTube session for this instance.</p></div>
-    <button class="secondary-btn" data-admin="refresh">${icon('repeat', 'sm')} Refresh</button></div>
+    <div class="page-head-actions">
+      <button class="secondary-btn" data-admin="refresh">${icon('repeat', 'sm')} Refresh</button>
+    </div></div>
   <div class="toolbar-row"><div class="chips scroll" role="tablist" aria-label="Admin sections">
     ${ADMIN_TABS.map(([id, label]) => `<button class="chip ${tab === id ? 'selected' : ''}" role="tab"
       aria-selected="${tab === id}" data-admin-tab="${id}">${label}</button>`).join('')}
@@ -1831,7 +2096,7 @@ async function adminAction(action, id) {
             <form id="admin-pass-form" data-uid="${uid}" novalidate>
               <label class="sr-only" for="admin-pass">New passphrase</label>
               <input id="admin-pass" name="password" type="password" minlength="6" autocomplete="new-password"
-                required placeholder="At least 6 characters">
+                required placeholder="At least 12 characters">
               <p class="field-hint">Every signed-in device for ${esc(u.name)} will be signed out.</p>
               <p class="field-error" id="admin-pass-error" role="alert"></p>
               <div class="form-actions"><button type="button" class="secondary-btn" data-action="close-form">Cancel</button>
@@ -1979,6 +2244,25 @@ async function adminAction(action, id) {
   }
 }
 
+/**
+ * The E / CLEAN tag after a track title.
+ *
+ * An explicit row shows "E" the way YouTube Music does. A clean row shows
+ * "CLEAN" — spelling it out because a silent clean edit is exactly the bug
+ * this marks: the whole point is that the listener can see *and tell* when
+ * they are being served the censored edit.
+ *
+ * The tag is always a *sibling* of the element that holds the title text,
+ * never a child of it: tests (and the media-session metadata they pin) read
+ * `.track-name`/`.queue-text strong`/h2 textContent as the track title, and a
+ * badge inside one of those would corrupt every comparison.
+ */
+function versionTag(t) {
+  if (t?.version === 'explicit') return '<b class="ver-tag ver-explicit" title="Explicit">E</b>';
+  if (t?.version === 'clean') return '<b class="ver-tag ver-clean" title="Clean edit — censored version">CLEAN</b>';
+  return '';
+}
+
 function trackRows(tracks, headers = true, collection = null) {
   if (!tracks.length) {
     return emptyState({ art: 'wave', title: 'Nothing here yet',
@@ -1988,8 +2272,9 @@ function trackRows(tracks, headers = true, collection = null) {
   rememberTracks(tracks);
   state.lastCollection = tracks;
   const act = current();
+  const anyAlbum = tracks.some((t) => t.album);
   const head = headers ? `<div class="track-header" aria-hidden="true"><span>#</span><span>Title</span>
-    <span class="track-album">Album</span><span></span><span></span>
+    <span class="track-album">${anyAlbum ? 'Album' : ''}</span><span></span><span></span>
     <span style="text-align:right">${icon('clock', 'xs')}</span></div>` : '';
   const rows = tracks.map((t, i) => {
     const isNow = act && act.videoId === t.videoId && state.playing;
@@ -2008,8 +2293,7 @@ function trackRows(tracks, headers = true, collection = null) {
       <div class="track-index"><span>${i + 1}</span>
         <span class="eq" aria-hidden="true"><i></i><i></i><i></i></span>${icon('play', 'xs')}</div>
       <div class="track-details">${cover(null, 'cover', t.thumb, 'lazy')}
-        <div class="track-desc"><div class="track-name">${esc(t.title ?? t.videoId)}</div>
-          <div class="track-artist">${esc(t.channel ?? '')}</div></div></div>
+        <div class="track-desc"><div class="track-title-line"><div class="track-name">${esc(t.title ?? t.videoId)}</div>${versionTag(t)}</div><div class="track-artist">${esc(t.channel ?? '')}</div></div></div>
       ${albumCell}
       <button class="like-row ${liked ? 'liked' : ''}" data-action="heart" data-id="${esc(t.videoId)}"
         aria-pressed="${liked}" aria-label="${liked ? 'Remove from' : 'Add to'} liked songs">${icon('heart', 'sm')}</button>
@@ -2106,6 +2390,7 @@ function collectionShell({ title, type, desc, tracks, art, id, playlistId, artis
     ${playlistId ? `<button class="circle-action" title="More options" aria-label="More playlist options" aria-haspopup="menu" data-action="playlist-menu" data-id="${playlistId}">${icon('dots')}</button>` : ''}
     <span class="collection-count">${tracks.length ? `${tracks.length} songs` : ''}</span>
   </div>
+  ${sectionHeader('Songs', '', '', '')}
   ${tracks.length ? trackRows(tracks, true, id) : emptyState({ art: 'plus', title: 'Nothing in here yet', text: empty || 'Add a few songs and they will show up here.',
     actions: '<button class="secondary-btn" data-page="search">Find music</button>' })}`;
 }
@@ -2127,7 +2412,10 @@ function rail() {
       <button class="icon-btn" data-action="nowplaying" title="Expand player">${icon('arrow-right', 'sm')}</button></div>
     <div class="rail-cover" data-action="nowplaying" role="button" tabindex="0" aria-label="Open now playing">
       ${cover(null, 'cover', t.thumb, 'eager')}<div class="rail-live"><span class="live-dot"></span> YOUR SESSION</div></div>
-    <div class="rail-track-info"><div><h2>${esc(t.title)}</h2><span>${esc(t.channel ?? '')}</span></div>
+    <div class="rail-track-info"><div><h2>${esc(t.title)}</h2>
+      <span>${(t.channelId || t.channel)
+        ? `<button class="rail-artist" data-action="artist" data-artist="${esc(t.channelId || t.channel)}" aria-label="Open ${esc(t.channel)}'s artist page">${esc(t.channel)}</button>`
+        : esc(t.channel ?? '')}</span></div>
       <button class="icon-btn ${state.liked.has(t.videoId) ? 'primary' : ''}" data-action="heart"
         data-id="${esc(t.videoId)}" aria-pressed="${state.liked.has(t.videoId)}"
         aria-label="${state.liked.has(t.videoId) ? 'Remove from' : 'Add to'} liked songs">${icon('heart')}</button>
@@ -2140,15 +2428,13 @@ function rail() {
     <div class="rail-divider"></div>
     <div class="rail-section-head"><strong>Up next</strong>
       <button data-action="queue">View queue →</button></div>
-    <div class="rail-queue">${up.map((x) => `<div class="queue-mini" data-action="play-track" data-id="${esc(x.videoId)}">
+    <div class="rail-queue">${up.length ? up.map((x) => `<div class="queue-mini" data-action="play-track" data-id="${esc(x.videoId)}">
       ${cover(null, 'cover', x.thumb)}<div class="queue-text">
         <strong>${esc(x.title)}</strong><span>${esc(x.channel ?? '')}</span></div>
-      <span class="duration">${fmt(x.durationS)}</span></div>`).join('')}</div>
-    <div class="session-card"><span class="eyebrow">KEEP THE FEELING</span>
-      <div class="session-title">${state.repeat === 2 ? 'Repeating this one.' : 'Your soundtrack, uninterrupted.'}</div>
-      <p>${state.stationQueue
-        ? `${state.queue.length} tracks so far, and more arriving as you listen. Every skip teaches sonora what you like.`
-        : `${state.queue.length} tracks queued. Every skip teaches sonora what you like.`}</p></div>`;
+      <span class="duration">${fmt(x.durationS)}</span></div>`).join('')
+      : `<div class="rail-queue-empty">${state.stationQueue
+        ? 'Your station keeps going ahead of you. Skips teach it what to play next.'
+        : 'Nothing queued yet. Play an album or start a station and the runway appears here.'}</div>`}</div>`;
 }
 
 function playerBar() {
@@ -2164,10 +2450,13 @@ function playerBar() {
     return `${progress}<div class="player-song">
       <button class="player-cover player-cover-empty" data-page="search" aria-label="Find music">${icon('wave')}</button>
       <div class="player-song-meta"><strong>Nothing playing</strong><span>Pick a track to start</span></div></div>
-      <div class="player-center"><div class="player-controls">
-        <button data-action="prev" aria-label="Previous song" disabled>${icon('prev')}</button>
-        <button class="main-toggle" data-action="playpause" aria-label="Play" disabled>${icon('play', 'fill')}</button>
-        <button data-action="next" aria-label="Next song" disabled>${icon('next')}</button></div></div>
+      <div class="player-controls">
+        <div class="player-transport">
+          <button data-action="prev" aria-label="Previous song" disabled>${icon('prev')}</button>
+          <button class="main-toggle" data-action="playpause" aria-label="Play" disabled>${icon('play', 'fill')}</button>
+          <button data-action="next" aria-label="Next song" disabled>${icon('next')}</button>
+        </div>
+      </div>
       <div class="player-extras"><button class="secondary-btn" data-page="search">${icon('search', 'sm')} Find music</button></div>`;
   }
 
@@ -2175,30 +2464,38 @@ function playerBar() {
   // column at every width. The taste actions sit with the other utilities.
   return `${progress}<div class="player-song">
       <button class="player-cover" data-action="nowplaying" aria-label="Open now playing">${cover(null, 'cover', t.thumb, 'eager')}</button>
-      <button class="player-song-meta" data-action="nowplaying" aria-label="Open now playing">
-        <strong>${esc(t.title)}</strong><span>${esc(t.channel ?? '')}${resuming ? ` · resumes at ${fmt(state.pendingResumeMs / 1000)}` : ''}</span></button>
+      <div class="player-song-meta">
+        <strong role="button" tabindex="0" data-action="nowplaying"><span>${esc(t.title)}</span></strong>
+        <span>${(t.channelId || t.channel)
+          ? `<button class="player-song-artist" data-action="artist" data-artist="${esc(t.channelId || t.channel)}" aria-label="Open ${esc(t.channel)}'s artist page">${esc(t.channel)}</button>`
+          : esc(t.channel ?? '')}${resuming ? ` · resumes at ${fmt(state.pendingResumeMs / 1000)}` : ''}</span></div>
       <button class="icon-btn player-like ${state.liked.has(t.videoId) ? 'primary' : ''}" data-action="heart"
         data-id="${esc(t.videoId)}" aria-pressed="${state.liked.has(t.videoId)}" aria-label="Like this song">${icon('heart', 'sm')}</button>
       <button class="icon-btn player-dislike ${state.disliked.has(t.videoId) ? 'is-disliked' : ''}" data-action="dislike"
         data-id="${esc(t.videoId)}" aria-pressed="${state.disliked.has(t.videoId)}"
         aria-label="${state.disliked.has(t.videoId) ? 'Undo "less like this"' : 'Play this less often'}"
         title="Less like this">${icon('thumb-down', 'sm')}</button></div>
-  <div class="player-center"><div class="player-controls">
-    <button class="ctrl ${state.shuffle ? 'on' : ''}" data-action="shuffle" aria-label="Shuffle" aria-pressed="${state.shuffle}">${icon('shuffle')}</button>
-    <button class="ctrl" aria-label="Previous song" data-action="prev">${icon('prev')}</button>
-    <button class="main-toggle" data-action="playpause" aria-label="${state.playing ? 'Pause' : 'Play'}">${icon(playIcon, 'fill')}</button>
-    <button class="ctrl" aria-label="Next song" data-action="next">${icon('next')}</button>
-    <button class="ctrl ${state.repeat ? 'on' : ''}" data-action="repeat" aria-label="Repeat ${['off', 'all', 'one'][state.repeat]}" aria-pressed="${state.repeat > 0}">${icon('repeat')}</button></div>
+  <div class="player-controls">
+    <div class="player-transport">
+      <button class="ctrl ${state.shuffle ? 'on' : ''}" data-action="shuffle" aria-label="Shuffle" aria-pressed="${state.shuffle}">${icon('shuffle')}</button>
+      <button class="ctrl" aria-label="Previous song" data-action="prev">${icon('prev')}</button>
+      <button class="main-toggle" data-action="playpause" aria-label="${state.playing ? 'Pause' : 'Play'}">${icon(playIcon, 'fill')}</button>
+      <button class="ctrl" aria-label="Next song" data-action="next">${icon('next')}</button>
+      <button class="ctrl ${state.repeat ? 'on' : ''}" data-action="repeat" aria-label="Repeat ${['off', 'all', 'one'][state.repeat]}" aria-pressed="${state.repeat > 0}">${icon('repeat')}</button>
+    </div>
     <div class="timebar"><span class="elapsed">${fmt(pos)}</span>
       <input aria-label="Track progress" class="range" type="range" min="0" max="${Math.max(1, Math.floor(dur))}"
         value="${Math.floor(pos)}" style="--percent:${percent}%" data-slider="progress">
-      <span class="duration">${fmt(dur)}</span></div></div>
+      <span class="duration">${fmt(dur)}</span></div>
+  </div>
   <div class="player-extras">
     <button class="icon-btn ${rooms.active ? 'room-on' : ''}" data-action="room"
       aria-label="${rooms.active ? 'Listen together — in a room' : 'Listen together'}" aria-haspopup="dialog">${icon('headphones')}</button>
     <button class="icon-btn" data-action="lyrics" aria-label="Lyrics" aria-haspopup="dialog">${icon('lyrics')}</button>
     <button class="icon-btn" data-action="queue" aria-label="Queue" aria-haspopup="dialog">${icon('queue')}</button>
-    <button class="icon-btn" data-action="nowplaying" aria-label="Expand player" aria-haspopup="dialog">${icon('expand', 'sm')}</button>
+    <!-- No "expand player" button here: the cover, the title and the rail arrow
+         all open the same sheet. It cost 52px of a 283px column and pushed this
+         cluster past its track, where it spilled left over the transport. -->
     <div class="volume-group"><button class="icon-btn" data-action="mute" aria-label="${state.muted ? 'Unmute' : 'Mute'}">${icon(state.muted ? 'mute' : 'volume')}</button>
       <input class="range" aria-label="Volume" data-slider="volume" type="range" min="0" max="100"
         value="${Math.round(state.volume * 100)}" style="--percent:${Math.round(state.volume * 100)}%"></div></div>
@@ -2207,7 +2504,45 @@ function playerBar() {
     <button data-action="next" aria-label="Next song">${icon('next', 'fill')}</button></div>`;
 }
 
+/**
+ * Identify a control well enough to find it again after an innerHTML rebuild.
+ *
+ * Re-rendering `#page-root`, the player bar or the nav replaces the focused
+ * element and throws focus to `<body>`, so Tab restarts at the top of the
+ * document. Any of these attributes is stable across a repaint of the same
+ * state, which makes it the re-focus key.
+ */
+const FOCUS_KEYS = ['data-library-tab', 'data-overlay-tab', 'data-admin-tab', 'data-filter',
+  'data-page', 'data-action', 'data-collection', 'data-menu-action'];
+function focusKey(el) {
+  if (!el || el === document.body || el === document.documentElement || !el.getAttribute) return null;
+  // Remember which surface the control was in: a heart exists in the player bar
+  // and on every row of the page for the same track.
+  const scope = el.closest('#player, #page-root, #rail-content, #mobile-nav, #desktop-nav, #side-playlists, #now-content, #queue-drawer');
+  for (const key of FOCUS_KEYS) {
+    const value = el.getAttribute(key);
+    if (value) return { key, value, id: el.getAttribute('data-id'), scope: scope?.id ?? null };
+  }
+  return el.id ? { key: 'id', value: el.id, scope: scope?.id ?? null } : null;
+}
+function restoreFocus(key) {
+  if (!key) return false;
+  // Only a focused element that the rebuild actually destroyed falls back to
+  // <body>; if focus is still somewhere real, it was never ours to move.
+  const active = document.activeElement;
+  if (active && active !== document.body && active !== document.documentElement) return false;
+  const root = key.scope ? document.getElementById(key.scope) : document;
+  if (!root) return false;
+  let selector = `[${key.key}="${CSS.escape(key.value)}"]`;
+  if (key.id) selector += `[data-id="${CSS.escape(key.id)}"]`;
+  const hit = [...root.querySelectorAll(selector)].find((n) => n.getClientRects().length > 0);
+  if (!hit) return false;
+  hit.focus({ preventScroll: true });
+  return true;
+}
+
 async function render() {
+  const focus = focusKey(document.activeElement);
   renderNav();
   const root = $('page-root');
   const body = state.page === 'home' ? homePage()
@@ -2227,30 +2562,111 @@ async function render() {
   refreshOverlay();
   updateRoomPill();
   document.title = pageTitle();
+  restoreFocus(focus);
+}
+
+/**
+ * Paint the player bar's 2px progress hairline.
+ *
+ * This runs on every `timeupdate` — four times a second for the whole session —
+ * so it may only touch compositor-owned properties. It used to set `--progress`
+ * on `#player`, and a custom property invalidates style for that element's
+ * whole subtree: the scrubber, the cover, the 36-bar waveform and every control
+ * were re-resolved on every tick. The `<i>` inside `.mini-progress` is now
+ * pinned full width once and scaled into place, which the compositor can do
+ * without a layout pass. app.css still sizes that element by `--progress`, so
+ * the width is overridden inline; nothing else in the stylesheet reads it.
+ */
+function paintPlayerProgress(pos, dur) {
+  const bar = $('player')?.querySelector('.mini-progress > i');
+  if (!bar || !(dur > 0)) return;
+  if (bar.style.width !== '100%') {
+    bar.style.width = '100%';
+    bar.style.transformOrigin = '0 50%';
+  }
+  bar.style.transform = `scaleX(${Math.min(1, Math.max(0, pos / dur)).toFixed(4)})`;
 }
 
 function updatePlayer() {
   const el = $('player');
+  const focus = focusKey(document.activeElement);
   const t = current();
   el.classList.toggle('is-playing', !!state.playing);
   el.classList.toggle('is-empty', !t);
   el.innerHTML = playerBar();
-  const dur = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : (t?.durationS || 0);
-  const pos = playerPosition();
-  if (dur) el.style.setProperty('--progress', `${(pos / dur) * 100}%`);
+  paintPlayerProgress(playerPosition(), playerDuration());
+  restoreFocus(focus);
   if (!$('now-overlay').hidden) refreshOverlay();
+  // Playback is the one thing that changes what the home sleeve is about.
+  syncHomeFeatured();
+}
+
+/**
+ * Keep the home sleeve in step with what is actually playing.
+ *
+ * `state.home.featured` used to be written only when a session save came back,
+ * so a track started from the shelf left the hero showing the previous song (or
+ * the first-run fallback) until the next reload — the player and the home page
+ * disagreed about what was on. This is the single place playback state changes,
+ * so it is the single place that adopts the current track into the sleeve.
+ *
+ * It repaints only the two home sections that read that state, and only when
+ * the track really changed: a full `render()` here would reset the reading
+ * position, and the player bar repaints constantly. Scroll and focus survive by
+ * replacing the nodes in place and restoring the control that had focus.
+ */
+function syncHomeFeatured() {
+  if (state.page !== 'home') return;
+  const t = current();
+  if (!t?.videoId || t.videoId === state.home.featured?.videoId) return;
+  const root = $('page-root');
+  const hero = root?.querySelector('.sleeve-hero');
+  if (!hero) return; // the home page is not on screen
+  const focus = focusKey(document.activeElement);
+  state.home.featured = { ...t };
+  state.home.featuredPos = state.pendingResumeMs > 0
+    ? state.pendingResumeMs
+    : Math.round((audio.currentTime || 0) * 1000);
+  hero.outerHTML = homeHero();
+  const shelf = root.querySelector('.sleeve-shelf');
+  if (shelf) shelf.outerHTML = homeShelfBody();
+  // outerHTML drops focus to <body>; put it back on the control it was on (the
+  // tile that was just tapped, or the hero's resume button) without scrolling.
+  restoreFocus(focus);
 }
 
 /**
  * Where the playhead will be. A restored session has no loaded metadata yet,
  * so its saved position is the honest answer until the first `playing` seeks
  * there; showing 0:00 would make "resume" look like "restart".
+ *
+ * While the element is playing the *queue* as one stream, its `currentTime` is
+ * a position in the plan (hours of it), not in a track: the mapped offset is
+ * the honest answer to "where in this song are we", and it is what the bar, the
+ * lock screen and the session save all read.
  */
 function playerPosition() {
+  if (state.streaming) return (Number(state.streamOffsetMs) || 0) / 1000;
   // A restored/adopted session has no loaded metadata yet, so its saved
   // position is the honest answer until the first `playing` seeks there.
   if (state.pendingResumeMs > 0 && !state.sourceStarted) return state.pendingResumeMs / 1000;
   return audio.currentTime || 0;
+}
+
+/**
+ * The length of the track the player is meant to be drawing, in seconds.
+ *
+ * The element's own `duration` is the plan's total while streaming (hours), so
+ * ask the track for its length there instead.
+ */
+function playerDuration() {
+  const known = Number(audio.duration);
+  if (state.streaming) {
+    // The plan's own duration for the track is the one the stream is playing.
+    const streamed = Number(state.streamDurationMs) / 1000;
+    if (streamed > 0) return streamed;
+  }
+  return Number.isFinite(known) && known > 0 ? known : (Number(current()?.durationS) || 0);
 }
 
 /**
@@ -2267,7 +2683,13 @@ function applyPendingResume() {
   if (!Number.isFinite(duration) || duration <= 0) return;
   const target = state.pendingResumeMs / 1000;
   state.pendingResumeMs = 0;
-  if (target > 1 && target < duration - 2) {
+  // The high bound used to be `target < duration - 2`, which threw away any
+  // saved playhead in the last two seconds: the player bar advertised
+  // "resumes at 3:59" and then restarted from 0:00. Resuming near the end is
+  // the correct behaviour — the track plays its last second and the loop wrap
+  // advances the queue, which is what a listener finishing a song on another
+  // device expects to continue into.
+  if (target > 1) {
     state.manualSeek = false;
     // Set lastTime first: assigning currentTime can fire `seeking`
     // synchronously, and a resume from a loaded 30 s playhead to 1.2 s must not
@@ -2278,6 +2700,28 @@ function applyPendingResume() {
 }
 
 // ── playback ────────────────────────────────────────────────────────────
+/**
+ * Say the new track to screen readers. `#player` is rebuilt constantly and has
+ * no live region of its own, so an automatic advance used to be completely
+ * silent; this is a polite, dedicated region (created on first use so no
+ * markup change is needed) that only speaks when the track actually changes.
+ */
+let npAnnouncer = null;
+let npAnnounced = null;
+function announceNowPlaying(t) {
+  if (!t?.videoId || t.videoId === npAnnounced) return;
+  npAnnounced = t.videoId;
+  if (!npAnnouncer) {
+    npAnnouncer = document.createElement('div');
+    npAnnouncer.id = 'np-announcer';
+    npAnnouncer.className = 'sr-only';
+    npAnnouncer.setAttribute('aria-live', 'polite');
+    npAnnouncer.setAttribute('aria-atomic', 'true');
+    document.body.append(npAnnouncer);
+  }
+  npAnnouncer.textContent = `Now playing: ${t.title ?? 'unknown track'}${t.channel ? ` by ${t.channel}` : ''}`;
+}
+
 function log(kind, extra = {}) {
   const t = current();
   if (!t) return;
@@ -2286,8 +2730,10 @@ function log(kind, extra = {}) {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       videoId: t.videoId, kind, source: state.page,
-      positionMs: Math.round((audio.currentTime || 0) * 1000),
-      durationMs: Number.isFinite(audio.duration) ? Math.round(audio.duration * 1000) : null,
+      // Streamed playback reports the *track* playhead and length, not the
+      // stream's (see playerPosition/playerDuration).
+      positionMs: Math.round(playerPosition() * 1000),
+      durationMs: Math.round(playerDuration() * 1000) || null,
       // The metadata travels with the event so the personal station can name a
       // track that was never searched (a shared link, an old queue).
       title: t.title ?? null, channel: t.channel ?? null,
@@ -2306,13 +2752,43 @@ function logSkipIfEarly() {
   }
 }
 
+/**
+ * How often the playhead alone is written back to the server while a track
+ * plays.
+ *
+ * A save is a SQLite write and a radio wake-up for every other device on the
+ * account, so the tick is deliberately coarse: everything that actually matters
+ * to a second device is saved immediately by a `force` caller (a track change,
+ * a pause, the tab going away, a queue edit). This interval only sets how stale
+ * a mid-song resume can be.
+ */
+const SESSION_TICK_MS = 15_000;
+
+/**
+ * The composition last written to /api/now, so a tick can be a patch.
+ *
+ * A playhead tick has nothing new to say about the queue, and re-sending the
+ * 60-track window every few seconds meant serialising ~58 KB on the main thread,
+ * holding it in the network process (keepalive) and rewriting the player-state
+ * row — hundreds of times an hour of listening, for a number that had moved by
+ * a few seconds. The server merges a body that carries no `queue`, so only a
+ * real change to the window (a new track, a reorder, a station page landing, a
+ * restored session) pays for the full body.
+ */
+let sentSessionKey = '';
+let sentSessionPlaying = null;
+// Arrival order is not save order when two requests take different network
+// paths. The timestamp orders save attempts; this per-device sequence breaks
+// same-millisecond ties. Both ride along on full saves and small playhead patches.
+let sessionSaveSequence = 0;
+
 async function saveSession({ force = false, takeover = false } = {}) {
   // In a room the playhead belongs to the server. Writing /api/now here would
   // fight it (and could steal the personal session from another device that is
   // genuinely playing), so the personal-session plumbing is simply off.
   if (rooms.active) return;
   const now = Date.now();
-  if (!force && now - state.savedAt < 5000) return;
+  if (!force && now - state.savedAt < SESSION_TICK_MS) return;
   const t = current();
   if (!t) return;
   const wantsTakeover = takeover || state.claim;
@@ -2327,34 +2803,79 @@ async function saveSession({ force = false, takeover = false } = {}) {
   // station queue grows past 60 entries, and the server stores at most 60: a
   // naive slice(0, 60) would resume an hour-old position on the wrong song.
   const start = Math.max(0, Math.min(state.index - 5, state.queue.length - 60));
-  const window = state.queue.slice(start, start + 60);
+  const windowTracks = state.queue.slice(start, start + 60);
   const positionMs = Math.round(playerPosition() * 1000);
+  const clientSavedAt = Date.now();
+  const clientSaveSeq = ++sessionSaveSequence;
+  // What the server would be told by a full body. `start` is part of it because
+  // a partial body's `index` is relative to the stored window: if the window
+  // slid, the same track has a different offset in it.
+  const windowKey = `${start}|${state.stationQueue ? 'station' : 'queue'}|${windowTracks.map((x) => x.videoId).join(',')}`;
+  const playing = !audio.paused && state.playing;
+  // A patch is only ever a playhead tick. Anything that changes what the stored
+  // row *means* — a new window, or playing flipping to paused and back — goes
+  // out in full, so a merge that handles nothing but `{videoId, index,
+  // positionMs}` still cannot leave a paused session looking like it is playing.
+  const full = windowKey !== sentSessionKey || playing !== sentSessionPlaying;
+  const payload = full ? {
+    queue: windowTracks.map((x) => ({
+      videoId: x.videoId,
+      title: String(x.title ?? '').slice(0, 300),
+      channel: String(x.channel ?? '').slice(0, 200),
+      thumb: String(x.thumb ?? '').slice(0, 500),
+      durationS: x.durationS || null,
+    })),
+    index: state.index - start,
+    positionMs,
+    source: state.page,
+    // A station queue must come back as a station, or a reload would freeze
+    // the endless queue into a finite list of what happened to be in it.
+    station: Boolean(state.stationQueue),
+    deviceId, deviceName,
+    playing, clientSavedAt, clientSaveSeq,
+    // A user play intent claims the session; a periodic save does not.
+    takeover: wantsTakeover,
+  } : {
+    // The patch: what moved, and the few fields the server cannot infer. A
+    // merged row keeps its stored tracks, source and station flag.
+    videoId: t.videoId,
+    index: state.index - start,
+    positionMs,
+    playing,
+    station: Boolean(state.stationQueue),
+    deviceId, deviceName,
+    clientSavedAt, clientSaveSeq,
+    takeover: wantsTakeover,
+  };
+  // `keepalive` bodies are capped at 64 KiB by the browser, and a worst-case
+  // 60-track window can reach it. A fetch that throws on size is swallowed as
+  // "offline" below, so the saved position would silently stop updating.
+  // Trim until the serialised body is safely under the cap. Only a full body
+  // can be big: the patch above is a couple of hundred bytes by construction.
+  const MAX_BODY = 58_000;
+  let body = JSON.stringify(payload);
+  if (full && body.length > MAX_BODY) {
+    for (const entry of payload.queue) entry.thumb = '';
+    body = JSON.stringify(payload);
+  }
+  if (full && body.length > MAX_BODY) {
+    for (const entry of payload.queue) {
+      entry.title = String(entry.title).slice(0, 120);
+      entry.channel = String(entry.channel).slice(0, 80);
+    }
+    body = JSON.stringify(payload);
+  }
+  if (full && body.length > MAX_BODY) {
+    // Last resort: keep the window up to the playhead, where the resume matters.
+    payload.queue = payload.queue.slice(0, Math.max(1, payload.index + 1));
+    body = JSON.stringify(payload);
+  }
   let res;
   try {
     res = await fetch('/api/now', {
       method: 'PUT', credentials: 'same-origin', keepalive: true,
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        queue: window.map((x) => ({
-          videoId: x.videoId,
-          // Cap like the server does: `keepalive` requests are limited to 64 KB
-          // total, and an unusually long title must not break the save.
-          title: String(x.title ?? '').slice(0, 300),
-          channel: String(x.channel ?? '').slice(0, 200),
-          thumb: String(x.thumb ?? '').slice(0, 500),
-          durationS: x.durationS || null,
-        })),
-        index: state.index - start,
-        positionMs,
-        source: state.page,
-        // A station queue must come back as a station, or a reload would freeze
-        // the endless queue into a finite list of what happened to be in it.
-        station: Boolean(state.stationQueue),
-        deviceId, deviceName,
-        playing: !audio.paused && state.playing,
-        // A user play intent claims the session; a periodic save does not.
-        takeover: wantsTakeover,
-      }),
+      body,
     });
   } catch {
     // Offline: keep the claim so the next attempt can still take over.
@@ -2368,6 +2889,10 @@ async function saveSession({ force = false, takeover = false } = {}) {
     return;
   }
   if (!res.ok) return;
+  // The composition is only "sent" once the server has it: a failed write must
+  // be re-sent in full next time rather than patched onto a row that predates
+  // the queue this device is holding.
+  if (full) { sentSessionKey = windowKey; sentSessionPlaying = playing; }
   const data = await res.json().catch(() => null);
   if (Number.isFinite(data?.updatedAt) && data.updatedAt > state.sessionUpdatedAt) {
     // Two saves can be in flight at once (a `playing` claim and the pause that
@@ -2457,11 +2982,24 @@ async function refreshSessionFromServer() {
  */
 function warmNext() {
   const nxt = state.queue[state.index + 1];
+  clearTimeout(warmTimer);
+  warmTimer = null;
   if (!nxt?.videoId) return;
-  fetch(`/api/warm/${encodeURIComponent(nxt.videoId)}`, {
-    method: 'POST', credentials: 'same-origin', keepalive: true,
-  }).catch(() => {});
+  // Debounce to the track the listener settles on. Mashing "next" used to fire
+  // one warm per skipped song; the server's download slots are FIFO, so the
+  // track actually chosen could queue behind four abandoned prefetches.
+  warmTimer = setTimeout(() => {
+    warmTimer = null;
+    // The queue may have moved on while the debounce waited.
+    if (state.queue[state.index + 1]?.videoId !== nxt.videoId) return;
+    fetch(`/api/warm/${encodeURIComponent(nxt.videoId)}`, {
+      method: 'POST', credentials: 'same-origin', keepalive: true,
+    }).catch(() => {});
+  }, 400);
 }
+
+/** One debounced prefetch of "the next track", not one per skip. */
+let warmTimer = null;
 
 // ── the endless station ─────────────────────────────────────────────────
 // A station is not a playlist: it must not stop, and it must not start over.
@@ -2478,6 +3016,39 @@ const STATION_AHEAD = 3;
 const stationPlaying = () => Boolean(state.stationQueue) && state.queue.length > 0;
 
 /**
+ * How many played entries stay in front of the playhead.
+ *
+ * An endless station appends a page every few tracks, for as long as the app is
+ * open — days, in an installed PWA — so the queue and everything that renders it
+ * (the drawer, the now-playing sheet, the station page) grew without bound. Only
+ * a window behind the playhead is worth keeping: "previous" is a skip, not an
+ * archive, and the drawer's "Earlier" section is a glance, not a history.
+ */
+const QUEUE_BEHIND = 20;
+
+/**
+ * Drop the queue entries that have scrolled far behind the playhead.
+ *
+ * `state.index` is rebased with the array: every consumer treats the queue as
+ * the whole world, so the two must move together or "next" lands on the wrong
+ * song. Nothing is offered up twice by dropping it — the station's `seen` list
+ * remembers every id it ever handed over, and the /api/now window is saved
+ * around the playhead, not from the front.
+ *
+ * Never while a room owns the queue: there `state.index` addresses the *shared*
+ * queue the server keeps, and trimming it locally would make this device's row
+ * numbers disagree with everyone else's.
+ */
+function trimQueueBehind(limit = QUEUE_BEHIND) {
+  if (rooms.active) return 0;
+  const drop = state.index - limit;
+  if (drop <= 0) return 0;
+  state.queue = state.queue.slice(drop);
+  state.index -= drop;
+  return drop;
+}
+
+/**
  * Ask the server for the next page of the station and append it to the queue.
  *
  * `exclude` is every id already in the queue *plus* everything the station has
@@ -2489,11 +3060,28 @@ async function extendStation() {
   const sq = state.stationQueue;
   if (!sq || sq.loading || sq.done) return 0;
   sq.loading = true;
+  // The wire caps `exclude` at 400 ids, so *which* 400 matters. It used to keep
+  // the first 400 — the queue's opening tracks plus the oldest ids the station
+  // ever handed over — which meant a long session stopped telling the
+  // recommender about the songs it had just played and started being offered
+  // them again. Keep the newest instead: the recent past is what "do not repeat
+  // yourself" means.
   const exclude = [...new Set([...state.queue.map((t) => t.videoId), ...sq.seen])]
-    .filter(Boolean).slice(0, 400);
+    .filter(Boolean).slice(-400);
   try {
     const data = await api(`/api/station/next?cursor=${sq.cursor}&exclude=${encodeURIComponent(exclude.join(','))}`);
-    const fresh = (data.tracks ?? []).filter((t) => t?.videoId && !state.queue.some((q) => q.videoId === t.videoId));
+    // Leaving the station (or starting another queue) must stop this page from
+    // landing: the request captured the old queue object, and appending its
+    // answer to whatever queue is current now tailed a new playlist with
+    // random station songs.
+    if (state.stationQueue !== sq) return 0;
+    // `fresh` checks sq.seen as well as the queue: `exclude` is capped at
+    // 400 ids on the wire, so a track the station handed over long ago can
+    // come back from the server once the queue has rotated past it — without
+    // the seen filter it would be appended as if it were new.
+    const seen = new Set(sq.seen);
+    const fresh = (data.tracks ?? [])
+      .filter((t) => t?.videoId && !seen.has(t.videoId) && !state.queue.some((q) => q.videoId === t.videoId));
     for (const t of data.tracks ?? []) if (t?.videoId) sq.seen.push(t.videoId);
     if (Number.isFinite(data.cursor)) sq.cursor = data.cursor;
     else sq.cursor += 3;
@@ -2509,14 +3097,21 @@ async function extendStation() {
     }
     rememberTracks(fresh);
     state.queue = [...state.queue, ...fresh.map(completeTrack)];
+    // An endless station grows for the life of the session, so the window
+    // behind the playhead is trimmed every time a page lands (see
+    // trimQueueBehind). The append itself is a composition change, so the
+    // station page is rebuilt below in either case.
+    trimQueueBehind();
     // A new track was appended, so whatever was warmed is no longer the last
     // one in the queue — but the *next* one may not exist yet. Warm it now.
     if (state.queue.length === state.index + 2) warmNext();
-    // The station page lists the live queue, so it has to repaint. Any other
-    // page only needs the up-next rail: a full render there would rebuild the
-    // search field and steal focus from someone typing.
-    if (state.page === 'station') render();
-    else { $('rail-content').innerHTML = rail(); updatePlayer(); }
+    // The queue grew: every surface that lists it has to follow. The station
+    // page lists the live queue, so `rowsChanged` rebuilds it; every other page
+    // only needs the up-next rail and the player bar (a full render there would
+    // rebuild the search field and steal focus from someone typing). Going
+    // through refreshQueueViews() is also what repaints an *open* queue drawer —
+    // it used to be left showing the queue as it was before the page landed.
+    refreshQueueViews({ rowsChanged: true });
     return fresh.length;
   } catch {
     // Silence on purpose: the queue still has songs, and a later advance will
@@ -2569,7 +3164,7 @@ function playStation(tracks, { shuffle = false } = {}) {
   state.stationQueue = {
     cursor: 3, seen: list.map((t) => t.videoId), loading: false, misses: 0, retryAt: 0, done: false,
   };
-  playIndex(0, { claim: true });
+  playIndex(0, { claim: true, queueChanged: true });
   notify(shuffle ? 'Shuffled — this station never ends' : 'Station playing · it never runs out', 'info');
 }
 
@@ -2578,17 +3173,25 @@ function leaveStation() {
   state.stationQueue = null;
 }
 
-function playIndex(i, { resumeMs = 0, claim = false } = {}) {
+function playIndex(i, { resumeMs = 0, claim = false, queueChanged = false } = {}) {
   const t = state.queue[i];
   if (!t) { state.ending = false; return; }
-  // A deliberate jump inside the shared queue is a room command; the snapshot
-  // it returns is what actually moves the playhead (here and everywhere else).
-  // `roomApplying` marks the writes the room itself made, so applying a remote
-  // state cannot echo back as a command.
+  // A shared-queue jump is a room command; `roomApplying` marks the room's own
+  // writes, so applying a remote state cannot echo back a command.
   if (rooms.active && !state.roomApplying) {
     rooms.command('select', { index: i, positionMs: resumeMs });
     return;
   }
+  // A deliberate source change ends the queue stream, if one was playing: this
+  // is the per-track player taking over (that is how the page leaves the stream
+  // on the way back in, and how a lock-screen skip leaves it while hidden).
+  if (state.streaming) {
+    state.streaming = null;
+    state.streamTrack = null;
+    state.streamOffsetMs = 0;
+    audio.loop = true;
+  }
+  const claimUndo = claim ? { hasPlayed: state.hasPlayed, blocked: state.sessionBlocked } : null;
   state.index = i;
   state.startedAt = null;
   // NOTE: `failures` is deliberately NOT reset here. Resetting it on every
@@ -2604,7 +3207,13 @@ function playIndex(i, { resumeMs = 0, claim = false } = {}) {
   if (claim) claimSession();
   state.pendingResumeMs = resumeMs;
   state.currentLyrics = null;
-  claimAudioSession();
+  // A locked phone is the one swap where WebKit can have rebuilt its GPU-side
+  // audio session while the web process still caches `type: 'playback'`. The
+  // cheap claim sees that stale cache and sends nothing; force the repair here,
+  // before the source changes, so the new session is asked for playback before
+  // it has to start the replacement source.
+  if (document.visibilityState === 'hidden') repairAudioSession({ force: true });
+  else claimAudioSession();
   audio.loop = true;
   audio.src = `/api/stream/${t.videoId}`;
   warmNext();
@@ -2614,13 +3223,50 @@ function playIndex(i, { resumeMs = 0, claim = false } = {}) {
   // Name the new track on the lock screen while it buffers, not after it
   // starts — otherwise a phone locked mid-load shows the previous song.
   nowPlaying.sync({ metadata: true });
+  announceNowPlaying(t);
   audio.play().catch((err) => {
+    // A superseded source (the listener pressed next again before this one
+    // started) rejects with AbortError. Painting that as a pause makes the bar
+    // say "Play" while the new track is already loading — or audible.
+    if (current()?.videoId !== t.videoId) return;
     console.warn('play blocked', err.message);
     state.playing = false;
+    // An interruption (another app taking the audio output) rejects this play
+    // and leaves the element paused. A paused element fires no `timeupdate`, so
+    // nothing else will ever look at it again: record that playback is still
+    // wanted so the resume paths below have something to act on.
+    if (document.visibilityState === 'hidden' && !state.userPause) {
+      state.resumeWanted = true;
+    }
+    // Nothing will emit `playing` or `error` for a refused play, so a
+    // `switching` left armed would keep dropping pause saves and stray `ended`
+    // events until the next successful track start.
+    state.switching = false;
+    // A refused play must not turn this device's next save into a takeover
+    // (see releaseFailedClaim): the device actually playing would be stolen
+    // from on the next visibilitychange save.
+    releaseFailedClaim(claimUndo);
     updatePlayer();
   });
   state.playing = true;
-  render();
+  // Arm the queue's continuous stream for the moment this page is hidden.
+  // One request per track start, and it has to happen *before* the screen
+  // locks: hidden is the one moment there is no time for a round trip, and on
+  // iOS the moment script stops running (public/queue-stream.js).
+  void armQueueStream();
+  // A track advance is not a navigation. This used to be a full `render()`:
+  // every track boundary — including the autonomous one at the end of a song —
+  // re-assigned #page-root, #rail-content and #player, and reset #main-scroll
+  // to the top. What actually changed is the player bar, the rail's now/next,
+  // the queue drawer if it is open, and one "active" row marker.
+  //
+  // A station queue is endless, so the window behind the playhead is trimmed as
+  // it advances. Anything dropped there changes the row indices the drawer and
+  // the sheet render from, so those are forced rather than patched. A caller
+  // that replaced the queue itself (`queueChanged`) is a different matter: on
+  // the station page the rows *are* the live queue, so that page is rebuilt.
+  const dropped = state.stationQueue ? trimQueueBehind() : 0;
+  refreshQueueViews({ forceOverlay: dropped > 0, rowsChanged: queueChanged, trimmed: dropped });
   // With the now-playing sheet open, the lyrics pane is on screen. A new track
   // must not leave the previous song's words sitting under the new title — the
   // dislike button skips a track, so this is reachable in one tap.
@@ -2635,7 +3281,7 @@ function playTrack(videoId, queue = null) {
   if (filled) {
     leaveStation();
     state.queue = filled;
-    playIndex(0, { claim: true });
+    playIndex(0, { claim: true, queueChanged: true });
     return;
   }
   const base = queue ?? (state.queue.length ? state.queue : []);
@@ -2655,7 +3301,7 @@ function playTrack(videoId, queue = null) {
   // starts a new context, so the endless station stops there.
   if (queue && queue !== state.queue) leaveStation();
   state.queue = base.map(completeTrack);
-  playIndex(idx, { claim: true });
+  playIndex(idx, { claim: true, queueChanged: true });
 }
 
 function playQueue(tracks, { shuffle = false } = {}) {
@@ -2670,7 +3316,7 @@ function playQueue(tracks, { shuffle = false } = {}) {
   rememberTracks(tracks);
   const list = tracks.map(completeTrack);
   state.queue = shuffle ? shuffled(list) : list;
-  playIndex(0, { claim: true });
+  playIndex(0, { claim: true, queueChanged: true });
   if (shuffle) notify('Shuffled');
 }
 
@@ -2723,6 +3369,23 @@ function claimSession() {
   state.resumeFrom = null;
 }
 
+/**
+ * Undo a session claim whose play() was refused.
+ *
+ * A claim is what turns the next /api/now save into `takeover: true`. If the
+ * play never actually started (autoplay policy, a refused stream), a claim
+ * that survives makes this device steal the session from the one genuinely
+ * playing — as soon as a visibilitychange save fires. Roll back only when
+ * this device was a *reader* before the claim: a device that was already
+ * playing keeps its ownership, and an unblocked older claim is not affected.
+ */
+function releaseFailedClaim(before) {
+  if (!before || !(before.blocked || !before.hasPlayed)) return;
+  state.claim = false;
+  state.hasPlayed = before.hasPlayed;
+  state.sessionBlocked = before.blocked;
+}
+
 function playPause() {
   if (!current()) return;
   if (rooms.active) {
@@ -2741,11 +3404,32 @@ function playPause() {
   if (audio.paused) {
     claimAudioSession();
     // An explicit play here is the one action that may take the session back
-    // from another device.
+    // from another device. If the browser refuses the play, the claim is
+    // rolled back below so a later save does not steal the session.
+    const before = { hasPlayed: state.hasPlayed, blocked: state.sessionBlocked };
     claimSession();
-    audio.play().catch((err) => notify(err.message));
+    // A rejected play() (autoplay policy, a refused stream) must not leave
+    // this device claiming the session either: releaseFailedClaim restores
+    // the reader state, so the next /api/now save cannot send takeover:true
+    // at the device that is actually playing.
+    audio.play().catch((err) => {
+      if (!audio.paused) return;
+      releaseFailedClaim(before);
+      notify(err.message);
+    });
     state.playing = true;
   } else {
+    // A person pressing pause: any source swap in flight is over as far as the
+    // transport is concerned, so `switching` must not stay armed (a stale flag
+    // drops the next pause save and the next natural `ended`).
+    state.switching = false;
+    state.userPause = true;
+    // A deliberate pause ends the interruption recovery too: leaving the intent
+    // armed would let the hidden watchdog start the music again a few seconds
+    // after the listener stopped it on purpose.
+    state.resumeOnVisible = false;
+    state.resumeWanted = false;
+    state.resumeAttempts = 0;
     audio.pause();
     state.playing = false;
   }
@@ -2767,8 +3451,12 @@ function overlayHtml() {
   // The queue as a rotation anchored on the playing track: everything after it,
   // then everything before it. The indices travel alongside so each row knows
   // which entry of `state.queue` it is (reordering needs that, not the slot).
+  // The rotation is windowed to ±QUEUE_BEHIND entries for the same reason the
+  // drawer is: the sheet is rebuilt whenever it is open and a long queue would
+  // otherwise put every entry (and every thumbnail) on screen at once.
   const queueIdx = state.queue.map((_, i) => i);
-  const upcomingIdx = [...queueIdx.slice(Math.max(0, state.index + 1)), ...queueIdx.slice(0, Math.max(0, state.index))];
+  const upcomingIdx = [...queueIdx.slice(Math.max(0, state.index + 1)), ...queueIdx.slice(0, Math.max(0, state.index))]
+    .slice(0, QUEUE_BEHIND * 2);
   const upcoming = upcomingIdx.map((i) => state.queue[i]);
 
   const tabs = [['lyrics', 'Lyrics'], ['queue', 'Up next'], ['details', 'About']];
@@ -2780,6 +3468,7 @@ function overlayHtml() {
   } else if (state.overlayTab === 'details') {
     panel = `<div class="np-details">
       <div class="detail-row"><span>Title</span><b>${esc(t.title)}</b></div>
+      <div class="detail-row"><span>Edit</span><b>${t.version === 'explicit' ? 'Explicit' : t.version === 'clean' ? 'Clean (censored)' : 'Unmarked'}</b></div>
       <div class="detail-row"><span>Artist</span>
         ${t.channelId || t.channel
     ? `<button class="detail-link" data-action="artist" data-artist="${esc(t.channelId || t.channel)}">${esc(t.channel ?? '—')}${icon('arrow-right', 'xs')}</button>`
@@ -2800,7 +3489,9 @@ function overlayHtml() {
     <div class="modal-content">
       <div class="np-head">
         <div class="np-head-copy"><span class="eyebrow">NOW PLAYING</span>
-          <h2>${esc(t.title)}</h2><p class="byline">${esc(t.channel ?? '')}</p></div>
+          <div class="track-title-line"><h2>${esc(t.title)}</h2>${versionTag(t)}</div>${(t.channelId || t.channel)
+            ? `<button class="byline byline-link" data-action="artist" data-artist="${esc(t.channelId || t.channel)}" aria-label="Open ${esc(t.channel)}'s artist page">${esc(t.channel)}</button>`
+            : `<p class="byline">${esc(t.channel ?? '')}</p>`}</div>
         <div class="np-actions">
           <button class="icon-btn ${liked ? 'primary' : ''}" data-action="heart" data-id="${esc(t.videoId)}"
             aria-pressed="${liked}" aria-label="${liked ? 'Remove from' : 'Add to'} liked songs">${icon('heart')}</button>
@@ -2897,7 +3588,11 @@ async function loadLyrics() {
     const t2 = current();
     if (t2 && t2.videoId === t.videoId) state.currentLyrics = text ?? null;
   } catch {
-    state.currentLyrics = null;
+    // Same staleness guard as the success path: a late failure for the
+    // previous track used to mark the *new* track as having no lyrics, and
+    // loadLyrics() then never asked again.
+    const t2 = current();
+    if (t2 && t2.videoId === t.videoId) state.currentLyrics = null;
   }
   refreshOverlay();
 }
@@ -2928,7 +3623,7 @@ function queueRow(t, index, { current = false } = {}) {
       data-queue-row data-video="${videoId}" data-index="${index}"${current ? ' data-current="1"' : ''}>
     <button class="queue-mini${current ? ' current' : ''}" data-action="play-track" data-id="${videoId}"
       aria-label="Play ${title}">${cover(null, 'cover', t.thumb)}
-      <span class="queue-text"><strong>${title}</strong><span>${esc(t.channel ?? '')}</span></span>
+      <span class="queue-text"><span class="track-title-line"><strong>${title}</strong>${versionTag(t)}</span><span>${esc(t.channel ?? '')}</span></span>
       <span class="duration">${fmt(t.durationS)}</span></button>
     ${grip}</div>`;
 }
@@ -2936,16 +3631,29 @@ function queueRow(t, index, { current = false } = {}) {
 function drawerHtml() {
   const entries = state.queue.map((t, i) => ({ t, i }));
   const playing = state.index >= 0 ? state.queue[state.index] : null;
-  const upcoming = entries.slice(Math.max(0, state.index + 1));
-  const earlier = entries.slice(0, Math.max(0, state.index));
-  $('queue-drawer').innerHTML = `<div class="drawer-top"><div><span class="eyebrow">Playing queue</span>
-      <h2>${state.queue.length} ${state.queue.length === 1 ? 'track' : 'tracks'}</h2></div>
+  // A window, not the whole queue: the drawer is repainted by refreshQueueViews
+  // on every playback change, and a long station queue is 50-200 entries, so
+  // rendering all of them rebuilt ~1,600 nodes (one <img> each) for rows nobody
+  // had scrolled to. The header still states the real total.
+  const upcoming = entries.slice(Math.max(0, state.index + 1), Math.max(0, state.index + 1) + QUEUE_BEHIND);
+  const earlier = entries.slice(0, Math.max(0, state.index)).slice(-QUEUE_BEHIND);
+  // Say so when the window is hiding rows: a drawer that silently stops after
+  // twenty reads as "the queue ends here", which is a worse lie than the cost of
+  // one line.
+  const aheadMore = Math.max(0, state.queue.length - Math.max(0, state.index + 1) - upcoming.length);
+  const behindMore = Math.max(0, Math.max(0, state.index) - earlier.length);
+  const moreNote = (n, where) => (n
+    ? `<p class="drawer-more field-hint">${n} more ${n === 1 ? 'track' : 'tracks'} ${where}</p>` : '');
+  const count = `${state.queue.length} ${state.queue.length === 1 ? 'track' : 'tracks'}`;
+  $('queue-drawer').innerHTML = `<div class="drawer-top"><div><h2>Queue <span class="drawer-count">${count}</span></h2></div>
       <button class="icon-btn" data-action="close-drawer" aria-label="Close queue">${icon('close')}</button></div>
-    ${playing ? `<span class="eyebrow">Now playing</span><div class="drawer-list">${queueRow(playing, state.index, { current: true })}</div>` : ''}
+    ${playing ? `<div class="drawer-list">${queueRow(playing, state.index, { current: true })}</div>` : ''}
     <div class="drawer-section"><span class="eyebrow">Up next</span><div class="drawer-list">
       ${upcoming.length ? upcoming.map(({ t, i }) => queueRow(t, i)).join('')
-        : `<div class="np-empty small">${icon('queue')}<p>Nothing queued. Play a playlist or a station to fill this.</p></div>`}</div></div>
-    ${earlier.length ? `<div class="drawer-section"><span class="eyebrow">Earlier</span><div class="drawer-list">${earlier.map(({ t, i }) => queueRow(t, i)).join('')}</div></div>` : ''}`;
+        : `<div class="np-empty small">${icon('queue')}<p>Nothing queued. Play a playlist or a station to fill this.</p></div>`}</div>
+      ${moreNote(aheadMore, 'after these')}</div>
+    ${earlier.length ? `<div class="drawer-section"><span class="eyebrow">Earlier</span><div class="drawer-list">${earlier.map(({ t, i }) => queueRow(t, i)).join('')}</div>
+      ${moreNote(behindMore, 'before these')}</div>` : ''}`;
 }
 
 // ── queue reorder ───────────────────────────────────────────────────────
@@ -2973,13 +3681,37 @@ function queueDragRow() {
   return scope?.querySelector(`[data-queue-row][data-video="${CSS.escape(queueDrag.videoId)}"]`) ?? null;
 }
 
+/**
+ * Row midpoints for the slot scan, read once and reused.
+ *
+ * `paintQueueDrop` used to read a rect per row on every pointermove, interleaved
+ * with the class writes that clear the old indicator — the classic
+ * write-then-read loop, which forces a synchronous layout per event. Pointer
+ * events arrive at the digitizer rate (120-240 Hz on a phone), so a 200-row
+ * queue cost ~400 rect computations per frame's worth of moves and the drop
+ * landed a frame behind the finger. The midpoints are read here in one batch
+ * (one layout, then every rect out of it) and thrown away when something can
+ * have moved them: a scroll, a resize, or a re-render under the finger.
+ */
+function queueDragGeometry(refresh = false) {
+  const rows = queueRowEls(queueDragRow());
+  const cached = queueDrag.geometry;
+  if (!refresh && cached && cached.rows.length === rows.length
+    && cached.rows.every((r, i) => r === rows[i] && r.isConnected)) return cached;
+  const centers = rows.map((r) => {
+    const box = r.getBoundingClientRect();
+    return box.top + box.height / 2;
+  });
+  queueDrag.geometry = { rows, centers };
+  return queueDrag.geometry;
+}
+
 /** Which visual slot (0…rows.length) the pointer is over. */
-function queueInsertSlot(rows, clientY) {
+function queueInsertSlot(rows, centers, clientY) {
   const dragged = queueDragRow();
   for (let i = 0; i < rows.length; i++) {
     if (rows[i] === dragged) continue; // the dragged row has no height of its own
-    const box = rows[i].getBoundingClientRect();
-    if (clientY < box.top + box.height / 2) return i;
+    if (clientY < centers[i]) return i;
   }
   return rows.length;
 }
@@ -3015,14 +3747,21 @@ function queueTargetIndex(rows, fromIndex, slot) {
 
 /** Paint the drop indicator under the pointer and remember the target index. */
 function paintQueueDrop(clientY) {
-  const rows = queueRowEls(queueDragRow());
-  for (const r of rows) r.classList.remove('drop-before', 'drop-after');
-  const slot = queueInsertSlot(rows, clientY);
+  const { rows, centers } = queueDragGeometry();
+  const slot = queueInsertSlot(rows, centers, clientY);
   queueDrag.target = queueTargetIndex(rows, queueDrag.fromIndex, slot);
   const dragged = queueDragRow();
   const mark = slot <= 0 ? rows[0] : rows[Math.min(slot, rows.length) - 1];
-  if (!mark || mark === dragged) return;
-  mark.classList.add(slot <= 0 ? 'drop-before' : 'drop-after');
+  const next = !mark || mark === dragged ? null : mark;
+  const at = next ? (slot <= 0 ? 'drop-before' : 'drop-after') : null;
+  // Only the two rows that changed are touched — the one that held the
+  // indicator and the one that holds it now — instead of clearing a class on
+  // every row in the list on every move.
+  if (next === queueDrag.mark && at === queueDrag.markAt) return;
+  queueDrag.mark?.classList.remove('drop-before', 'drop-after');
+  if (next) next.classList.add(at);
+  queueDrag.mark = next;
+  queueDrag.markAt = at;
 }
 
 function clearQueueDrop() {
@@ -3039,6 +3778,21 @@ function beginQueueDrag(e, row) {
   queueDrag.active = true;
   queueDrag.startY = e.clientY;
   queueDrag.startX = e.clientX;
+  queueDrag.frameY = e.clientY;
+  // Cache where every row is *now*, at the cheapest moment there is: the hand
+  // has just gone down and nothing has moved yet. From here a move costs one
+  // transform write, not a layout.
+  queueDragGeometry(true);
+}
+
+/** The coalesced frame of a drag: one transform write, then one cached scan. */
+function flushQueueDrag() {
+  queueDragFrame = 0;
+  const drag = queueDrag;
+  if (!drag) return;
+  const row = queueDragRow();
+  if (row) row.style.transform = `translateY(${Math.round(drag.frameY - drag.startY)}px)`;
+  paintQueueDrop(drag.frameY);
 }
 
 document.addEventListener('pointerdown', (e) => {
@@ -3056,9 +3810,13 @@ document.addEventListener('pointerdown', (e) => {
     target: Number(row.dataset.index),
     startX: e.clientX,
     startY: e.clientY,
+    frameY: e.clientY,
     active: Boolean(grip),
     moved: false,
     surface: row.closest('#now-content, #queue-drawer'),
+    geometry: null,
+    mark: null,
+    markAt: null,
   };
   if (queueDrag.active) beginQueueDrag(e, row);
 });
@@ -3076,17 +3834,27 @@ document.addEventListener('pointermove', (e) => {
   }
   if (e.cancelable) e.preventDefault();
   queueDrag.moved = true;
-  const row = queueDragRow();
-  if (!row) return;
-  row.classList.add('dragging');
-  row.style.transform = `translateY(${Math.round(dy)}px)`;
-  // Let every surface that is open follow along: a re-render during the drag
-  // (a track change, a room update) must not leave a stale row behind.
-  paintQueueDrop(e.clientY);
+  // The "being dragged" class is two writes on one element: done here so a
+  // re-render under the finger (queueRow reads queueDrag) still marks the row,
+  // and so the gesture is observable before the next frame. Everything that
+  // reads layout waits for the frame below.
+  queueDragRow()?.classList.add('dragging');
+  queueDrag.frameY = e.clientY;
+  // There is no point doing this work more than once per frame: the pointer can
+  // fire ten times between two paints. Coalescing also means a dropped frame
+  // costs one skipped update, not a queued backlog of stale ones.
+  if (!queueDragFrame) queueDragFrame = requestAnimationFrame(flushQueueDrag);
 }, { passive: false });
 
 function finishQueueDrag(e, cancelled = false) {
   if (!queueDrag || e.pointerId !== queueDrag.pointerId) return;
+  // A pointerup almost always arrives in the same frame as the last
+  // pointermove, so the coalesced paint has not run yet and `target` still
+  // points at the previous slot. Apply the pending frame synchronously: where
+  // the finger let go is exactly what has to be committed, whatever the frame
+  // rate was doing.
+  if (queueDragFrame) { cancelAnimationFrame(queueDragFrame); queueDragFrame = 0; }
+  flushQueueDrag();
   const drag = queueDrag;
   queueDrag = null;
   clearQueueDrop();
@@ -3098,6 +3866,12 @@ function finishQueueDrag(e, cancelled = false) {
 
 document.addEventListener('pointerup', (e) => finishQueueDrag(e));
 document.addEventListener('pointercancel', (e) => finishQueueDrag(e, true));
+
+// The cached midpoints only hold while the list stays put. Both surfaces can
+// scroll under the finger (and the sheet's list is short enough to scroll on a
+// phone), so a scroll throws them away and the next frame re-reads them once.
+document.addEventListener('scroll', () => { if (queueDrag) queueDrag.geometry = null; }, { capture: true, passive: true });
+window.addEventListener('resize', () => { if (queueDrag) queueDrag.geometry = null; }, { passive: true });
 
 // The click that a completed drag emits (pointerup → click on the row) is the
 // one thing that would turn a reorder into "play this track". Capture phase, so
@@ -3131,13 +3905,29 @@ function reorderQueueRow(row, delta) {
   moveQueueEntry(row.dataset.video, to);
   // Focus follows the row it was on: a re-render must not drop the keyboard
   // user back at the top of the document.
-  requestAnimationFrame(() => {
-    const moved = surface?.querySelector(`[data-queue-row][data-video="${CSS.escape(row.dataset.video)}"]`)
-      ?? document.querySelector(`[data-queue-row][data-video="${CSS.escape(row.dataset.video)}"]`);
-    if (!moved) return;
+  //
+  // The repaint can itself land in a rAF (the pointer-drag path batches it), so
+  // restoring on the next frame and assuming the new DOM already existed was a
+  // race: it silently lost the user's place. Retry a couple of frames instead,
+  // and fall back to the document when the surface was replaced wholesale.
+  const selector = `[data-queue-row][data-video="${CSS.escape(row.dataset.video)}"]`;
+  let focusAttempts = 0;
+  const restoreFocus = () => {
+    const host = surface?.isConnected ? surface : document;
+    const moved = host.querySelector(selector) ?? document.querySelector(selector);
+    if (!moved) {
+      // ~200 ms of frames, only while the row genuinely is not there yet. A
+      // fixed number of frames was not enough on a loaded machine (the repaint
+      // competes with other suites), and the failure mode is silent.
+      focusAttempts += 1;
+      if (focusAttempts <= 12) requestAnimationFrame(restoreFocus);
+      return;
+    }
     (grip ? moved.querySelector('[data-queue-grip]') : moved.querySelector('[data-action="play-track"]'))
       ?.focus({ preventScroll: true });
-  });
+  };
+  // The common case repaints synchronously, so try before yielding a frame.
+  restoreFocus();
   notify(`Moved to position ${to + 1} of ${state.queue.length}`, 'info');
 }
 
@@ -3162,9 +3952,12 @@ function moveQueueEntry(fromVideoId, toIndex) {
   const [moved] = next.splice(from, 1);
   next.splice(to, 0, moved);
   state.queue = next;
+  // Order is part of the plan: an armed plan still describes the old order, so
+  // a stream started after this drag would play the queue as it used to be.
+  invalidateQueuePlan();
   // The song that is playing is the same song; only where it sits changes.
   if (playing) state.index = Math.max(0, next.findIndex((t) => t.videoId === playing.videoId));
-  refreshQueueViews({ forceOverlay: true });
+  refreshQueueViews({ forceOverlay: true, rowsChanged: true });
   // Reordering is a queue edit, not a play intent: it is saved, but debounced so
   // a held-down Alt+Arrow cannot spam the session endpoint.
   clearTimeout(queueSaveTimer);
@@ -3173,12 +3966,82 @@ function moveQueueEntry(fromVideoId, toIndex) {
 }
 
 /** Repaint every surface that lists the queue. */
-function refreshQueueViews({ forceOverlay = false } = {}) {
+function refreshQueueViews({ forceOverlay = false, rowsChanged = false, trimmed = 0 } = {}) {
   $('rail-content').innerHTML = rail();
   updatePlayer(); // player bar (+ the sheet, when it is open)
   if (forceOverlay && !$('now-overlay').hidden) refreshOverlay({ force: true });
   if (!$('drawer-overlay').hidden) drawerHtml();
-  if (state.page === 'station') void render();
+  // The station page lists the *live* queue, so it follows the queue. A change
+  // to that list's composition (an append, a reorder, a removal) rebuilds the
+  // page — the hero, the counts and the rows all move. A track advance does not:
+  // it only moves the "now playing" row marker. A trim behind the playhead does
+  // move rows (the dropped ones are gone from the list), so the list alone is
+  // repainted in place — the page keeps its scroll position and its hero.
+  if (state.page === 'station') {
+    if (rowsChanged) { void render(); return; }
+    if (trimmed > 0) { patchStationRows(trimmed); return; }
+  }
+  patchNowPlayingRows();
+}
+
+/**
+ * Repaint the station page's row list from the live queue.
+ *
+ * Only the list (and the count in its section head) is rebuilt: the rows are a
+ * window on the queue, so trimming behind the playhead makes the rendered list
+ * stale long before anything else on the page changes.
+ *
+ * `dropped` is how many entries fell off the front. In the common case that is
+ * the only change, and the rows that remain are literally the same elements —
+ * so the leading rows are removed and the numbering shifted instead of
+ * re-parsing the whole list (which would re-create a thumbnail per row on every
+ * track advance). Anything else — an append, a reorder — falls back to a rebuild.
+ */
+function patchStationRows(dropped = 0) {
+  const root = $('page-root');
+  const list = root?.querySelector('.track-list');
+  const live = stationPlaying() ? state.queue : null;
+  if (!list || !live) return;
+  const rendered = [...list.querySelectorAll('.track-row')];
+  const intact = dropped > 0 && rendered.length === live.length + dropped
+    && rendered[dropped]?.dataset.track === live[0]?.videoId;
+  if (intact) {
+    for (let i = 0; i < dropped; i++) rendered[i].remove();
+    [...list.querySelectorAll('.track-row')].forEach((row, i) => {
+      const n = row.querySelector('.track-index span');
+      if (n) n.textContent = String(i + 1);
+    });
+  } else {
+    list.outerHTML = trackRows(live, true, 'station');
+  }
+  const note = root.querySelector('.shelf-head-copy p');
+  if (note) note.textContent = stationQueueNote(live.length);
+  patchNowPlayingRows();
+}
+
+/**
+ * Move the "now playing" marker without rebuilding the page.
+ *
+ * Every list surface — station, playlist, album, liked songs, search results —
+ * marks the row that is playing with `.active` and aria-current, and that marker
+ * is the only thing about them that changes when one track ends and the next
+ * begins. Rebuilding them for it meant re-assigning `#page-root.innerHTML` (and
+ * `#rail-content`, and `#player`) 150-400 nodes at a time, with 10-30 images to
+ * re-decode, plus a reset of `#main-scroll` to the top — the reading position a
+ * listener had scrolled to, thrown away every few minutes.
+ */
+function patchNowPlayingRows() {
+  const root = $('page-root');
+  if (!root) return;
+  const act = current();
+  const videoId = state.playing && act ? act.videoId : null;
+  for (const row of root.querySelectorAll('.track-row[data-track]')) {
+    const isNow = Boolean(videoId) && row.dataset.track === videoId;
+    if (row.classList.contains('active') === isNow) continue;
+    row.classList.toggle('active', isNow);
+    if (isNow) row.setAttribute('aria-current', 'true');
+    else row.removeAttribute('aria-current');
+  }
 }
 
 // ── overlay mechanics ───────────────────────────────────────────────────
@@ -3341,6 +4204,21 @@ document.addEventListener('change', (e) => {
   syncPrefInputs();
 });
 
+document.addEventListener('sonora:pref-change', (e) => {
+  // notifications.js writes its own preference straight to localStorage (the
+  // "Enable alerts" tap in the bell panel is the browser's permission
+  // gesture, which belongs to that module) and announces the write with this
+  // event. Mirror the change into state.prefs, or the settings sheet renders
+  // a stale checkbox after the user just enabled it — without re-writing
+  // localStorage (the module already did) or re-dispatching (that would loop
+  // back into notifications.js).
+  const key = e.detail?.key;
+  if (!key) return;
+  state.prefs = { ...(state.prefs ?? {}), [key]: e.detail?.value };
+  // A sheet that is open re-applies stored values instead of being rebuilt.
+  syncPrefInputs();
+});
+
 function confirmSheet({ title, text, confirmLabel = 'Delete', danger = false, action }) {
   confirmAction = action;
   openFormSheet(`<button class="modal-close" data-action="close-form" aria-label="Close">${icon('close')}</button>
@@ -3413,6 +4291,26 @@ function contextMenu(e, items) {
   el.querySelector('button')?.focus({ preventScroll: true });
 }
 
+// The menu is announced as `role="menu"`, so it has to behave like one: arrow
+// keys move between items (wrapping), Home/End jump, and Tab still leaves the
+// menu (that is the ARIA APG pattern; Escape is handled globally).
+$('context-menu').addEventListener('keydown', (e) => {
+  const menu = $('context-menu');
+  if (menu.hidden) return;
+  const items = [...menu.querySelectorAll('[role="menuitem"]')];
+  if (!items.length) return;
+  const at = items.indexOf(document.activeElement);
+  let next = null;
+  if (e.key === 'ArrowDown') next = items[(at + 1 + items.length) % items.length];
+  else if (e.key === 'ArrowUp') next = items[(at - 1 + items.length) % items.length];
+  else if (e.key === 'Home') next = items[0];
+  else if (e.key === 'End') next = items.at(-1);
+  if (!next) return;
+  e.preventDefault();
+  e.stopPropagation();
+  next.focus({ preventScroll: true });
+});
+
 // The account menu is ONE popover shared by two triggers: the topbar button and
 // the sidebar footer. It used to be pinned to a hardcoded `top:54px; right:12px`
 // slot, so from the sidebar it opened in the opposite corner and on desktop it
@@ -3474,7 +4372,15 @@ function closeMenus({ restoreFocus = true } = {}) {
   if (restoreFocus && wasOpen && hadFocus && menuTrigger && document.contains(menuTrigger)) {
     menuTrigger.focus?.({ preventScroll: true });
   }
-  if (!menu.hidden) menuTrigger = null;
+  // The old guard read `if (!menu.hidden)` — dead, since menu.hidden was just
+  // set true, so a stale trigger survived every close and a later, unrelated
+  // sheet could restore focus to a row that no longer owns it. Drop the
+  // trigger only when a menu was actually open and nobody consumed it: the
+  // focus restore above deliberately passes the trigger on (that is how a
+  // row that opened a context menu gets its focus back), so an Escape close
+  // that returned focus still has an owner, and a menu-item click that
+  // immediately opens a sheet has not reached this line yet.
+  if (wasOpen && !(restoreFocus && hadFocus)) menuTrigger = null;
 }
 
 // ── account & security ──────────────────────────────────────────────────
@@ -3502,7 +4408,7 @@ function securityPage() {
       <span class="page-overline">Your account</span>
       <h1 class="page-title">Account &amp; security<span class="accent">.</span></h1>
       <p class="security-lede">Who can get in, which devices stay signed in, and how to lock them out.</p>
-    </div></div>`;
+    </div><div class="page-head-actions"></div></div>`;
 
   if (!d) {
     if (state.security.error) {
@@ -3802,7 +4708,14 @@ async function signOutEverywhere() {
 }
 
 // ── auth ────────────────────────────────────────────────────────────────
+// Whether the page on screen is the offline empty state rather than a page the
+// user navigated to. `state.user` alone cannot answer that: a signed-in browser
+// whose reload ran while the tunnel was down still carries the user from the
+// previous boot, so the offline page looked "signed in" to the online handler.
+let offlineBootShown = false;
+
 function showOffline() {
+  offlineBootShown = true;
   $('auth-overlay').hidden = true;
   closeOverlay('now-overlay');
   closeOverlay('drawer-overlay');
@@ -3816,7 +4729,11 @@ function showOffline() {
 }
 
 window.addEventListener('online', () => {
-  if (!state.user) boot();
+  // `!state.user` used to be the whole condition, so a signed-in boot that raced
+  // a tunnel blip stayed on the offline empty state — the room/now pill
+  // self-recovered, the page did not, and the only way out was a full reload.
+  // Coming back online is exactly that reload's "Try again", minus the reload.
+  if (offlineBootShown || !state.user) boot();
 });
 
 // ── sign-in screen ──────────────────────────────────────────────────────
@@ -3864,6 +4781,26 @@ function applyAuthCaps() {
   }
 }
 
+/**
+ * Show the sign-in screen.
+ *
+ * This is the whole app's front door for a first-time visitor and for an
+ * expired session, and it is deliberately the cheapest thing boot can do: the
+ * overlay markup already exists in index.html (hidden), so this only unhides it.
+ * Every round trip that used to sit in front of it has been taken out of the
+ * path — boot() fires /api/me immediately instead of after /api/health (see
+ * bootOnce) — and nothing here awaits anything: the capability fetch below
+ * repaints the passkey row when it lands, long after the form is on screen.
+ *
+ * What is left is the module itself: app.js is one 337 KB ES module, so V8
+ * parses and compiles all of it before the first statement runs, and a visitor
+ * who only needs this form pays for the whole player. Splitting that is not
+ * possible from inside this file — it needs a second entry module (a few dozen
+ * lines: fetch /api/me, then `await import('./app.js')` on success, else
+ * unhide the overlay) plus one `<script>` swap in public/index.html. No build
+ * step is required for it: dynamic `import()` is native. That change belongs to
+ * index.html and to whoever owns the shell, not here.
+ */
 function showAuth() {
   closeOverlay('now-overlay');
   closeOverlay('drawer-overlay');
@@ -4036,7 +4973,7 @@ document.addEventListener('submit', async (e) => {
     const uid = Number(form.dataset.uid);
     const password = String(new FormData(form).get('password') ?? '');
     const error = $('admin-pass-error');
-    if (password.length < 6) { if (error) error.textContent = 'Use at least 6 characters.'; return; }
+    if (password.length < 12) { if (error) error.textContent = 'Use at least 12 characters.'; return; }
     const btn = form.querySelector('button[type="submit"]');
     if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>Saving…'; }
     try {
@@ -4188,10 +5125,12 @@ document.addEventListener('click', async (e) => {
       row?.classList.add('removing');
       api(`/api/playlists/${plId}/tracks/${encodeURIComponent(id)}`, { method: 'DELETE' })
         .then(async () => {
+          // The DELETE is the success boundary. Confirm it before auxiliary refresh
+          // work: a slow collection reload must not leave the changed screen silent.
+          notify('Removed from playlist');
           await loadPlaylists();
           setTimeout(async () => {
             if (state.collection === d.coll) await openCollection(d.coll, { history: 'none' });
-            notify('Removed from playlist');
           }, row ? 180 : 0);
         })
         .catch((err) => { row?.classList.remove('removing'); notify(err.message, 'error'); });
@@ -4241,20 +5180,27 @@ document.addEventListener('click', async (e) => {
   }
 
   const id = d.id;
+  // One catch for the whole delegation. Many branches await helpers that report
+  // their own errors, but the ones that do not (a room command, a playlist read
+  // behind "Play all") used to reject into an unhandled promise — the button
+  // did nothing and said nothing.
+  try {
   switch (d.action) {
     case 'back':
       if (historyCursor.index > 0) {
+        captureScroll();
         historyCursor.index -= 1;
         const x = historyEntries[historyCursor.index];
-        if (x.page === 'collection' && x.collection) await openCollection(x.collection, { history: 'none' });
+        if (x.page === 'collection' && x.collection) await openCollection(x.collection, { history: 'none', scrollTop: x.scroll ?? 0 });
         else navigate(x.page, x.collection, false, x.mood);
       }
       break;
     case 'forward':
       if (historyCursor.index < historyEntries.length - 1) {
+        captureScroll();
         historyCursor.index += 1;
         const x = historyEntries[historyCursor.index];
-        if (x.page === 'collection' && x.collection) await openCollection(x.collection, { history: 'none' });
+        if (x.page === 'collection' && x.collection) await openCollection(x.collection, { history: 'none', scrollTop: x.scroll ?? 0 });
         else navigate(x.page, x.collection, false, x.mood);
       }
       break;
@@ -4310,12 +5256,10 @@ document.addEventListener('click', async (e) => {
     }
     case 'retry-collection': await openCollection(id, { history: 'none' }); break;
     case 'playlist-menu': {
-      const pl = state.collectionData;
       contextMenu(e, [
         { text: 'Add to queue', action: 'queue-collection', icon: 'queue', id: state.collection },
         { text: 'Delete playlist', action: 'delete-playlist', icon: 'close', id },
       ]);
-      void pl;
       break;
     }
     case 'play-seed': {
@@ -4351,7 +5295,7 @@ document.addEventListener('click', async (e) => {
         playIndex(idx, { resumeMs, claim: true });
       } else {
         state.queue = [completeTrack(f), ...state.queue];
-        playIndex(0, { resumeMs, claim: true });
+        playIndex(0, { resumeMs, claim: true, queueChanged: true });
       }
       break;
     }
@@ -4363,7 +5307,7 @@ document.addEventListener('click', async (e) => {
         break;
       }
       claimSession();
-      if (audio.currentTime > 3) { seekTo(0); return; }
+      if (playerPosition() > 3) { seekTo(0); return; }
       nextTrack({ back: true, userInitiated: true });
       break;
     case 'next':
@@ -4376,13 +5320,38 @@ document.addEventListener('click', async (e) => {
     case 'room-share': await shareRoomLink(); break;
     case 'room-leave': await leaveRoomFromUi(); break;
     case 'room-end': endRoomFromUi(); break;
+    case 'room-make-host': {
+      // Hand the seat over, from the sheet, host only. The click is optimistic
+      // in one direction only: the button disables immediately so a double tap
+      // cannot send two hand-overs, and the roster repaints from the snapshot
+      // the server returns (which is what flips everyone's policy view).
+      if (!rooms.active) break;
+      const who = Number(d.dataset.user);
+      if (!Number.isInteger(who)) break;
+      d.disabled = true;
+      const label = d.textContent;
+      d.textContent = 'Handing over…';
+      const snap = await rooms.setHost(who);
+      if (!snap) {
+        d.disabled = false;
+        d.textContent = label;
+      }
+      break;
+    }
     case 'room-visibility': await setRoomVisibility(d.value); break;
     case 'room-control': await setRoomControl(d.value); break;
     case 'room-select':
       if (rooms.active) await rooms.command('select', { index: Number(d.index) });
       break;
     case 'room-queue-remove':
-      if (rooms.active) await rooms.command('queue-remove', { index: Number(d.index) });
+      if (rooms.active) {
+        // Remove by track id, not by position: the idempotent form is
+        // exactly-once (already gone is success) and cannot delete a neighbour
+        // when another member changed the queue under a retried request.
+        // `index` stays as the fallback for an old snapshot without ids.
+        if (d.videoId) await rooms.command('queue-remove', { videoId: d.videoId });
+        else await rooms.command('queue-remove', { index: Number(d.index) });
+      }
       break;
     case 'room-invite-user': await inviteUserById(Number(d.id)); break;
     case 'room-uninvite': await uninviteById(Number(d.id)); break;
@@ -4390,6 +5359,10 @@ document.addEventListener('click', async (e) => {
     case 'shuffle':
       state.shuffle = !state.shuffle;
       store.set('shuffle', state.shuffle);
+      // The armed plan holds one random *order*, baked in when it was built
+      // (public/queue-stream.js). Toggling shuffle mid-track without dropping it
+      // is how a locked phone plays the old order all night.
+      invalidateQueuePlan();
       notify(state.shuffle ? 'Shuffle on' : 'Shuffle off', 'info');
       updatePlayer();
       refreshOverlay();
@@ -4397,6 +5370,10 @@ document.addEventListener('click', async (e) => {
     case 'repeat':
       state.repeat = (state.repeat + 1) % 3;
       store.set('repeat', state.repeat);
+      // Same rule as shuffle, and worse when it is missed: a plan armed before
+      // repeat-one stays a whole-queue plan, and the reverse leaves one song
+      // looping until the listener comes back to the app.
+      invalidateQueuePlan();
       notify(['Repeat off', 'Repeat all', 'Repeat one'][state.repeat], 'info');
       updatePlayer();
       refreshOverlay();
@@ -4430,21 +5407,6 @@ document.addEventListener('click', async (e) => {
         notify(err.message, 'error');
         if (btn) { btn.disabled = false; btn.classList.remove('btn-loading'); btn.textContent = 'Try again'; }
       }
-      break;
-    }
-    case 'delete-playlist': {
-      const pl = state.playlists.find((p) => p.id === Number(id)) ?? state.collectionData;
-      confirmSheet({
-        title: 'Delete this playlist?',
-        text: `“${pl?.title ?? 'This playlist'}” and its ${pl?.trackCount ?? pl?.tracks?.length ?? 0} songs will be removed from sonora. Your YouTube account is untouched.`,
-        confirmLabel: 'Delete playlist', danger: true,
-        action: async () => {
-          await api(`/api/playlists/${id}`, { method: 'DELETE' });
-          await loadPlaylists();
-          notify('Playlist deleted');
-          navigate('library');
-        },
-      });
       break;
     }
     case 'nowplaying': openNow(null, el); break;
@@ -4493,6 +5455,15 @@ document.addEventListener('click', async (e) => {
     }
     case 'logout':
       await api('/api/auth/logout', { method: 'POST' }).catch(() => {});
+      // A reload alone leaves the previous account's data sitting in this
+      // browser for whoever signs in next: `sonora.searchRecent` is the raw
+      // queries they typed and `sonora.prefs` is their settings. Both belong to
+      // the account, so they go. Device-scoped keys stay, because they identify
+      // the browser and not the account: `sonora.deviceId` (the row the device
+      // list shows) and the PWA install/update snoozes (`sonora.pwa.*`, written
+      // by pwa.js) — clearing those would re-prompt on the very next visit.
+      store.remove('searchRecent');
+      store.remove('prefs');
       location.reload();
       break;
 
@@ -4730,6 +5701,9 @@ document.addEventListener('click', async (e) => {
     }
     default: break;
   }
+  } catch (err) {
+    notify(err?.message || 'Something went wrong. Try again.', 'error');
+  }
 });
 
 document.addEventListener('input', (e) => {
@@ -4745,6 +5719,13 @@ document.addEventListener('input', (e) => {
       $('search-results').innerHTML = searchBody();
       return;
     }
+    // `clearSearchShelves(null)` puts the results container into its loading
+    // state first, so the repaint below is the spinner and five skeleton rows —
+    // NOT the shelves: `searchBody()` returns early while `searchResults` is
+    // null, and the four shelves are only built by the debounced runSearch when
+    // an answer actually arrives. (The review filed this as a ~3,000-node
+    // repaint per keystroke; measured against this code it is ~35 nodes, which
+    // is why the immediate "Searching…" feedback stays.)
     clearSearchShelves(null);
     $('search-results').innerHTML = searchBody();
     searchTimer = setTimeout(runSearch, 380);
@@ -4753,21 +5734,30 @@ document.addEventListener('input', (e) => {
     // A drag is a human hand on the playhead: hold the room's correction loop
     // so it does not yank the slider back under the finger.
     if (rooms.active) rooms.hold(4000);
-    state.manualSeek = true;
-    // The `seeking` handler consumes this after the wrap test. Without it, a
-    // drag whose `change` never fires would leave `manualSeek` armed forever,
-    // and the queue would stop advancing at the end of every track.
-    state.lockSeek = true;
-    audio.currentTime = Number(t.value);
-    state.pendingResumeMs = 0;
-    state.lastTime = audio.currentTime;
+    if (state.streaming) {
+      // While the stream plays, a drag cannot seek per input event: each seek
+      // is a new source. Paint the bar under the finger and seek on release
+      // (the `change` handler below).
+      const dur = playerDuration() || 1;
+      document.querySelectorAll('input[data-slider="progress"]').forEach((x) => {
+        x.value = t.value;
+        x.style.setProperty('--percent', `${(Number(t.value) / dur) * 100}%`);
+      });
+      document.querySelectorAll('.elapsed').forEach((x) => { x.textContent = fmt(Number(t.value)); });
+      paintPlayerProgress(Number(t.value), dur);
+      return;
+    }
+    // seekTo is the one door: it knows whether the element is playing a track
+    // or the queue stream, and a raw `currentTime` write while streaming would
+    // jump inside the plan's timeline instead of the track's.
+    seekTo(Number(t.value));
     const dur = audio.duration || 1;
     document.querySelectorAll('input[data-slider="progress"]').forEach((x) => {
       x.value = t.value;
       x.style.setProperty('--percent', `${(Number(t.value) / dur) * 100}%`);
     });
     document.querySelectorAll('.elapsed').forEach((x) => { x.textContent = fmt(Number(t.value)); });
-    if (dur) $('player').style.setProperty('--progress', `${(Number(t.value) / dur) * 100}%`);
+    if (dur) paintPlayerProgress(Number(t.value), dur);
   }
   if (t.dataset.slider === 'volume') {
     state.volume = Number(t.value) / 100;
@@ -4775,8 +5765,14 @@ document.addEventListener('input', (e) => {
     audio.volume = state.volume;
     audio.muted = state.muted;
     t.style.setProperty('--percent', `${t.value}%`);
-    store.set('volume', state.volume);
-    store.set('muted', state.muted);
+    // A drag fires ~60 input events a second; a synchronous localStorage write
+    // on each one is a known source of drag jank on a phone. Persist on settle.
+    clearTimeout(volumeSaveTimer);
+    volumeSaveTimer = setTimeout(() => {
+      volumeSaveTimer = null;
+      store.set('volume', state.volume);
+      store.set('muted', state.muted);
+    }, 150);
   }
   if (t.id === 'admin-track-search') {
     state.admin.trackQuery = t.value;
@@ -4788,6 +5784,8 @@ document.addEventListener('input', (e) => {
 
 document.addEventListener('change', (e) => {
   if (e.target.dataset.slider === 'progress') {
+    // The drag painted while streaming; the release is the seek.
+    if (state.streaming) seekTo(Number(e.target.value));
     state.manualSeek = false;
     // The command is sent on release, not on every input event: a drag would
     // otherwise be a flood of seeks for everyone else in the room.
@@ -4798,8 +5796,8 @@ document.addEventListener('change', (e) => {
   }
 });
 
-$('now-overlay').addEventListener('click', (e) => { if (e.target.id === 'now-overlay') $('now-overlay').hidden = true; });
-$('yt-overlay').addEventListener('click', (e) => { if (e.target.id === 'yt-overlay') e.currentTarget.hidden = true; });
+$('now-overlay').addEventListener('click', (e) => { if (e.target.id === 'now-overlay') closeNow(); });
+$('yt-overlay').addEventListener('click', (e) => { if (e.target.id === 'yt-overlay') closeOverlay('yt-overlay'); });
 
 // File drop / picker for the cookie jar.
 document.addEventListener('change', async (e) => {
@@ -4837,7 +5835,7 @@ document.addEventListener('drop', async (e) => {
 document.addEventListener('click', (e) => {
   if (e.target.closest?.('#yt-drop')) $('yt-file')?.click();
 });
-$('drawer-overlay').addEventListener('click', (e) => { if (e.target.id === 'drawer-overlay') e.currentTarget.hidden = true; });
+$('drawer-overlay').addEventListener('click', (e) => { if (e.target.id === 'drawer-overlay') closeOverlay('drawer-overlay'); });
 
 document.addEventListener('keydown', (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
@@ -4875,8 +5873,11 @@ document.addEventListener('keydown', (e) => {
     || document.activeElement.isContentEditable;
   if (typing) return;
 
-  // Reorder the queue from the keyboard: Alt+↑ / Alt+↓ with focus on a row or on
-  // its grip. Plain arrows are left alone — they scroll the list.
+  // Reorder the queue from the keyboard: Alt+↑ / Alt+↓ with focus on a row or
+  // on its grip. Plain arrows are left alone — they scroll the list. This runs
+  // BEFORE the sheet guard below: reordering is a keyboard feature of the queue
+  // drawer and of the sheet's "Up next" tab, so focus inside a queue row is
+  // exactly where the keys must keep working while an overlay is open.
   const queueRowEl = document.activeElement.closest?.('[data-queue-row]');
   if (queueRowEl && e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
     e.preventDefault();
@@ -4884,6 +5885,14 @@ document.addEventListener('keydown', (e) => {
     reorderQueueRow(queueRowEl, e.key === 'ArrowUp' ? -1 : 1);
     return;
   }
+
+  // A modal sheet is open: the keys below are the sheet's to interpret, not
+  // the player's. The typing guard above only covers focused inputs, so `/`,
+  // `m`, `q`, Space and the arrows would otherwise navigate/switch tracks
+  // while a confirm or form sheet sits on top of the app (typing an unmached
+  // letter into a form that never focuses an input — a confirm sheet — is the
+  // reachable case). topOverlay() is the same state the Escape handler uses.
+  if (topOverlay()) return;
 
   // Elements that act as buttons but are not <button> still need Enter/Space.
   // A real <button> (the album cell inside a row, say) activates itself, and
@@ -4913,9 +5922,12 @@ document.addEventListener('keydown', (e) => {
   if (document.activeElement.tagName === 'BUTTON' && e.code === 'Space') return;
   if (e.code === 'Space' && !e.ctrlKey && !e.metaKey) { e.preventDefault(); playPause(); }
   if (e.key === 'ArrowRight' && e.altKey) { e.preventDefault(); nextTrack({ userInitiated: true }); }
-  if (e.key === 'ArrowLeft' && e.altKey) { e.preventDefault(); nextTrack({ back: true }); }
-  if (e.key === 'ArrowRight' && !e.altKey) { e.preventDefault(); if (audio.duration) seekTo(Math.min(audio.duration - 0.5, audio.currentTime + 5)); }
-  if (e.key === 'ArrowLeft' && !e.altKey) { e.preventDefault(); seekTo(Math.max(0, audio.currentTime - 5)); }
+  // `userInitiated` matches Alt+Right: an Alt+ArrowLeft is the same keyboard
+  // gesture (a deliberate skip) and must log the skip and claim the session
+  // the same way — the omission made the back-skip the one action that did not.
+  if (e.key === 'ArrowLeft' && e.altKey) { e.preventDefault(); nextTrack({ back: true, userInitiated: true }); }
+  if (e.key === 'ArrowRight' && !e.altKey) { e.preventDefault(); if (playerDuration()) seekTo(Math.min(playerDuration() - 0.5, playerPosition() + 5)); }
+  if (e.key === 'ArrowLeft' && !e.altKey) { e.preventDefault(); seekTo(Math.max(0, playerPosition() - 5)); }
   if (e.key.toLowerCase() === 'm') { e.preventDefault(); state.muted = !state.muted; audio.muted = state.muted; store.set('muted', state.muted); updatePlayer(); }
   if (e.key.toLowerCase() === 'q') { e.preventDefault(); openDrawer(); }
 });
@@ -4990,8 +6002,9 @@ document.addEventListener('pointercancel', () => { pressStart = null; clearTimeo
 //   * "Synced" is a measurement, not a promise — the badge shows the actual
 //     local-vs-room drift, because a label that is always green is worthless.
 //   * The room page is rebuilt only when its composition changes (track, queue,
-//     roster, policy). Progress and sync are patched in place, so a command from
-//     someone else never steals the invite field out from under the host.
+//     policy). Progress, sync and the roster are patched in place, so neither a
+//     command from someone else nor somebody joining steals the invite field out
+//     from under the host.
 
 const initialOf = (name) => String(name ?? '?').trim().charAt(0).toUpperCase() || '?';
 
@@ -5059,26 +6072,61 @@ let roomSig = '';
 function roomSignature() {
   const r = state.room;
   if (!r) return `none:${state.roomStatus}`;
+  // What has to be rebuilt, not what merely has to be right. The roster
+  // (member list, online flags, guest count) is deliberately absent: presence is
+  // the SSE connection, so it changes whenever anyone joins, leaves or locks
+  // their phone — often several times a minute — and rebuilding #page-root for
+  // that threw away the host's half-typed invite name and their cursor. Those
+  // are patched in place by patchRoomRoster() instead. Track, queue and policy
+  // changes stay here: they move the layout.
   return [
     r.code, r.ended ? 'ended' : '', r.joined ? 'in' : 'out', state.roomStatus,
     r.private ? 'locked' : '', r.track?.videoId ?? '', r.queue?.length ?? 0, r.index ?? 0,
     r.visibility ?? '', r.control ?? '', r.host?.id ?? '',
-    (state.roomMembers ?? []).map((m) => `${m.id}${m.online ? '*' : ''}`).join(','),
-    state.roomGuests ?? 0,
     (state.roomInvites ?? []).length,
     (state.roomPeople ?? []).map((p) => `${p.id}${p.member ? 'm' : p.invited ? 'i' : ''}`).join(','),
   ].join('|');
 }
 
+/** The roster people, from the live member list when there is one. */
+const roomRoster = () => (state.roomMembers.length ? state.roomMembers : (state.room?.members ?? []));
+const roomRosterGuests = () => (Number.isFinite(state.roomGuests) && state.roomGuests > 0
+  ? state.roomGuests : (state.room?.guests ?? 0));
+
+let roomRosterSig = '';
+const roomRosterSignature = () => `${roomRoster().map((m) => `${m.id}${m.online ? '*' : ''}`).join(',')}|${roomRosterGuests()}`;
+
+/**
+ * Patch the roster in place, the way patchRoomSync() patches the drift badge.
+ *
+ * A join, a leave, a phone locking: each of those is one chip and one number.
+ * Rebuilding the page for it was the difference between "the room updated" and
+ * "the name I was halfway through typing into Invite people just vanished".
+ */
+function patchRoomRoster() {
+  const sig = roomRosterSignature();
+  if (sig === roomRosterSig) return;
+  roomRosterSig = sig;
+  const people = roomRoster();
+  const row = document.querySelector('.room-page [data-room-people-row]');
+  if (row) row.innerHTML = roomPeopleRowHtml(people, roomRosterGuests());
+  const count = document.querySelector('.room-page [data-room-people-count]');
+  if (count) count.textContent = roomPeopleCount(people.length);
+}
+
 function paintRoom({ force = false } = {}) {
-  if (state.page !== 'room') { roomSig = ''; return; }
+  if (state.page !== 'room') { roomSig = ''; roomRosterSig = ''; return; }
   const sig = roomSignature();
   if (force || sig !== roomSig) {
     roomSig = sig;
     render();
+    // The rebuild just painted the roster as it is now; record that so the next
+    // presence change is the only thing that rewrites the row again.
+    roomRosterSig = roomRosterSignature();
     return;
   }
   patchRoomSync();
+  patchRoomRoster();
 }
 
 const roomSkeleton = () => `<section class="room-page" aria-busy="true">
@@ -5115,11 +6163,34 @@ function roomEndedPage() {
   </section>`;
 }
 
-const roomPersonChip = (m) => `<span class="room-person${m.online ? ' is-online' : ''}${m.role === 'host' ? ' is-host' : ''}">
+/**
+ * One person in the room.
+ *
+ * `canPromote` adds the hand-over control, and is passed only from the room
+ * sheet and only for the host looking at somebody else. It exists because a
+ * `control: 'host'` room is unskippable, unpausable and unendable for everyone
+ * but the host: without a way to give the seat away, a group whose host walked
+ * off was stuck with the room until housekeeping deleted it.
+ */
+const roomPersonChip = (m, { canPromote = false } = {}) => `<span class="room-person${m.online ? ' is-online' : ''}${m.role === 'host' ? ' is-host' : ''}">
   <span class="room-avatar" aria-hidden="true">${esc(initialOf(m.name))}</span>
   <span class="room-person-name">${esc(m.name)}</span>
   ${m.role === 'host' ? '<span class="room-host-tag">HOST</span>' : ''}
-  <span class="sr-only">${m.online ? 'listening now' : 'offline'}</span></span>`;
+  <span class="sr-only">${m.online ? 'listening now' : 'offline'}</span></span>${canPromote
+  ? `<button type="button" class="room-promote" data-action="room-make-host" data-user="${esc(m.id)}">Make host</button>` : ''}`;
+
+/**
+ * The chips of "In the room", plus the anonymous listeners behind the code.
+ *
+ * Shared by the page and by `patchRoomRoster()` so the two can never disagree
+ * about what a roster looks like.
+ */
+function roomPeopleRowHtml(people, guests) {
+  return `${people.map(roomPersonChip).join('')}${guests > 0
+    ? `<span class="room-person is-guest"><span class="room-avatar" aria-hidden="true">+${guests}</span><span class="room-person-name">listening as guests</span></span>` : ''}`;
+}
+
+const roomPeopleCount = (n) => `${n} ${n === 1 ? 'person' : 'people'}`;
 
 function roomQueueRows(room) {
   const queue = room.queue ?? [];
@@ -5139,7 +6210,8 @@ function roomQueueRows(room) {
         <span class="room-queue-text"><strong>${esc(x.title)}</strong><span>${esc(x.channel ?? '')}</span></span>
         <span class="duration">${fmt(x.durationS)}</span></button>
       ${i === room.index || locked ? '' : `<button class="icon-btn room-queue-remove" data-action="room-queue-remove"
-        data-index="${i}" aria-label="Remove ${esc(x.title)} from the queue">${icon('close', 'sm')}</button>`}
+        data-video-id="${esc(x.videoId)}" data-index="${i}"
+        aria-label="Remove ${esc(x.title)} from the queue">${icon('close', 'sm')}</button>`}
     </li>`).join('')}</ol>`;
 }
 
@@ -5236,9 +6308,8 @@ function roomLivePage(room) {
     </div>
     <div class="room-people">
       <div class="room-section-head"><strong>In the room</strong>
-        <span>${people.length} ${people.length === 1 ? 'person' : 'people'}</span></div>
-      <div class="room-people-row">${people.map(roomPersonChip).join('')}${(state.roomGuests ?? room.guests ?? 0) > 0
-    ? `<span class="room-person is-guest"><span class="room-avatar" aria-hidden="true">+${state.roomGuests ?? room.guests}</span><span class="room-person-name">listening as guests</span></span>` : ''}</div>
+        <span data-room-people-count>${roomPeopleCount(people.length)}</span></div>
+      <div class="room-people-row" data-room-people-row>${roomPeopleRowHtml(people, state.roomGuests ?? room.guests ?? 0)}</div>
     </div>
     <div class="room-queue">
       <div class="room-section-head"><strong>Up next</strong><span>${room.queue?.length ?? 0} tracks</span></div>
@@ -5255,8 +6326,12 @@ function roomPage() {
   // a page that failed to load. A skeleton here would never resolve.
   if (!room && state.roomStatus === 'idle') return roomEndedPage();
   if (!room) return roomSkeleton();
-  if (state.roomStatus === 'ended' || room.ended) return roomEndedPage();
+  // 'private' must be tested before 'ended': a snapshot can carry both (a
+  // private room that was later ended), and the signed-in app polls its way
+  // into 403 PRIVATE snapshots — the visitor must see the locked gate, not a
+  // page that tells them the room is over (they cannot verify that).
   if (state.roomStatus === 'private' || room.private) return roomGate({ locked: true, code });
+  if (state.roomStatus === 'ended' || room.ended) return roomEndedPage();
   if (!room.joined) return roomGate({ code, room });
   return roomLivePage(room);
 }
@@ -5320,12 +6395,16 @@ function roomCreateHtml() {
 
 function roomSheetHtml(room) {
   const url = `${location.origin}${room.link ?? `/l/${room.code}`}`;
+  const people = state.roomMembers.length ? state.roomMembers : (room.members ?? []);
+  const iAmHost = room.host?.id === state.user?.id;
   return `<button class="modal-close" data-action="close-form" aria-label="Close">${icon('close')}</button>
     <div class="form-body"><span class="eyebrow">Listening together</span>
       <h2>${esc(room.host?.name ?? 'Someone')}’s room</h2>
       <p class="form-desc"><span data-room-sync="${roomSyncState()}">${esc(roomSyncLabel())}</span>
         · <b data-room-online>${onlineCount()}</b> listening</p>
-      <div class="room-people-row room-sheet-people">${(state.roomMembers.length ? state.roomMembers : (room.members ?? [])).map(roomPersonChip).join('')}</div>
+      <div class="room-people-row room-sheet-people">${people.map((m) => roomPersonChip(m, {
+    canPromote: Boolean(iAmHost) && m.role !== 'host',
+  })).join('')}</div>
       <div class="room-link-row"><input readonly value="${esc(url)}" aria-label="Room link">
         <button class="secondary-btn" data-action="room-copy">Copy</button></div>
       <div class="form-actions">
@@ -5588,6 +6667,404 @@ function rememberedRoom() {
 }
 
 
+// ── the queue as one continuous stream ──────────────────────────────────
+//
+// Everything above assumes the page is awake at the end of a track. On a locked
+// iPhone it is not: WebKit suspends the web process while the media process
+// keeps playing, so `timeupdate` stops arriving, the loop wrap is never seen,
+// and the queue stops at the end of the current song. The production log has
+// it exactly (PLAN.md finding #6): the last save this app made was the
+// `visibilitychange` one at the instant of locking, the track boundary 26 s
+// later produced no /api/events `complete` and no next /api/stream request, and
+// nothing else arrived all night.
+//
+// The only thing that crosses that boundary with no script running is a media
+// resource that already contains the next tracks. So while the page is hidden
+// the element plays `/api/queue-stream/:token` — the queue concatenated by the
+// server into one fragmented MP4 — and it is handed back to the per-track
+// player, at whatever the music actually reached, when the page is visible
+// again. public/queue-stream.js owns the mapping; src/queue-stream.js owns the
+// stream.
+//
+// Scope, deliberately:
+//   * iOS only. Android and desktop keep the per-track handoff, which works
+//     there: their hidden pages still deliver `timeupdate`, so swapping the
+//     source again for no reason would only insert a gap.
+//   * Not in a room. The room's playhead is the server's, and a locally
+//     generated stream would fight every snapshot the room sends.
+//   * Every queue mode otherwise: queue order, shuffle and repeat-one all get a
+//     plan (public/queue-stream.js explains what each becomes). An earlier
+//     version skipped shuffle and repeat-one, which left exactly the listeners
+//     most likely to leave the phone locked with no protection at all.
+
+const queueStreamDevice = freezesWhenHidden(deviceName);
+/** Reported with every diagnostic, so a log line names the build that wrote it. */
+const CLIENT_BUILD = 'queue-stream-14';
+/** How long the stream gets to prove it is playing before the player reverts. */
+const QUEUE_STREAM_HEALTH_MS = 4000;
+
+/**
+ * Tell the server what the hidden-playback path decided.
+ *
+ * A PWA on a locked phone has no remote console, and this feature is invisible
+ * by nature: the plan is armed minutes before it is used, and the moment it
+ * matters the page is not running. Without this, "it still does not work" is
+ * unanswerable from the server (the previous round had to guess between three
+ * explanations). Best-effort by construction: diagnostics must never interfere
+ * with playback, so every failure here is swallowed.
+ */
+const clientReportAt = new Map();
+function clientReport(event, detail = {}) {
+  // The arming path runs on every track start; repeating the same verdict once
+  // a minute is plenty to see what a device is doing, and keeps the log quiet.
+  const key = `${event}:${detail.reason ?? detail.ok ?? ''}`;
+  const now = Date.now();
+  // A success (or a leave/error) is always worth seeing; a repeated *failure*
+  // — the convergence below can retry every timeupdate — is not.
+  const always = detail.ok === true || event === 'live-leave' || event === 'live-error';
+  if (!always && now - (clientReportAt.get(key) ?? 0) < 60_000) return;
+  clientReportAt.set(key, now);
+  try {
+    fetch('/api/client-report', {
+      method: 'POST', credentials: 'same-origin', keepalive: true,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        event,
+        build: CLIENT_BUILD,
+        device: deviceName,
+        room: Boolean(rooms.active),
+        shuffle: Boolean(state.shuffle),
+        repeat: state.repeat,
+        queue: state.queue.length,
+        index: state.index,
+        playing: Boolean(state.playing),
+        ...detail,
+      }),
+    }).catch(() => {});
+  } catch { /* never break playback for a diagnostic */ }
+}
+
+/**
+ * Ask the server for a plan built from the queue as it is right now.
+ *
+ * Called from every track start, so the plan is already in hand when the phone
+ * locks — the moment the page is hidden is the one moment there is no time for
+ * a round trip. A failure is silent on purpose: the caller falls back to the
+ * per-track player, which is exactly what the app did before this existed.
+ */
+async function armQueueStream() {
+  // Not iOS: the per-track handoff works, so there is nothing to report.
+  if (!queueStreamDevice) { state.queuePlan = null; return; }
+  // This page already learned its engine cannot play the stream. Do not keep
+  // swapping the listener's track out for silence.
+  if (state.streamBlocked) { state.queuePlan = null; return; }
+  if (rooms.active) { state.queuePlan = null; clientReport('live-skip', { reason: 'room' }); return; }
+  const ids = planTrackIds({
+    queue: state.queue, index: state.index, shuffle: state.shuffle, repeatOne: state.repeat === 2,
+  });
+  if (!ids.length) { state.queuePlan = null; clientReport('live-skip', { reason: 'no-queue' }); return; }
+  // Already armed for this track: `playing` and `playIndex` both call this, and
+  // a fresh plan for the same track buys nothing.
+  if (state.queuePlan?.firstId === ids[0] && Date.now() - state.queuePlan.at < 30_000) return;
+  // The previous plan is deliberately kept while this one is in flight: it is
+  // still a timeline over the same queue, and the screen may lock in the
+  // milliseconds before the answer arrives (which is exactly what happened on
+  // the first device test after this shipped).
+  const firstId = ids[0];
+  try {
+    const res = await fetch('/api/queue-stream/plan', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ids }),
+    });
+    if (!res.ok) { clientReport('live-plan', { ok: false, status: res.status, asked: ids.length }); return; }
+    const plan = await res.json().catch(() => null);
+    // The track may have moved on while the request was in flight; a plan whose
+    // first track is not the one playing would start the wrong song.
+    if (!plan?.token || !Array.isArray(plan.tracks) || !plan.tracks.length) {
+      clientReport('live-plan', { ok: false, reason: 'empty', asked: ids.length });
+      return;
+    }
+    if (state.streaming) return;
+    state.queuePlan = { token: plan.token, tracks: plan.tracks, firstId, at: Date.now() };
+    clientReport('live-plan', { ok: true, asked: ids.length, tracks: plan.tracks.length });
+    // Armed while the page is already hidden (a track that started after the
+    // screen locked): converge onto the stream now, while this page still runs.
+    if (document.visibilityState === 'hidden') enterQueueStream();
+  } catch (err) {
+    // Offline, or a server that predates the endpoint.
+    clientReport('live-plan', { ok: false, error: String(err?.name ?? err) });
+  }
+}
+
+/**
+ * Forget the armed queue-stream plan because the queue or the mode just changed.
+ *
+ * `planTrackIds` bakes the playback mode into the plan at arm time
+ * (public/queue-stream.js): a repeat-one plan carries the current track alone,
+ * a shuffle plan carries one particular random order. So a plan armed before a
+ * shuffle/repeat toggle keeps describing an order the player is no longer
+ * playing: repeat-one armed on a locked phone then loops one song all night,
+ * shuffle turned on mid-track locks the old order in, and a removed row keeps
+ * playing because the stream still contains it. Dropping the plan is what makes
+ * the next enterQueueStream — or the hidden arm path, or the re-arm below —
+ * rebuild it from the queue and mode as they are now.
+ */
+function invalidateQueuePlan() {
+  state.queuePlan = null;
+  // While the stream is live the plan is already committed to the element's
+  // URL; there is nothing to arm until playback leaves the stream, and
+  // enterQueueStream returns early while `streaming` is set anyway.
+  if (state.streaming) return;
+  // Re-arm now rather than at the next `playing`: the screen can lock between
+  // this tap and the next track start, and the hidden convergence has no plan to
+  // work with until one lands. armQueueStream itself is a no-op off-device, in a
+  // room, or once the engine has refused the stream.
+  if (document.visibilityState === 'visible' && !state.streamBlocked) void armQueueStream();
+}
+
+/**
+ * Hand the element the whole queue. Called on the way into the background,
+ * while the page is still running: from here on nothing has to run at a track
+ * boundary for the music to continue.
+ */
+function enterQueueStream() {
+  const plan = state.queuePlan;
+  const t = current();
+  if (state.streamBlocked) return false;
+  if ((state.streamCooldownUntil ?? 0) > Date.now()) return false;
+  if (state.streaming) return true;
+  if (!plan) { clientReport('live-enter', { ok: false, reason: 'no-plan' }); return false; }
+  if (!t?.videoId) { clientReport('live-enter', { ok: false, reason: 'no-track' }); return false; }
+  if (!state.playing || audio.paused) {
+    clientReport('live-enter', { ok: false, reason: audio.paused ? 'paused' : 'not-playing' });
+    return false;
+  }
+  // The plan is a timeline over the queue, so the stream can start at the
+  // current track's position *anywhere* in it — not only where it was armed.
+  // That is what keeps this working when the lock lands between a track change
+  // and the next plan.
+  const offsetMs = Math.max(0, Math.round((Number(audio.currentTime) || 0) * 1000));
+  const atMs = planOffsetFor(plan.tracks, t.videoId, offsetMs);
+  if (atMs == null) {
+    clientReport('live-enter', { ok: false, reason: 'not-in-plan', now: t.videoId });
+    return false;
+  }
+  state.streaming = { token: plan.token, tracks: plan.tracks, startMs: atMs, videoId: t.videoId };
+  state.streamLoadAt = Date.now();
+  state.streamPlayedOnce = false;
+  state.streamTrack = t.videoId;
+  state.streamOffsetMs = offsetMs;
+  state.streamDurationMs = Math.round((Number(t.durationS) || 0) * 1000);
+  // The stream is the queue: the element must not loop it, and the wrap
+  // detector that normally advances the queue has nothing to see in it.
+  audio.loop = false;
+  state.switching = true;
+  state.manualSeek = false;
+  state.lockSeek = false;
+  state.sourceStarted = false;
+  state.lastTime = 0;
+  // Same rule as a hidden track swap in playIndex: this is the moment the
+  // web-process category cache and a fresh GPU-side session are most likely to
+  // disagree, so force the pair through before the new source is assigned.
+  repairAudioSession({ force: true });
+  state.streamSeekNonce = (state.streamSeekNonce ?? 0) + 1;
+  audio.src = streamSrc(plan.token, atMs, state.streamSeekNonce);
+  // No pause first: on a locked phone a pause is where iOS takes the audio
+  // session away (public/playback.js). This is the same playing → src → play
+  // transition a lock-screen "next" makes.
+  audio.play().catch((err) => {
+    clientReport('live-enter', { ok: false, reason: 'play-rejected', error: String(err?.name ?? err) });
+    // An interruption (another app grabbing the audio output — Discord, a call,
+    // Siri) rejects this play() and leaves the element paused. `switching` must
+    // not stay armed: the pause handler treats an armed swap as "not the
+    // listener" and so refuses to record that a resume is owed, and a paused
+    // element fires no `timeupdate`, so nothing would ever retry. Measured:
+    // switching apps ended the stream and the music never came back.
+    if (err?.name === 'AbortError' || err?.name === 'NotAllowedError') {
+      state.switching = false;
+      if (document.visibilityState === 'hidden' && !state.userPause) {
+        state.resumeOnVisible = true;
+      }
+      return;
+    }
+    if (err?.name === 'NotSupportedError') {
+      // The engine will not play this stream at all. Count it like any other
+      // failure (two in a row gives up), and hand playback back right here:
+      // this rejection can arrive without the element's own `error` event, and
+      // an element left pointing at an unsupported source is simply silent.
+      state.streamFails = (state.streamFails ?? 0) + 1;
+      if (state.streamFails >= 2) {
+        state.streamBlocked = true;
+        clientReport('live-blocked', { reason: 'not-supported', fails: state.streamFails });
+      } else {
+        state.streamCooldownUntil = Date.now() + 15_000;
+      }
+      state.queuePlan = null;
+      leaveQueueStream();
+    }
+  });
+  nowPlaying.sync({ force: true });
+  state.streamFails = 0;
+  clientReport('live-enter', { ok: true, atMs, tracks: plan.tracks.length, src: audio.src.slice(0, 80) });
+  // The stream has to *prove* it plays. WebKit can accept a source and then
+  // never decode it, and the listener is usually already gone by the time that
+  // would show up — silently, with the Now Playing widget empty. A couple of
+  // seconds of watching, while the page is still awake, is the only chance to
+  // tell the difference; if it is not playing, hand playback back to the
+  // per-track element (which at worst keeps the current song going) and say so.
+  clearTimeout(state.streamWatch);
+  const watching = plan.token;
+  state.streamWatch = setTimeout(() => {
+    if (!state.streaming || state.streaming.token !== watching) return;
+    // Never judge a hidden page. iOS suspends the web process: timers fire
+    // late and the element's JS-visible readyState/currentTime are frozen at
+    // their lock-time values, so a check that runs here always reads
+    // "stalled" — and reverts a stream the media process is playing fine
+    // (measured: segments kept arriving for 20 s, then a late timer killed
+    // it). The check exists to catch a dead swap while the page is awake.
+    if (document.visibilityState === 'hidden') return;
+    // A stream that has played at all is not stalled, whatever it reads now.
+    if (state.streamPlayedOnce) return;
+    // HAVE_FUTURE_DATA means the element has enough to keep playing; a small
+    // non-zero playhead is the same proof from the other side.
+    const ok = !audio.paused && !audio.error && (audio.readyState >= 3 || audio.currentTime > 0.2);
+    if (ok) return;
+    clientReport('live-stalled', {
+      readyState: audio.readyState, paused: audio.paused,
+      error: audio.error?.code ?? null, time: Number(audio.currentTime) || 0,
+    });
+    state.queuePlan = null;
+    leaveQueueStream();
+  }, QUEUE_STREAM_HEALTH_MS);
+  return true;
+}
+
+/**
+ * Hand playback back to the per-track player, at the position the music
+ * actually reached. `offsetMs` overrides that position (a seek: the bar the
+ * listener dragged was the mapped track's, so the target is a track offset).
+ */
+function leaveQueueStream({ offsetMs = null } = {}) {
+  const live = state.streaming;
+  if (!live) return false;
+  clearTimeout(state.streamWatch);
+  state.streamWatch = null;
+  // Clamped by the same wall-clock ceiling as the playhead mapping: leaving on
+  // a bogus reading used to resume the per-track player minutes into a track
+  // the listener had never reached.
+  const elapsedSec = streamElapsedSeconds();
+  const elapsed = Math.max(0, Math.round((elapsedSec ?? 0) * 1000));
+  const mapped = elapsedSec === null ? null : locate(live.tracks, live.startMs + elapsed);
+  // The server keeps a session (and an ffmpeg tail) per plan token until it
+  // goes idle; a client that leaves and re-enters with fresh plans would stack
+  // them into the per-user cap and get 429s. Closing on the way out is one
+  // keepalive fetch, and it is the difference between "skip works" and "the
+  // fourth skip kills the stream".
+  try {
+    fetch(streamSrc(live.token, 0), { method: 'DELETE', credentials: 'same-origin', keepalive: true }).catch(() => {});
+  } catch { /* leaving must never throw */ }
+  state.streaming = null;
+  state.streamTrack = null;
+  state.streamOffsetMs = 0;
+  state.streamDurationMs = 0;
+  audio.loop = true;
+  const target = mapped ?? { videoId: live.videoId, offsetMs: 0 };
+  const index = state.queue.findIndex((x) => x.videoId === target.videoId);
+  const resumeMs = offsetMs == null ? target.offsetMs : Math.max(0, Math.round(Number(offsetMs) || 0));
+  clientReport('live-leave', {
+    elapsedMs: elapsed, track: target.videoId, index, offsetMs: resumeMs,
+    found: index >= 0, seekOverride: offsetMs != null,
+  });
+  // A resume into a track is a deliberate seek: without these the swap looks
+  // exactly like a loop wrap and the queue would advance twice.
+  state.manualSeek = false;
+  state.lockSeek = false;
+  state.sourceStarted = false;
+  state.lastTime = 0;
+  playIndex(index >= 0 ? index : state.index, { resumeMs });
+  return true;
+}
+
+/**
+ * Keep the player honest while the queue stream plays.
+ *
+ * Usually the page is frozen and this never runs. When it does — an unlock that
+ * has not happened yet, a desktop-sized viewport, a background tab on another
+ * engine — the mapped track is the truth: move `state.index` to it, name it on
+ * the lock screen, and let the bar draw the track's own progress rather than
+ * three hours of stream.
+ */
+/**
+ * How long the current stream load has been running, in seconds of wall clock.
+ *
+ * The element's clock can only ever advance as fast as real time, so this is a
+ * hard ceiling on any `currentTime` reading. An engine that reports the raw
+ * segment PTS instead of elapsed-since-load (WebKit did, while the segments
+ * were stamped with absolute plan positions) reads as minutes of playback in
+ * the first second — and the client then "maps" that to a track the listener
+ * is nowhere near, walking the playhead further off on every cycle until the
+ * element runs past its window and ends. Measured on the device: the mapped
+ * position compounding 152 s -> 999 s -> 5376 s across three re-entries.
+ */
+function streamWallSeconds() {
+  const at = Number(state.streamLoadAt) || 0;
+  return at > 0 ? Math.max(0, (Date.now() - at) / 1000) : 0;
+}
+
+/**
+ * The stream's elapsed seconds, or null when the reading is impossible.
+ *
+ * `SLACK_S` covers a buffered element running slightly ahead of the wall clock
+ * plus timer slop; anything beyond that is a bogus reading, not playback.
+ */
+const STREAM_CLOCK_SLACK_S = 30;
+function streamElapsedSeconds() {
+  const ct = Number(audio.currentTime) || 0;
+  if (!(ct >= 0)) return null;
+  const wall = streamWallSeconds();
+  if (wall > 0 && ct > wall + STREAM_CLOCK_SLACK_S) {
+    clientReport('live-skew', { time: +ct.toFixed(2), wall: +wall.toFixed(2) });
+    return null;
+  }
+  return ct;
+}
+
+function applyStreamPosition() {
+  const live = state.streaming;
+  if (!live) return false;
+  const elapsed = streamElapsedSeconds();
+  // An impossible clock reading is ignored rather than believed: mapping it
+  // would move `state.index` to a track nobody is hearing and re-arm the plan
+  // from there, which is how one bad reading became three.
+  if (elapsed === null) return true;
+  if (elapsed > 0.5) state.streamPlayedOnce = true;
+  const at = locate(live.tracks, live.startMs + Math.round(elapsed * 1000));
+  if (!at) return true;
+  state.streamDurationMs = Number(live.tracks[at.index]?.durationMs) || 0;
+  if (at.videoId && at.videoId !== state.streamTrack) {
+    // A track finished inside the stream. Log it as played through — at its own
+    // end, which is where the listener heard it finish — before the playhead
+    // moves to the new one.
+    state.streamOffsetMs = Math.max(0, Math.round((Number(current()?.durationS) || 0) * 1000)) || state.streamOffsetMs;
+    log('complete');
+    state.streamTrack = at.videoId;
+    const index = state.queue.findIndex((x) => x.videoId === at.videoId);
+    if (index >= 0) state.index = index;
+    state.playing = true;
+    state.streamOffsetMs = at.offsetMs;
+    log('start');
+    nowPlaying.sync({ metadata: true, force: true });
+    announceNowPlaying(current());
+    warmNext();
+    maybeExtendStation();
+    updatePlayer();
+  } else {
+    state.streamOffsetMs = at.offsetMs;
+  }
+  return true;
+}
+
 // ── iOS audio session plumbing ──────────────────────────────────────────
 /**
  * A deliberate seek. Marking it is what keeps the loop-wrap detector from
@@ -5597,6 +7074,13 @@ function rememberedRoom() {
  */
 function seekTo(seconds) {
   const to = Math.max(0, Number(seconds) || 0);
+  // While the queue stream plays, a seek is a track offset *inside the plan*:
+  // the element gets the same session at a new position. Leaving the stream
+  // and re-entering instead loses the seek — the re-entry reads the element's
+  // clock before the per-track resume has landed, and a suspended page (a
+  // locked phone after its grace period) never gets to finish the hand-back
+  // at all.
+  if (state.streaming) { seekStreamTo(to); return; }
   state.pendingResumeMs = 0;
   state.manualSeek = true;
   state.lockSeek = true;
@@ -5604,12 +7088,54 @@ function seekTo(seconds) {
   audio.currentTime = to;
 }
 
+/**
+ * Move the playhead inside the live queue stream.
+ *
+ * Same session, same plan, new position: `streamSrc(token, at, k)` with a fresh
+ * `k` tells the server to slide its playlist window to `at` (the window
+ * otherwise follows what the listener consumes), and the element restarts from
+ * the segment that holds the target. No leave/re-enter round trip, so nothing
+ * can read a stale clock in between.
+ */
+function seekStreamTo(seconds) {
+  const live = state.streaming;
+  const t = current();
+  const offsetMs = Math.max(0, Math.round((Number(seconds) || 0) * 1000));
+  const atMs = planOffsetFor(live.tracks, t?.videoId, offsetMs);
+  if (atMs == null || !t) {
+    // The track is not in this plan (a station that regenerated, say): fall
+    // back to the per-track player, which can always seek its own file.
+    leaveQueueStream({ offsetMs });
+    return;
+  }
+  state.streamSeekNonce = (state.streamSeekNonce ?? 0) + 1;
+  state.manualSeek = true;
+  state.lockSeek = true;
+  state.lastTime = 0;
+  // The element's clock restarts at zero on the new source, and it is at `atMs`
+  // in the plan: that pair is the mapping applyStreamPosition reads.
+  live.startMs = atMs;
+  state.streamLoadAt = Date.now();
+  state.streamTrack = t.videoId;
+  state.streamOffsetMs = offsetMs;
+  state.streamDurationMs = Math.round((Number(t.durationS) || 0) * 1000);
+  state.streamPlayedOnce = false;
+  repairAudioSession({ force: true });
+  audio.src = streamSrc(live.token, atMs, state.streamSeekNonce);
+  audio.play().catch(() => {});
+  nowPlaying.sync({ force: true });
+  updatePlayer();
+  clientReport('live-seek', { atMs, offsetMs, k: state.streamSeekNonce });
+}
+
 audio.loop = true;
 audio.volume = state.volume;
 audio.muted = state.muted;
 bindSheetSwipe();
 
-boot();
+// boot() runs once at the very end of this module (after `nowPlaying` exists).
+// Calling it here as well made every boot request, render and session restore
+// happen twice.
 
 // The lock screen is its own renderer: it needs metadata, an artwork URL it is
 // allowed to fetch, and an explicit position state before it will draw a seek
@@ -5618,6 +7144,9 @@ const nowPlaying = createMediaSession({
   audio,
   base: location.href,
   getTrack: () => current(),
+  // The lock screen draws the *track* the listener is on, not the queue stream
+  // the element happens to be playing (see playerPosition/playerDuration).
+  clock: { position: playerPosition, duration: playerDuration },
   // Preload the art so the lock screen never has to do a cold fetch.
   warmArtwork: (src) => { const img = new Image(); img.src = src; },
   handlers: {
@@ -5633,11 +7162,49 @@ const nowPlaying = createMediaSession({
       // interruption, it must not be undone when the page becomes visible.
       state.userPause = true;
       state.resumeOnVisible = false;
+      state.resumeWanted = false;
       if (rooms.active) {
         rooms.command('pause', { positionMs: Math.round((audio.currentTime || 0) * 1000) });
         return;
       }
+      // A deliberate pause ends any swap in flight, exactly as the transport's
+      // own pause button does: leaving the marker armed would keep the media
+      // widget saying `playing` over a paused track, and would make the paused
+      // save below look like a source swap and skip it.
+      state.switching = false;
       audio.pause();
+    },
+    /**
+     * The OS's own stop (a car head unit, a Bluetooth long-press, Android's
+     * "stop" on the notification). Unlike pause this ends the session, so it is
+     * the one action that must also take the Now Playing widget away instead of
+     * leaving it claiming a live player over silence — the same lie the failure
+     * cap told before `stopped()` existed.
+     */
+    stop: () => {
+      // The listener's decision in both directions: nothing may resume it when
+      // the page comes back, and nothing may retry it.
+      state.userPause = true;
+      state.resumeOnVisible = false;
+      state.resumeWanted = false;
+      state.resumeAttempts = 0;
+      state.switching = false;
+      state.playing = false;
+      // Deliberately not leaveQueueStream(): that hands playback back to the
+      // per-track element at the mapped position, which is a resume, not a stop.
+      // Tear the stream bookkeeping down here instead, and restore the loop flag
+      // the stream had to clear (enterQueueStream): a per-track source loops.
+      clearTimeout(state.streamWatch);
+      state.streamWatch = null;
+      state.streaming = null;
+      state.streamTrack = null;
+      state.streamOffsetMs = 0;
+      state.streamDurationMs = 0;
+      state.queuePlan = null;
+      audio.loop = true;
+      audio.pause();
+      nowPlaying.stopped();
+      updatePlayer();
     },
     previoustrack: () => {
       if (rooms.active) {
@@ -5648,7 +7215,14 @@ const nowPlaying = createMediaSession({
         return;
       }
       claimSession();
-      if (audio.currentTime > 3) seekTo(0);
+      if (playerPosition() > 3) seekTo(0);
+      // At the top of a track, "previous" must stay inside the queue stream.
+      // `nextTrack({ back: true })` leaves the stream and cold-loads a per-track
+      // source, which is the one transition a hidden page may not survive: the
+      // page is usually frozen, so nothing starts the new source and the music
+      // stops until the app is opened. Restart the streamed track instead —
+      // same session, same plan, a seek to its own beginning.
+      else if (state.streaming) seekStreamTo(0);
       else nextTrack({ back: true, userInitiated: true });
     },
     nexttrack: () => {
@@ -5662,7 +7236,20 @@ const nowPlaying = createMediaSession({
     // consumes it, so a stale flag can never disarm the wrap that advances
     // the queue at the end of a track.
     onSeekStart: () => { state.pendingResumeMs = 0; state.manualSeek = true; state.lockSeek = true; },
-    onSeekEnd: () => { state.lastTime = audio.currentTime; updatePlayer(); },
+    // The lock screen's scrubber describes the mapped track while the queue
+    // stream plays, so that seek has to leave the stream and land in the track.
+    // Returning true means this callback already moved playback.
+    onSeek: (seconds) => {
+      if (!state.streaming) return false;
+      seekStreamTo(seconds);
+      return true;
+    },
+    onSeekEnd: () => { state.lastTime = playerPosition(); updatePlayer(); },
+    // The `pause` a src swap emits is not a listener pause, so the lock screen
+    // must not be told playback stopped — see media-session.js `sync`. A pause
+    // the listener made *during* a swap is still theirs, which is the same rule
+    // the transport uses two lines into the `pause` handler below.
+    isSwitching: () => state.switching && !state.userPause,
   },
 });
 
@@ -5672,18 +7259,32 @@ const nowPlaying = createMediaSession({
  * guard makes the pair idempotent, so one wrap can never skip two tracks.
  */
 function endTrack() {
-  if (state.ending) return;
+  // While the queue stream plays there is no per-track boundary to react to:
+  // the boundary is inside the server's stream, and advancing the queue here
+  // would swap the source out from under a page that is (usually) frozen.
+  if (state.streaming) return;
+  // In a room, `ending` stays armed as the wrap guard (the still-looping
+  // element re-detects the wrap on every timeupdate); the roomNextAt cool-down
+  // is what retries a failed auto-next, slowly, instead of on every wrap.
+  if (rooms.active) {
+    if (Date.now() - (state.roomNextAt ?? 0) < ROOM_AUTO_NEXT_COOLDOWN_MS) return;
+  } else if (state.ending) return;
+  // A retry inside the same room wrap must not log another 'complete' — the
+  // station counts those as played-through seeds — and the non-room path
+  // logs exactly once per wrap.
+  if (!state.ending) log('complete');
   state.ending = true;
-  // Pause first: pausing does not close the audio session, a natural end does.
-  audio.pause();
-  log('complete');
   if (rooms.active) {
     // The room decides what plays next. This is a natural continuation, which
     // any member may trigger, so a host with a locked phone cannot freeze the
     // group on the last second of a track.
-    state.ending = false;
-    state.playing = false;
-    updatePlayer();
+    // Transport truth: the element is still audibly looping the finished
+    // track until the room's snapshot lands (loadRoomTrack reads the
+    // snapshot's own playing state), so `playing` must keep saying so —
+    // painting a pause here would make the bar, the lock screen and the room
+    // pill lie for the whole round trip, and pausing the element is what
+    // surrenders the iOS audio session on a locked phone.
+    state.roomNextAt = Date.now();
     rooms.command('next', { auto: true });
     return;
   }
@@ -5695,16 +7296,35 @@ function endTrack() {
     return;
   }
   // Switch inside this event, not in a timer — background timers are delayed.
-  nextTrack();
+  // While the page is hidden the old source is deliberately *not* paused: a
+  // pause on a backgrounded phone is where iOS drops the audio session, and the
+  // next track then plays into a dead session (silent, with an emptying Now
+  // Playing widget) until the listener returns to the app. `handoffTrack`
+  // carries the whole argument, including why the manual "next" path — which
+  // never pauses — is the behaviour to match.
+  handoffTrack({
+    pause: () => audio.pause(),
+    next: nextTrack,
+    background: document.visibilityState === 'hidden',
+  });
 }
+
+/** One room auto-next per wrap retry: failed commands are re-sent, slowly. */
+const ROOM_AUTO_NEXT_COOLDOWN_MS = 3000;
 
 // Belt and braces: with `loop` on, `ended` should never fire, and on iOS it
 // must not (a natural end closes the audio session). If an engine still emits
 // it, advancing here is better than stopping on the last second of a track.
 // `switching` filters a stale `ended` that arrives while the next source loads.
-audio.addEventListener('ended', () => { if (!state.switching) endTrack(); });
+// A stream that ends at all has failed (it repeats for a day), so the honest
+// answer there is to rejoin the per-track player instead of ending the queue.
+audio.addEventListener('ended', () => {
+  if (state.streaming) { leaveQueueStream(); return; }
+  if (!state.switching) endTrack();
+});
 
 audio.addEventListener('seeking', () => {
+  if (state.streaming) return;
   const wrap = isLoopWrap(state.lastTime, audio.currentTime, {
     manualSeek: state.manualSeek, started: state.sourceStarted,
   });
@@ -5717,44 +7337,63 @@ audio.addEventListener('seeking', () => {
 });
 
 audio.addEventListener('timeupdate', () => {
-  // Some engines — WebKit on a locked iPhone is the one that matters — loop
-  // without emitting `seeking`. The jump is still visible here, and this is
-  // the only chance to advance the queue before the same song repeats forever.
-  // Test before lastTime is overwritten and before the seek flag is cleared,
-  // so a deliberate seek to 0 is still not mistaken for the end.
-  if (isLoopWrap(state.lastTime, audio.currentTime, {
+  // While the queue stream plays, the element's clock is a position in the plan
+  // rather than in a track: map it back to the track and offset first, then the
+  // rest of this handler paints the same way it always does.
+  if (!state.streaming && document.visibilityState === 'hidden' && state.playing && !audio.paused) {
+    // The screen is locked but this page is still running (iOS gives a locked
+    // audio page a grace period before suspending it). Converge onto the queue
+    // stream now: a plan may have arrived after the transition, or the track
+    // under the playhead may have changed since the plan was armed. With no
+    // plan at all, ask for one — nothing else re-arms while hidden, and the
+    // device log showed exactly that window staying open for minutes.
+    if (!state.queuePlan && !state.streamBlocked) void armQueueStream();
+    enterQueueStream();
+  }
+  if (state.streaming) {
+    applyStreamPosition();
+  } else if (isLoopWrap(state.lastTime, audio.currentTime, {
+    // Some engines — WebKit on a locked iPhone is the one that matters — loop
+    // without emitting `seeking`. The jump is still visible here, and this is
+    // the only chance to advance the queue before the same song repeats forever.
+    // Test before lastTime is overwritten and before the seek flag is cleared,
+    // so a deliberate seek to 0 is still not mistaken for the end.
     manualSeek: state.manualSeek, started: state.sourceStarted,
   })) {
     endTrack();
     return;
   }
-  // Safety net for a lock-screen seek that never moved the playhead (no
-  // `seeking` event fires then): by the time timeupdate runs, any seek that
-  // did happen has already been consumed above.
-  if (state.lockSeek) { state.lockSeek = false; state.manualSeek = false; }
-  if (!state.manualSeek) state.lastTime = audio.currentTime;
-  const dur = audio.duration || 0;
+  if (!state.streaming) {
+    // Safety net for a lock-screen seek that never moved the playhead (no
+    // `seeking` event fires then): by the time timeupdate runs, any seek that
+    // did happen has already been consumed above.
+    if (state.lockSeek) { state.lockSeek = false; state.manualSeek = false; }
+    if (!state.manualSeek) state.lastTime = audio.currentTime;
+  }
+  const pos = playerPosition();
+  const dur = playerDuration();
   // Keeps the lock-screen scrubber honest while it is visible. Throttled
   // inside the module; this is a no-op when paused.
   if (state.playing) nowPlaying.position();
   document.querySelectorAll('input[data-slider="progress"]').forEach((x) => {
     if (document.activeElement === x) return;
-    x.value = String(Math.floor(audio.currentTime));
-    if (dur) x.style.setProperty('--percent', `${(audio.currentTime / dur) * 100}%`);
+    x.value = String(Math.floor(pos));
+    if (dur) x.style.setProperty('--percent', `${(pos / dur) * 100}%`);
   });
-  document.querySelectorAll('.elapsed').forEach((x) => { x.textContent = fmt(audio.currentTime); });
+  document.querySelectorAll('.elapsed').forEach((x) => { x.textContent = fmt(pos); });
   const t = current();
-  if (dur) $('player').style.setProperty('--progress', `${(audio.currentTime / dur) * 100}%`);
+  // Composited, not a custom-property write: see paintPlayerProgress.
+  paintPlayerProgress(pos, dur);
   // Keep the expanded sheet's scrubber honest without rebuilding it (a rebuild
   // would fight the user's focus and the lyrics scroll position).
   if (!$('now-overlay').hidden) {
     const sheet = $('now-content');
     const input = sheet.querySelector('[data-slider="progress"]');
     if (input && document.activeElement !== input) {
-      input.value = String(Math.floor(audio.currentTime));
-      if (dur) input.style.setProperty('--percent', `${(audio.currentTime / dur) * 100}%`);
+      input.value = String(Math.floor(pos));
+      if (dur) input.style.setProperty('--percent', `${(pos / dur) * 100}%`);
     }
-    sheet.querySelectorAll('.elapsed').forEach((x) => { x.textContent = fmt(audio.currentTime); });
+    sheet.querySelectorAll('.elapsed').forEach((x) => { x.textContent = fmt(pos); });
   }
   if (t && state.playing) saveSession();
 });
@@ -5781,9 +7420,27 @@ audio.addEventListener('seeked', () => {
 
 audio.addEventListener('playing', () => {
   state.playing = true;
+  // Playback can start without `playIndex` (resuming a restored session, an
+  // interrupted session coming back): arm the hidden-playback plan here too,
+  // because the plan has to exist before the screen locks, not after.
+  if (!state.streaming) void armQueueStream();
+  // Hidden already (a track that started while the screen was locked): this is
+  // the moment to get onto the stream, while the page is still running.
+  //
+  // A swap this call arms must not be disarmed by this same handler: the `pause`
+  // that a `src` assignment queues arrives *after* it, and clearing the flag
+  // here made that pause look like a listener pause — the lock screen went
+  // `paused` for the whole cold load, a false paused save reached /api/now, and
+  // the resume watchdog raced the stream's own play. Leave it to the code that
+  // knows when the swap settled: the stream's `playing` (below, next event),
+  // its `pause`, or enterQueueStream's own rejection path. `!state.streaming` is
+  // read first because enterQueueStream also answers `true` for "already
+  // streaming" — and that case *is* the settled swap, which must clear it.
+  const enteredStream = document.visibilityState === 'hidden'
+    && !state.streaming && enterQueueStream();
   state.failures = 0;
   state.sourceStarted = true;
-  state.switching = false;
+  if (!enteredStream) state.switching = false;
   state.ending = false;
   state.hasPlayed = true;
   claimAudioSession();
@@ -5806,6 +7463,8 @@ audio.addEventListener('playing', () => {
   // screen) does not outlive the next track.
   state.userPause = false;
   state.resumeOnVisible = false;
+  state.resumeWanted = false;
+  state.resumeAttempts = 0;
   // A track that starts while the screen is off is the one case nothing else
   // can rescue: there is no gesture, no visibility change and no event that
   // says the audio session went stale. Repair it here (rate-limited inside the
@@ -5827,8 +7486,17 @@ audio.addEventListener('pause', () => {
   if (document.visibilityState === 'hidden'
     && !state.userPause && !state.ending && !state.switching) {
     state.resumeOnVisible = true;
+    state.resumeWanted = true;
   }
-  state.playing = false;
+  // A `.src` swap pauses and immediately re-plays; that queued pause is not
+  // the listener, so it must not paint the transport as paused (it used to
+  // flip the button to "Play" for the whole cold load).
+  state.playing = !audio.paused || (state.switching && !state.userPause);
+  // Re-register the Media Session handlers here too, not only on `playing`:
+  // an iOS interruption (a call, Siri, another app taking the output) arrives
+  // as a pause and can drop the handlers, and until the track resumes the
+  // lock-screen controls would be dead. Cheap and idempotent.
+  nowPlaying.installHandlers();
   // Position state survives a pause, which is what keeps the lock-screen bar
   // at the right place instead of snapping back to zero.
   nowPlaying.sync({ force: true });
@@ -5842,14 +7510,45 @@ audio.addEventListener('pause', () => {
 audio.addEventListener('error', async () => {
   const t = current();
   if (!t) return;
+  // A stream that fails is not a track that failed. Drop the plan and return to
+  // the per-track player at the mapped position: counting this against the
+  // track would skip a song the listener never heard the end of.
+  if (state.streaming) {
+    console.warn('queue stream failed', audio.error?.code);
+    clientReport('live-error', { code: audio.error?.code ?? null });
+    // A source this engine cannot play at all (MEDIA_ERR_SRC_NOT_SUPPORTED) is
+    // not worth retrying in a loop — every attempt swaps the working track out
+    // for silence. But a single bad segment (a truncated fetch through a
+    // tunnel) is worth exactly one more try, so failures are counted and the
+    // stream is only given up on after two in a row.
+    state.streamFails = (state.streamFails ?? 0) + 1;
+    if (!audio.error || audio.error.code === 4) {
+      if (state.streamFails >= 2) {
+        state.streamBlocked = true;
+        clientReport('live-blocked', { code: audio.error?.code ?? null, fails: state.streamFails });
+      } else {
+        state.streamCooldownUntil = Date.now() + 15_000;
+      }
+    }
+    state.queuePlan = null;
+    leaveQueueStream();
+    return;
+  }
   console.warn('audio error', audio.error?.code, t.videoId);
   state.failures += 1;
+  const failedId = t.videoId;
   const failing = state.startedAt;
   state.startedAt = null;
+  // A failed source never reaches `playing`, which normally clears these.
+  state.switching = false;
+  state.ending = false;
 
   if (state.failures > 3) {
     // Stop churning through the queue and say why, if the server knows why.
     state.playing = false;
+    // There is no player left, not a paused one: `paused` would leave the Now
+    // Playing widget on screen advertising a track that will never start.
+    nowPlaying.stopped();
     updatePlayer();
     let gated = false;
     try {
@@ -5872,11 +7571,19 @@ audio.addEventListener('error', async () => {
     }
     return;
   }
-  setTimeout(() => {
+  // Advance before a locked iPhone can freeze background timers. Microtasks
+  // finish with this media event; a 400 ms timer may not run until unlock.
+  // The failed-id guard also protects a manual next in this same event turn,
+  // and makes repeated error events for one source idempotent.
+  queueMicrotask(() => {
+    // Never skip the song the listener chose while this recovery was queued.
+    if (current()?.videoId !== failedId) return;
     if (state.failures > 3 || state.startedAt !== null) return;
-    if (failing === null) return;
+    // A source that never reached `playing` has no start stamp, but must still
+    // advance; only a mid-track failure with no stamp is skipped.
+    if (failing === null && state.sourceStarted) return;
     nextTrack();
-  }, 400 * state.failures);
+  });
 });
 
 document.addEventListener('visibilitychange', () => {
@@ -5884,6 +7591,14 @@ document.addEventListener('visibilitychange', () => {
   // to report it, so repair the category on the way out and on the way back in
   // (public/audio-session.js explains why re-asserting alone does not work).
   repairAudioSession();
+  // Both directions, not just the way back in. iOS drops the lock-screen
+  // handlers on an interruption while hidden — which pauses the element, so no
+  // `playing` will fire until something resumes it — and locking the phone
+  // relaunches the GPU process *after* this transition, which empties WebKit's
+  // remote-command set with no event at all (public/media-session.js). The
+  // way out is the last synchronous chance to re-register before the page can
+  // be frozen; media-session.js then keeps re-asserting from `timeupdate`.
+  nowPlaying.installHandlers();
   // A room is a live connection: come back by re-reading it, not by trusting
   // whatever the stream managed to deliver while the tab was frozen.
   if (rooms.active) {
@@ -5891,10 +7606,18 @@ document.addEventListener('visibilitychange', () => {
     return;
   }
   if (document.visibilityState === 'hidden') {
+    // Hand the element the whole queue first, while this page still runs: on a
+    // locked iPhone nothing here will run again until the screen comes back
+    // (public/queue-stream.js).
+    enterQueueStream();
     if (!audio.paused) log('progress');
     saveSession({ force: true });
     return;
   }
+  // Visible again: the queue stream is the queue, not a track. Hand playback
+  // back to the real player at wherever the music actually got to before doing
+  // anything else, so the UI, the lock screen and the session save all agree.
+  leaveQueueStream();
   // Coming back to an idle app is the natural moment to notice that the phone
   // kept playing: adopt its newer session instead of offering a stale position.
   if (audio.paused && !state.playing) refreshSessionFromServer();
@@ -5903,9 +7626,29 @@ document.addEventListener('visibilitychange', () => {
   // playing, or while it was paused *for* us (see the pause handler). Nothing
   // resumes it by itself, so do it here rather than waiting for a tap: a play()
   // is allowed again now that the page is visible.
-  if (state.resumeOnVisible) resumeAfterInterruption();
-  else if (state.playing && audio.paused) resumeAfterInterruption();
+  resumeIfInterrupted();
 });
+
+/**
+ * Pick the track back up after a platform interruption.
+ *
+ * Called from the two places an interruption can be observed to end: the page
+ * becoming visible again, and the audio session returning to `active` while the
+ * page stays in the background (the call was hung up, the prompt finished, the
+ * listener is still in Maps). The second one used to leave the player paused
+ * until the app was opened again — and a paused background tab never advances
+ * to the next track, which is the silence this whole file is about.
+ */
+function resumeIfInterrupted() {
+  // A room's playhead is the server's; its own corrector owns resume there, and
+  // a local play() would just fight it.
+  if (rooms.active) return;
+  // A pause the listener made is never undone, whichever flag survived.
+  if (state.userPause) return;
+  if (state.resumeOnVisible || state.resumeWanted || (state.playing && audio.paused)) {
+    resumeAfterInterruption();
+  }
+}
 
 /**
  * This tab was playing and is not any more, for a reason that was not the user.
@@ -5916,23 +7659,82 @@ document.addEventListener('visibilitychange', () => {
  */
 function resumeAfterInterruption() {
   state.resumeOnVisible = false;
+  state.resumeWanted = false;
   // Signed out: the element was paused by the sign-in screen, not by iOS, and
   // playing it again would only 401 the stream.
   if ($('auth-overlay') && !$('auth-overlay').hidden) return;
+  // Nothing left to play (the queue ran out, the source was never set): giving
+  // up is correct, and the watchdog below must not resurrect a finished queue.
+  if (!audio.currentSrc && !current()) return;
+  // Bounded retries. The watchdog re-arms `resumeWanted` on every refusal, so
+  // an interruption that never ends (a call that is still going, another app
+  // that keeps the output) would otherwise retry for as long as the page lives.
+  state.resumeAttempts = (state.resumeAttempts ?? 0) + 1;
+  if (state.resumeAttempts > 60) return;
   state.playing = true;
   claimAudioSession();
   audio.play().catch(() => {
     if (!audio.paused) return;
     state.playing = false;
+    // Still refused: the session has not come back yet. Keep the intent so the
+    // next witness (a page resume, the audio session going active, or the
+    // watchdog below) tries again instead of giving up after one attempt.
+    if (document.visibilityState === 'hidden' && !state.userPause) state.resumeWanted = true;
     updatePlayer();
   });
 }
 
 // A frozen page comes back with a fresh process chain behind the same DOM: the
 // category has to be sent again, not remembered. `pageshow` also covers a
-// restore from the back/forward cache, which fires no `visibilitychange`.
-addEventListener('pageshow', () => repairAudioSession());
-addEventListener('resume', () => repairAudioSession({ force: true }));
+// restore from the back/forward cache, which fires no `visibilitychange` — and
+// a page that comes back from there while the queue stream was playing has to
+// return to the per-track player just as a visible page does.
+addEventListener('pageshow', () => { repairAudioSession(); leaveQueueStream(); });
+// `resume` is the page lifecycle event: a suspended page coming back to life.
+// The category needs re-sending (a fresh process chain is behind the same DOM),
+// and so does the playback state — a page suspended mid-interruption wakes with
+// the element paused and no event that says the interruption is over.
+addEventListener('resume', () => { repairAudioSession({ force: true }); resumeIfInterrupted(); });
+
+// The interruption can also end without the listener ever returning to the app:
+// they hang up, dismiss the prompt, and stay in Maps. That produces no
+// `visibilitychange` and no `playing` event, so the audio session's own state is
+// the only witness. Without this the player sat paused — silently, with the Now
+// Playing widget emptied — until the app was opened again, and a paused
+// background tab never auto-advances to the next track.
+audioSession.onResume(() => {
+  if (document.visibilityState === 'visible') return;
+  resumeIfInterrupted();
+});
+
+/**
+ * The last-resort net: notice on our own that we should be playing and are not.
+ *
+ * Every other recovery is event-driven, and each event can fail to arrive. The
+ * audio session's `statechange` only fires if WebKit classified the takeover as
+ * an interruption — another app simply grabbing the output (Discord, a game, a
+ * navigation prompt) does not always qualify. `visibilitychange` needs the
+ * listener to come back to the app, which is exactly what they did not do.
+ * `resume` needs the page to have been suspended first. So a hidden page whose
+ * music was taken away could sit paused forever with the Now Playing widget
+ * emptied — the "switched apps and the music stopped" report.
+ *
+ * Cheap by construction: one interval, and `resumeIfInterrupted` is a handful of
+ * boolean checks that return immediately whenever playback is healthy, a swap is
+ * in flight, or the pause was the listener's own. It only ever calls play() on a
+ * page that has produced audio before and is silent through no one's choosing.
+ *
+ * Exactly one interval, deliberately. There used to be a second, byte-identical
+ * copy of this block (a copy-paste), and the two together burned the 60-attempt
+ * retry cap in resumeAfterInterruption twice as fast: a six-minute phone call
+ * disarmed auto-resume for the rest of the session, so the music never came back
+ * after the next interruption. A second net must not be added to fix a net that
+ * is not firing — make this one smarter instead.
+ */
+setInterval(() => {
+  if (document.visibilityState !== 'hidden') return;
+  resumeIfInterrupted();
+}, 10_000);
 
 // ── data actions ────────────────────────────────────────────────────────
 let searchTimer = null;
@@ -5986,6 +7788,10 @@ async function runSearch() {
       store.set('searchRecent', state.searchRecent);
     }
   } catch (err) {
+    // A slow failure belongs to the query that asked for it. Without this
+    // guard a delayed 500 on the previous query cleared the newer query's
+    // shelves and blamed it ("No match for …", "Search is unavailable").
+    if (state.search.trim() !== q) return;
     clearSearchShelves([]);
     notify(err.message, 'error');
   }
@@ -5994,7 +7800,9 @@ async function runSearch() {
 
 async function loadPlaylists() {
   const { playlists } = await api('/api/playlists');
-  state.playlists = playlists;
+  // An unexpected shape (an older server, a proxy error page) must degrade to
+  // "no playlists" instead of making every later render throw on .map().
+  state.playlists = Array.isArray(playlists) ? playlists : [];
 }
 
 /**
@@ -6015,13 +7823,13 @@ function trackMeta(videoId) {
 
 async function loadLikes() {
   const { tracks } = await api('/api/likes');
-  state.likedTracks = tracks;
-  state.liked = new Set(tracks.map((t) => t.videoId));
+  state.likedTracks = Array.isArray(tracks) ? tracks : [];
+  state.liked = new Set(state.likedTracks.map((t) => t.videoId));
 }
 
 async function loadDislikes() {
   const { tracks } = await api('/api/dislikes');
-  state.disliked = new Set(tracks.map((t) => t.videoId));
+  state.disliked = new Set((Array.isArray(tracks) ? tracks : []).map((t) => t.videoId));
 }
 
 /**
@@ -6037,7 +7845,19 @@ function removeFromQueue(videoId) {
   if (idx < 0) return;
   const wasPlaying = idx === state.index;
   state.queue = state.queue.filter((t) => t.videoId !== videoId);
-  if (idx < state.index) { state.index -= 1; return; }
+  // The removed row is still inside any armed plan's track list, so a stream
+  // armed before this edit would keep playing the song the listener refused.
+  invalidateQueuePlan();
+  if (idx < state.index) {
+    state.index -= 1;
+    // The row that was removed sits above the playhead, so no playback change
+    // is needed — but every open list still shows the old rows with their old
+    // indices, and a click on one would target the wrong entry.
+    refreshQueueViews({ forceOverlay: true, rowsChanged: true });
+    clearTimeout(queueSaveTimer);
+    queueSaveTimer = setTimeout(() => { saveSession({ force: true }); }, 250);
+    return;
+  }
   if (!wasPlaying) return;
   if (!state.queue.length) {
     audio.pause();
@@ -6056,7 +7876,7 @@ function removeFromQueue(videoId) {
     render();
     return;
   }
-  playIndex(Math.min(idx, state.queue.length - 1));
+  playIndex(Math.min(idx, state.queue.length - 1), { queueChanged: true });
 }
 
 /**
@@ -6158,7 +7978,7 @@ async function tracksFor(collection) {
   return [];
 }
 
-async function openCollection(collection, { history = 'push' } = {}) {
+async function openCollection(collection, { history = 'push', scrollTop = 0 } = {}) {
   state.page = 'collection';
   state.collection = collection;
   state.collectionLoading = true;
@@ -6169,40 +7989,51 @@ async function openCollection(collection, { history = 'push' } = {}) {
     historyEntries[historyCursor.index] = { page: 'collection', collection };
     try { history.replaceState({ i: historyCursor.index }, '', routePath('collection', collection)); } catch {}
   }
-  applyRoute({ page: 'collection', collection }, { scroll: true });
+  applyRoute({ page: 'collection', collection }, { scroll: history === 'push', scrollTop });
   document.title = pageTitle();
 
+  // Resolve into locals first. A slow answer for a collection the listener has
+  // already left used to be written straight into state, so opening playlist B
+  // while A was still loading left B's page showing A's title and tracks.
+  let data = null;
+  let albumTracks = null;
+  let error = null;
   try {
     if (collection === 'liked') {
       await loadLikes();
     } else if (collection.startsWith('p')) {
       const { playlist } = await api(`/api/playlists/${Number(collection.slice(1))}`);
-      state.collectionData = playlist;
+      data = playlist ?? null;
     } else if (collection.startsWith('a')) {
       const ytId = collection.slice(1);
       const known = state.browse.albums?.find((a) => a.id === ytId)
         ?? state.mood?.playlists?.find((p) => p.id === ytId);
-      const data = await api(`/api/album/${encodeURIComponent(ytId)}`);
-      const tracks = data.tracks ?? [];
-      state.collectionData = {
-        title: data.title ?? known?.title ?? tracks[0]?.album ?? 'Album',
-        author: data.author ?? known?.author ?? tracks[0]?.channel,
-        authorId: data.authorId ?? null,
-        type: data.type ?? 'Album',
+      const album = await api(`/api/album/${encodeURIComponent(ytId)}`);
+      const tracks = Array.isArray(album?.tracks) ? album.tracks : [];
+      data = {
+        title: album?.title ?? known?.title ?? tracks[0]?.album ?? 'Album',
+        author: album?.author ?? known?.author ?? tracks[0]?.channel,
+        authorId: album?.authorId ?? null,
+        type: album?.type ?? 'Album',
         // The release's own cover, not its first track's video still.
-        art: data.thumb ?? known?.thumb ?? tracks[0]?.thumb ?? null,
+        art: album?.thumb ?? known?.thumb ?? tracks[0]?.thumb ?? null,
         tracks,
       };
-      state.albumTracks = { id: ytId, title: state.collectionData.title, author: state.collectionData.author, tracks };
+      albumTracks = { id: ytId, title: data.title, author: data.author, tracks };
     }
   } catch (err) {
-    state.collectionError = err.message;
+    error = err.message;
   }
-  if (state.collection !== collection) return;
+  // The staleness guard runs before *anything* is committed, and in the error
+  // path too: a late failure must not label the newer page as broken.
+  if (state.collection !== collection || state.page !== 'collection') return;
+  state.collectionData = data;
+  state.albumTracks = albumTracks;
+  state.collectionError = error;
   state.collectionLoading = false;
   await render();
   document.title = pageTitle();
-  if (state.page === 'collection') $('main-scroll').scrollTop = 0;
+  if (state.page === 'collection') $('main-scroll').scrollTop = scrollTop;
 }
 
 async function startRadio(seedVideoId) {
@@ -6259,13 +8090,20 @@ async function loadBrowse(kind) {
 
 function queueNext(videoId) {
   const t = trackIndex.get(videoId) ?? { videoId };
+  const playing = state.queue[state.index] ?? null;
   const existing = state.queue.findIndex((x) => x.videoId === videoId);
   if (existing >= 0) state.queue.splice(existing, 1);
+  // Taking the entry out shifts every later index by one. Re-locate the song
+  // that is playing instead of trusting the old number, or "play next" on a
+  // track above the playhead leaves the player highlighting the wrong song
+  // (and a reload resumes on the wrong one).
+  if (playing) state.index = Math.max(0, state.queue.findIndex((x) => x.videoId === playing.videoId));
   const at = Math.min(state.queue.length, Math.max(0, state.index + 1));
   state.queue.splice(at, 0, { ...t, videoId });
   notify('Playing next', 'info');
   render();
   refreshOverlay();
+  saveSession({ force: true });
 }
 
 /**
@@ -6287,7 +8125,11 @@ async function queueAdd(videoId) {
   }
   if (state.queue.some((q) => q.videoId === videoId)) { notify('Already in the queue', 'info'); return; }
   state.queue = [...state.queue, completeTrack({ ...t, videoId })];
-  refreshQueueViews({ forceOverlay: true });
+  // An emptied queue (the last song was disliked away) leaves the index at -1;
+  // appending the first new entry must give it a current track again, without
+  // autoplaying it.
+  if (state.index < 0) state.index = state.queue.length - 1;
+  refreshQueueViews({ forceOverlay: true, rowsChanged: true });
   notify('Added to the queue', 'info');
   // The queue is part of the session; save it now rather than waiting for the
   // next playback tick, which may never come if nothing is playing.
@@ -6503,7 +8345,12 @@ async function checkServer() {
   const REQUIRED = ['search', 'radio', 'station', 'station-next', 'dislikes', 'likes', 'playlists', 'album',
     // The account screen and the login form depend on these; a server that
     // predates them would 404 on every refresh and passkey attempt.
-    'devices', 'passkeys'];
+    'devices', 'passkeys',
+    // The three whose absence is worst: a locked phone has no page script, so
+    // only the server's queue stream can advance it ('queue-stream'); a follow
+    // that 404s is a feature that silently does nothing ('follows'); and the
+    // bell would poll an endpoint that does not exist ('notifications').
+    'queue-stream', 'follows', 'notifications'];
   let health;
   try {
     health = await api('/api/health');
@@ -6520,13 +8367,47 @@ async function checkServer() {
   }
 }
 
+// Single-flight: the document used to call boot() twice (module scope and the
+// trailing line), so every boot request, render and session restore happened
+// twice. Concurrent callers share one run; a later explicit boot (after sign-in,
+// after coming back online) still gets a fresh one.
+let bootRun = null;
+
 async function boot() {
-  // Check the server before anything else. The app is served from disk per
-  // request but the routes are frozen at process start, so a server left
-  // running across a deploy hands the new bundle old routes. Saying that once,
-  // up front, is the difference between "the deploy went wrong" and "the app is
-  // broken".
-  await checkServer();
+  if (bootRun) return bootRun;
+  bootRun = bootOnce()
+    .catch(async (err) => {
+      // Last resort. boot() is called fire-and-forget, so an unexpected throw
+      // would leave the index.html skeleton on screen with no error at all.
+      console.error('boot failed', err);
+      if (state.user) { try { await render(); } catch {} }
+      else showAuth();
+    })
+    .finally(() => { bootRun = null; });
+  return bootRun;
+}
+
+async function bootOnce() {
+  // A boot *is* the offline page's "Try again": whatever this run decides is the
+  // new truth, and showOffline raises the flag again if it fails offline.
+  offlineBootShown = false;
+  // The server check must still happen (the app is served from disk per request
+  // but the routes are frozen at process start, so a server left running across
+  // a deploy hands the new bundle old routes — saying that once is the
+  // difference between "the deploy went wrong" and "the app is broken"), but it
+  // does not have to happen *first*. Three questions used to be asked one after
+  // another — /api/health, then /api/me, then /api/now after five more loaders —
+  // and the hero image, the LCP element, only exists after the render() at the
+  // end of all of it: every round trip was dead air in front of the first real
+  // paint. Health only reports a skew, so it is not awaited at all.
+  checkServer();
+
+  // The saved session needs nothing but the cookie, so it goes out beside
+  // /api/me and is awaited where its answer is actually used, further down.
+  // On a signed-out browser this costs one 401 that the server answers without
+  // touching the database — a whole round trip saved on every signed-in boot is
+  // worth that. It cannot reject: a failure here means "no session to restore".
+  const savedNow = api('/api/now').catch(() => null);
 
   try {
     const me = await api('/api/me');
@@ -6549,11 +8430,16 @@ async function boot() {
 
   $('auth-overlay').hidden = true;
 
+  // Every loader is independent: one failing endpoint (a 500 on /api/likes, a
+  // slow /api/playlists) must not abort boot and leave the skeleton up
+  // forever. The page still renders with whatever the others produced.
   await Promise.all([
-    loadLikes(),
-    loadDislikes().catch(() => {}),
-    loadPlaylists(),
-    api('/api/recent').then((r) => { state.home.recent = r.tracks; }).catch(() => {}),
+    loadLikes().catch(() => { state.likedTracks = []; state.liked = new Set(); }),
+    loadDislikes().catch(() => { state.disliked = new Set(); }),
+    loadPlaylists().catch(() => { state.playlists = []; }),
+    api('/api/recent')
+      .then((r) => { state.home.recent = Array.isArray(r?.tracks) ? r.tracks : []; })
+      .catch(() => { state.home.recent = []; }),
   ]);
 
   // The pinned station is on the home page, so fetch it in the background (it
@@ -6561,9 +8447,14 @@ async function boot() {
   // page reports its own error if the user opens it.
   loadStation({ silent: true });
 
-  // Restore the last session the phone was playing.
-  try {
-    const { state: saved, updatedAt } = await api('/api/now');
+  // Restore the last session the phone was playing. The request itself went out
+  // beside /api/me (see the top of bootOnce); only the answer is awaited here,
+  // because a restored queue must land before the first render() but the fetch
+  // had no reason to wait for the five loaders above.
+  const nowSession = await savedNow;
+  if (nowSession) {
+    const saved = nowSession.state;
+    const updatedAt = nowSession.updatedAt;
     if (saved?.tracks?.length && saved.tracks[saved.index ?? 0]) {
       // Durations are persisted with the queue; if an older save lacks them,
       // fall back to the track index so "up next" never shows 0:00.
@@ -6598,7 +8489,7 @@ async function boot() {
       warmNext();
       maybeExtendStation();
     }
-  } catch {}
+  }
 
   // Seed the home page with something real to click. Fire and forget: the
   // first paint must not wait on a network round trip, and whatever page the
@@ -6626,31 +8517,50 @@ async function boot() {
   historyEntries[0] = route;
   historyCursor.index = 0;
   if (shared?.page !== 'track') {
-    try { history.replaceState({ i: 0 }, '', routePath(route.page, route.collection, route.mood)); } catch {}
+    // The hash is the source of truth on a reload, and the entry being shown may
+    // be one this page pushed before the reload: its state carries an `i` that
+    // this document's fresh historyEntries knows nothing about. Unconditionally
+    // replacing it with { i: 0 } threw that state away *and* pointed the entry
+    // at the wrong index, so the next popstate adopted a stale `i` and routed to
+    // the wrong page. Only an entry nobody wrote (state===null: a first visit, a
+    // plain /l/ tunnel link) gets a rewrite, and any state it does carry is kept.
+    // An entry the app already owns needs nothing: its hash is the route.
+    if (history.state?.i === undefined) {
+      try { history.replaceState({ ...(history.state ?? {}), i: 0 }, '', routePath(route.page, route.collection, route.mood)); } catch {}
+    }
   }
-  if (route.page === 'collection' && route.collection) {
-    await openCollection(route.collection, { history: 'none' });
-  } else if (route.page === 'artist' && route.collection) {
-    // A shared or reloaded artist link is a page whose content is fetched, so
-    // boot has to kick its loader itself — rendering the route alone would
-    // leave the skeleton up forever.
-    state.page = 'artist';
-    state.collection = route.collection;
-    await loadArtist(route.collection);
-  } else if (route.page === 'mood' && route.mood) {
-    state.page = 'mood';
+  try {
+    if (route.page === 'collection' && route.collection) {
+      await openCollection(route.collection, { history: 'none' });
+    } else if (route.page === 'artist' && route.collection) {
+      // A shared or reloaded artist link is a page whose content is fetched, so
+      // boot has to kick its loader itself — rendering the route alone would
+      // leave the skeleton up forever.
+      state.page = 'artist';
+      state.collection = route.collection;
+      await loadArtist(route.collection);
+    } else if (route.page === 'mood' && route.mood) {
+      state.page = 'mood';
+      state.collection = null;
+      await loadMood(route.mood);
+    } else {
+      state.page = route.page;
+      state.collection = route.collection;
+      await render();
+      // Pages whose content is fetched (not derived from state already loaded)
+      // must kick their own loader on a deep link: applyRoute does this for
+      // in-app navigation, but boot renders directly.
+      if (route.page === 'security') loadSecurity();
+      if (route.page === 'room' && route.collection) openRoom(route.collection);
+      if (shared?.page === 'track') playSharedTrack(shared.videoId);
+    }
+  } catch (err) {
+    // A route whose data failed still paints the page it can paint: an empty
+    // Discover is a usable app, a skeleton held forever is not.
+    console.error('boot route failed', err);
+    state.page = 'home';
     state.collection = null;
-    await loadMood(route.mood);
-  } else {
-    state.page = route.page;
-    state.collection = route.collection;
-    await render();
-    // Pages whose content is fetched (not derived from state already loaded)
-    // must kick their own loader on a deep link: applyRoute does this for
-    // in-app navigation, but boot renders directly.
-    if (route.page === 'security') loadSecurity();
-    if (route.page === 'room' && route.collection) openRoom(route.collection);
-    if (shared?.page === 'track') playSharedTrack(shared.videoId);
+    await render().catch(() => {});
   }
 
   // Rejoin the room this browser was in. A reload is not a decision to leave:
@@ -6706,5 +8616,7 @@ document.addEventListener('focusin', (e) => {
 document.addEventListener('focusout', () => setTimeout(pinWindowScroll, 0));
 window.visualViewport?.addEventListener('resize', pinWindowScroll);
 
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+// pwa.js owns the service worker lifecycle (register, update prompt, offline
+// pill) and always loads, so registering here as well was a second update check
+// and a second place that had to agree on the options forever. One owner.
 boot();

@@ -1,8 +1,17 @@
+// The first test imports src/config.js, which reads ambient environment
+// variables; an inherited PORT (dev shells and CI runners both export one) made
+// the "dev default port is 8130" assertion fail on the machine's environment
+// instead of on the code. Neutralise it before config.js can possibly be
+// evaluated: config.js is only imported dynamically inside a test body, which
+// runs after this top-level statement, so the import sees PORT as unset.
+delete process.env.PORT;
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 
 // Guards the container setup against the two mistakes that are silent rather
 // than loud: publishing a different port than the dev server, and running the
@@ -77,12 +86,124 @@ test('the container gets a working resolver, not just the podman forwarder', () 
   for (const s of servers) assert.doesNotMatch(s, /127\.0\.0\.1|localhost/);
 });
 
-test('the entrypoint refuses to start without SONORA_SECRET', () => {
-  const script = read('scripts/container-entrypoint.sh');
-  assert.match(script, /SONORA_SECRET/, 'entrypoint checks SONORA_SECRET');
-  // An empty value is the likely mistake and config.js `??` does not catch it.
-  assert.match(script, /-z "\$\{SONORA_SECRET:-\}"/, 'empty and unset are both rejected');
-  assert.match(script, /exit 1/);
+test('the entrypoint enforces SONORA_SECRET at runtime', async (t) => {
+  const script = path.join(ROOT, 'scripts/container-entrypoint.sh');
+  const run = (secret) => {
+    const env = { ...process.env };
+    if (secret === undefined) delete env.SONORA_SECRET;
+    else env.SONORA_SECRET = secret;
+    return spawnSync('/bin/sh', [script, '/bin/sh', '-c', 'printf entrypoint-ok'], {
+      env,
+      encoding: 'utf8',
+      timeout: 5_000,
+    });
+  };
+
+  for (const [label, secret] of [
+    ['unset', undefined],
+    ['empty', ''],
+    ['spaces', '   '],
+    ['tabs and newlines', '\t \n\r\t'],
+    ['Unicode whitespace', '\u00a0\ufeff\u2003'],
+  ]) {
+    await t.test(`rejects ${label}`, () => {
+      const result = run(secret);
+      assert.equal(result.error, undefined);
+      assert.equal(result.status, 1, result.stderr);
+      assert.equal(result.stdout, '');
+      assert.match(result.stderr, /SONORA_SECRET is unset, empty, or whitespace/);
+    });
+  }
+
+  await t.test('accepts a non-whitespace value and executes the command', () => {
+    const result = run('  a-valid-production-secret  ');
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, 'entrypoint-ok');
+    assert.equal(result.stderr, '');
+  });
+});
+
+test('rootless podman maps the runtime user to the invoking host account', () => {
+  const override = read('compose.podman.yaml');
+  assert.match(override, /userns_mode:\s*["']?keep-id:uid=1000,gid=1000["']?/);
+  assert.match(override, /compose\.yaml -f compose\.podman\.yaml/);
+});
+
+test('the podman override disables the pod that would cancel keep-id', () => {
+  // podman-compose 1.3 joins every project to a pod by default, and podman
+  // refuses `--userns` together with `--pod` ("cannot be set together"). The
+  // documented command then fails outright, and any stack started without this
+  // option runs unmapped — a read-only bind mount reported as "attempt to write
+  // a readonly database" by the first boot that has to migrate. The setting is
+  // top-level x-podman, not a service key, so assert on indentation too.
+  const override = read('compose.podman.yaml');
+  assert.match(override, /^x-podman:\s*$/m, 'x-podman is a top-level key');
+  assert.match(override, /^\s+in_pod:\s*false\s*$/m, 'in_pod is disabled');
+});
+
+test('compose constrains privileges and process count', () => {
+  const compose = composeService();
+  assert.match(compose, /cap_drop:\s*\n\s*- ALL/);
+  assert.match(compose, /security_opt:\s*\n\s*- no-new-privileges:true/);
+  const pids = /pids_limit:\s*(\d+)/.exec(compose);
+  assert.ok(pids, 'compose declares a PID limit');
+  assert.ok(Number(pids[1]) >= 64 && Number(pids[1]) <= 1024, 'PID limit is usable and bounded');
+});
+
+test('the image copies only the scripts its runtime and healthcheck need', () => {
+  const containerfile = read('Containerfile');
+  assert.match(containerfile, /COPY scripts\/container-entrypoint\.sh scripts\/healthcheck\.js \.\/scripts\//);
+  assert.doesNotMatch(containerfile, /^COPY scripts \.\/scripts$/m);
+});
+
+test('the image normalises non-secret source modes before dropping to node', () => {
+  // Atomic local edits left this assembled worktree's public/app.js and
+  // package-lock.json at 0600. Buildah preserved that as root:root, so the
+  // declared USER node could neither hash the lockfile nor execute public code.
+  const containerfile = read('Containerfile');
+  const normalise = containerfile.indexOf('chmod -R a+rX src public scripts');
+  const drop = containerfile.indexOf('USER node:node');
+  assert.ok(normalise >= 0, 'source readability/traversal is explicit');
+  assert.ok(drop > normalise, 'normalisation runs before the unprivileged user');
+  assert.match(containerfile, /chmod 0644 package\.json package-lock\.json/);
+});
+
+test('release publication is gated and PR builds have no package-write token', () => {
+  const workflow = read('.github/workflows/ci.yml');
+  const job = (name) => {
+    const lines = workflow.split('\n');
+    const start = lines.indexOf(`  ${name}:`);
+    assert.notEqual(start, -1, `${name} job exists`);
+    let end = lines.length;
+    for (let i = start + 1; i < lines.length; i++) {
+      if (/^  [a-z][a-z0-9-]*:$/.test(lines[i])) { end = i; break; }
+    }
+    return lines.slice(start, end).join('\n');
+  };
+  assert.match(job('publish'), /needs: \[unit, browser, build\]/);
+  assert.match(job('publish'), /if: github\.event_name != 'pull_request'/);
+  assert.match(job('publish'), /packages: write/);
+  assert.doesNotMatch(job('build'), /packages: write/);
+  assert.match(job('build'), /-e HOST=0\.0\.0\.0/, 'image smoke reaches a non-loopback listener');
+  for (const name of ['config', 'rooms-idle', 'youtube', 'lifecycle']) {
+    assert.match(job('unit'), new RegExp(`test/${name}\\.test\\.js`), `${name} gates publication`);
+  }
+  assert.doesNotMatch(job('browser'), /continue-on-error/);
+  for (const name of ['unit', 'browser', 'build', 'publish']) {
+    assert.match(job(name), /timeout-minutes: \d+/, `${name} has a timeout`);
+  }
+});
+
+test('secret material is excluded at every build-context depth', () => {
+  const ignore = read('.dockerignore');
+  for (const pattern of [
+    '**/.env', '**/.env.*', '**/.netrc', '**/.npmrc', '**/*.pem', '**/*.key',
+    '**/cookies.txt', '**/*-cookies.txt', '**/*.cookies', '**/*.db',
+    '**/*.db-shm', '**/*.db-wal',
+  ]) {
+    assert.ok(ignore.split('\n').includes(pattern), `.dockerignore contains ${pattern}`);
+  }
 });
 
 test('the image installs what yt-dlp actually needs', () => {

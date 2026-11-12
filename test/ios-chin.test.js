@@ -232,12 +232,13 @@ for (const d of DEVICES) {
   });
 }
 
-test('when the shell still cannot reach the bottom, the app says so with numbers', async (t) => {
+test('when the shell still cannot reach the bottom, the app says so in words', async (t) => {
   if (!browser) return t.skip('no chromium available; set CHROME_BIN to enable');
 
-  // The fallback for a device this fix does not cover: a labelled gap can be
-  // finished in one screenshot, a silent one costs another round trip. The pill
-  // must appear exactly when the shell is clipped and never otherwise.
+  // The fallback for a device this fix does not cover. A user cannot act on a
+  // pixel count, so the pill carries one human sentence and the measurement
+  // lives in the title (and console.debug) where a bug report can find it. The
+  // pill must appear exactly when the shell is clipped and never otherwise.
   t.after(await installIos({ screenWidth: 393, screenHeight: 852 }));
   await loginAndOpen({ width: 393, height: 852, top: 59, bottom: 34 });
 
@@ -252,14 +253,23 @@ test('when the shell still cannot reach the bottom, the app says so with numbers
     window.dispatchEvent(new Event('resize'));
     for (let i = 0; i < 40; i++) {
       const el = document.querySelector('.pwa-pill[data-kind="chin"]');
-      if (el) return el.querySelector('.pwa-pill-text').textContent;
+      if (el) {
+        return {
+          text: el.querySelector('.pwa-pill-text').textContent,
+          title: el.getAttribute('title') || '',
+        };
+      }
       await new Promise((r) => setTimeout(r, 50));
     }
     return null;
   })()`);
   assert.ok(pill, 'a clipped shell must raise the self-check pill');
-  assert.match(pill, /\b793px of 852px\b/, `the pill must report both heights, got: ${pill}`);
-  assert.match(pill, /\b59px short\b/, `the pill must report the shortfall, got: ${pill}`);
+  // What the user reads is a sentence they can act on…
+  assert.match(pill.text, /fill your screen/i, `the pill must say what is wrong, got: ${pill.text}`);
+  assert.doesNotMatch(pill.text, /\d+px/, `a pixel count is not for the user, got: ${pill.text}`);
+  // …and the numbers are still there for a bug report.
+  assert.match(pill.title, /\b793px of 852px\b/, `the measurement belongs in the title, got: ${pill.title}`);
+  assert.match(pill.title, /\b59px short\b/, `the shortfall belongs in the title, got: ${pill.title}`);
 });
 
 test('the self-check is iOS-standalone only', async (t) => {

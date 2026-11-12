@@ -29,6 +29,8 @@ import {
   deleteRoomRow, parseRoomState, listRoomMembers, getRoomMember, addRoomMember,
   removeRoomMember, countRoomMembers, touchRoomMember, addRoomInvite, removeRoomInvite,
   getRoomInvite, listRoomInvites, searchUsers, listRoomsToPrune, getUser, upsertTrack,
+  setRoomHost, setRoomMemberRole,
+  transaction,
 } from './db.js';
 
 // No i/l/o/0/1: a code gets read aloud and retyped.
@@ -40,7 +42,40 @@ const VIDEO_ID = /^[A-Za-z0-9_-]{11}$/;
 /** The same window `/api/now` stores; a room queue is not a playlist. */
 const MAX_QUEUE = 60;
 const MAX_STREAMS_PER_ROOM = 200;
+/**
+ * How much unwritten data a subscriber may hold before it is dropped.
+ *
+ * A phone that suspends the tab (or a laptop that sleeps) stops draining its
+ * socket, and an SSE writer that keeps writing to it grows the server's memory
+ * for as long as the room lives. A megabyte is far more than a few frames of
+ * playhead state and far less than a leak.
+ */
+const MAX_BUFFERED_BYTES = 1 << 20;
 const TICK_MS = 15_000;
+// Node clamps larger (and non-finite) delays to 1 ms. Sleep in bounded chunks
+// instead: the timer re-reads the persisted playhead before arming its successor.
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+/**
+ * How close to the derived end an `auto` advance may be and still count as a
+ * natural continuation.
+ *
+ * A device that is a little ahead of the server — the steady state, since the
+ * server's clock is the authority and positive drift is normal — reaches the
+ * end of its own file up to ~120 ms before the server's derived end. Refusing
+ * that one advance used to wedge a room whose host was asleep, so the rule gets
+ * a tolerance; it is far too small to be usable as a skip.
+ */
+const AUTO_END_TOLERANCE_MS = 500;
+/**
+ * When a track's duration is unknown, this is when the room decides it is over.
+ *
+ * Fifteen minutes is longer than any song and shorter than a mix or a live set
+ * (which `isCompilation()` keeps out of rooms anyway), so treating an
+ * unmeasurable track as ended at this point is a ceiling, not a guess at its
+ * length. Without it the room could never leave such a track at all. Mirrored
+ * in public/rooms.js.
+ */
+const UNKNOWN_DURATION_CEILING_MS = 15 * 60_000;
 
 export class RoomError extends Error {
   constructor(status, code, message, details = null) {
@@ -66,13 +101,30 @@ export function normaliseTrack(t) {
 }
 
 export function normaliseQueue(list) {
-  return (Array.isArray(list) ? list : [])
-    .map(normaliseTrack)
-    .filter(Boolean)
-    .slice(0, MAX_QUEUE);
+  const seen = new Set();
+  const queue = [];
+  for (const candidate of Array.isArray(list) ? list : []) {
+    const track = normaliseTrack(candidate);
+    // Keep the first copy and its position. Duplicate ids make index-based
+    // transport ambiguous and used to let create/queue-set bypass queue-add's
+    // duplicate rule. De-duplicate before the cap so repeats cannot crowd out
+    // distinct tracks later in the submitted queue.
+    if (!track || seen.has(track.videoId)) continue;
+    seen.add(track.videoId);
+    queue.push(track);
+    if (queue.length === MAX_QUEUE) break;
+  }
+  return queue;
 }
 
-const durationMs = (track) => (track?.durationS > 0 ? track.durationS * 1000 : null);
+const durationMs = (track) => {
+  const seconds = Number(track?.durationS);
+  if (!Number.isFinite(seconds) || seconds <= 0) return null;
+  const ms = seconds * 1000;
+  // Overflow is not a measurable duration. Treat it like an unknown one, with
+  // its normal bounded ceiling, rather than producing an infinite timer.
+  return Number.isFinite(ms) ? ms : null;
+};
 
 /**
  * Where the playhead is at `now`, from stored state.
@@ -82,19 +134,39 @@ const durationMs = (track) => (track?.durationS > 0 ? track.durationS * 1000 : n
  */
 export function derivePlayhead(state, now = Date.now()) {
   const queue = Array.isArray(state?.queue) ? state.queue : [];
+  // The index is normalised to an integer, not merely clamped: `Math.min/max`
+  // leaves a fractional value fractional, which reads `queue[1.5]` = undefined
+  // while the queue is still non-empty — a snapshot with a queue and no track,
+  // which no client path can repair without a command.
+  const wanted = Number.isFinite(state?.index) ? Math.trunc(state.index) : 0;
   const index = queue.length
-    ? Math.min(Math.max(0, state.index ?? 0), queue.length - 1)
+    ? Math.min(Math.max(0, wanted), queue.length - 1)
     : 0;
   const track = queue[index] ?? null;
   const dur = durationMs(track);
-  let positionMs = Math.max(0, Math.round(state?.positionMs ?? 0));
+  const storedPosition = Number(state?.positionMs);
+  let positionMs = Number.isFinite(storedPosition) ? Math.max(0, Math.round(storedPosition)) : 0;
   let playing = Boolean(state?.playing);
-  if (playing) positionMs += Math.max(0, now - (state?.anchorAt ?? now));
+  // A corrupt persisted position or anchor must fall back independently. In
+  // particular, never let NaN reach `limit - positionMs`: Node turns that into
+  // the same 1 ms timeout as an overflowing duration.
+  const anchorAt = state?.anchorAt == null ? NaN : Number(state.anchorAt);
+  if (playing && Number.isFinite(anchorAt)) positionMs += Math.max(0, now - anchorAt);
   let ended = false;
-  // A track with no known duration can never be "ended" here; the host's own
-  // player reports that case (see the `auto` rule in applyCommand).
+  // A track with no known duration has no derivable end — the catalogue simply
+  // did not say, and the client cannot invent one either. Left at that, nothing
+  // could ever make such a track "ended": `scheduleEnd` returns early, the
+  // `auto` rule in applyCommand refuses every auto-advance, and a host-only room
+  // whose host had gone to sleep stayed frozen on that track until housekeeping
+  // deleted the room hours later. So it is treated as ended after a ceiling no
+  // song reaches. public/rooms.js applies the same ceiling to the auto-next
+  // suppression, which is what lets the two sides agree on "this is over".
   if (dur != null && positionMs >= dur) {
     positionMs = dur;
+    ended = true;
+    playing = false;
+  } else if (dur == null && positionMs >= UNKNOWN_DURATION_CEILING_MS) {
+    positionMs = UNKNOWN_DURATION_CEILING_MS;
     ended = true;
     playing = false;
   }
@@ -103,14 +175,21 @@ export function derivePlayhead(state, now = Date.now()) {
 
 const clampPosition = (value, track) => {
   const max = durationMs(track);
-  const n = Math.max(0, Math.round(Number(value) || 0));
+  const numeric = Number(value);
+  const n = Number.isFinite(numeric) ? Math.max(0, Math.round(numeric)) : 0;
   return max != null ? Math.min(n, max) : n;
 };
 
 const nowIso = () => new Date().toISOString();
 
-/** The wire object. `at` is the server instant `positionMs` was true. */
-export function snapshotFor(row, { userId = null } = {}) {
+/**
+ * The wire object. `at` is the server instant `positionMs` was true.
+ *
+ * `includeActor` is off for the public (guest) shape: `updatedBy` carries an
+ * account id and display name, and names are not a public-room resource — the
+ * guest page never renders it, so it must not be sent either.
+ */
+export function snapshotFor(row, { userId = null, includeActor = true } = {}) {
   const stored = parseRoomState(row) ?? { queue: [], index: 0, positionMs: 0, playing: false };
   const now = Date.now();
   const ph = derivePlayhead(stored, now);
@@ -132,7 +211,7 @@ export function snapshotFor(row, { userId = null } = {}) {
     queue: ph.queue,
     track: ph.track,
     updatedAt: Date.parse(row.updatedAt) || now,
-    ...(stored.updatedBy ? { updatedBy: stored.updatedBy } : {}),
+    ...(includeActor && stored.updatedBy ? { updatedBy: stored.updatedBy } : {}),
     createdAt: Date.parse(row.createdAt) || now,
     // Anonymous listeners in a public room. They have no membership row by
     // design; the open stream is the only trace, which is why this is a count
@@ -161,16 +240,64 @@ function entryFor(code) {
   return entry;
 }
 
-function dropSub(code, sub) {
+function dropSub(code, sub, { notify = true } = {}) {
   const entry = hub.get(code);
-  if (!entry) return;
-  entry.subs.delete(sub);
+  if (!entry || !entry.subs.delete(sub)) return;
   try { sub.res.end(); } catch { /* already gone */ }
-  publish(code, 'members', presencePayload(code));
+  if (notify) publish(code, 'members', presencePayload(code));
   if (!entry.subs.size) {
     clearInterval(entry.ticker);
+    clearTimeout(entry.endTimer);
     hub.delete(code);
   }
+}
+
+/**
+ * Publish the moment a playing room reaches the end of its track.
+ *
+ * `ended` is derived, not stored, so nothing used to *notify* anyone when the
+ * playhead crossed it: clients kept their last `playing: true` snapshot and
+ * their target position grew past the duration forever, which made an
+ * un-advanced room restart and jump to the end about once a second. The derived
+ * end is a known instant, so arm one timer for it (per room, replaced on every
+ * state change, unref'd) and broadcast the ended snapshot when it fires.
+ */
+function scheduleEnd(code) {
+  const entry = hub.get(code);
+  if (!entry) return;
+  clearTimeout(entry.endTimer);
+  entry.endTimer = null;
+  const row = getRoomRow(code);
+  if (!row || row.endedAt) return;
+  const ph = derivePlayhead(parseRoomState(row) ?? {}, Date.now());
+  if (!ph.playing || ph.ended) return;
+  // An unknown duration still gets a timer. derivePlayhead() ends such a track
+  // at UNKNOWN_DURATION_CEILING_MS, so this is the instant the room needs a
+  // wake-up at — returning here instead (the old behaviour) meant the state
+  // frame that announces "ended" was never published and no client was ever
+  // told the track was over.
+  const limit = durationMs(ph.track) ?? (ph.track ? UNKNOWN_DURATION_CEILING_MS : null);
+  if (limit == null || !Number.isFinite(limit)) return;
+  const remaining = limit - ph.positionMs;
+  // Very long tracks need more than one timeout. At each chunk boundary the
+  // callback below re-reads state and calls scheduleEnd again if it is genuinely
+  // early, so no accuracy is lost and a corrupt row cannot create a 1 ms loop.
+  const wait = Number.isFinite(remaining) ? Math.max(0, remaining) : 0;
+  const delay = Math.max(1, Math.min(wait + 10, MAX_TIMER_DELAY_MS));
+  entry.endTimer = setTimeout(() => {
+    entry.endTimer = null;
+    if (!hub.has(code)) return;
+    const fresh = getRoomRow(code);
+    if (!fresh || fresh.endedAt) return;
+    const atEnd = derivePlayhead(parseRoomState(fresh) ?? {}, Date.now());
+    if (!atEnd.ended) {
+      if (!atEnd.playing) return; // paused or advanced in the meantime
+      scheduleEnd(code); // the timer fired a hair early
+      return;
+    }
+    publish(code, 'state', snapshotFor(fresh, { userId: null }));
+  }, delay);
+  entry.endTimer.unref?.();
 }
 
 /** How many anonymous listeners are connected right now. */
@@ -195,21 +322,79 @@ export function listenerCount(code) {
   return online.size + guests;
 }
 
-export function publish(code, event, data) {
+export function publish(code, event, data, { notifyDrops = true } = {}) {
   const entry = hub.get(code);
   if (!entry?.subs.size) return;
   const payload = frame(event, data);
   // A guest must never receive the roster: account names are not a public-room
   // resource, so the presence event is shaped per subscriber.
-  let guestPayload = null;
+  let guestPresence = null;
+  let dropped = 0;
+  // A `state` frame is a snapshot, and a snapshot is per-viewer: the caller
+  // built it for the commander, whose `joined` flag and (for a guest, via
+  // publicSnapshotData) roster-free shape are not every subscriber's. Clients
+  // treat `state` exactly like the initial snapshot of their own stream, so
+  // each subscriber gets the snapshot the same viewer would have fetched —
+  // members snapshotFor themselves, guests get the public shape. Memoised per
+  // userId so a room of fifty still pays one query set per *viewer*, and only
+  // on the (human-frequency) command path, never per tick.
+  const row = event === 'state' ? getRoomRow(code) : null;
+  const memberFrames = new Map();
+  const memberStateFrame = (userId) => {
+    if (!memberFrames.has(userId)) {
+      memberFrames.set(userId, frame('state', row ? snapshotFor(row, { userId }) : data));
+    }
+    return memberFrames.get(userId);
+  };
+  let guestState = null;
   for (const sub of [...entry.subs]) {
     let out = payload;
-    if (sub.guest && event === 'members') {
-      guestPayload ??= frame('members', { members: [], guests: data.guests, listeners: data.listeners });
-      out = guestPayload;
+    if (event === 'state') {
+      if (sub.guest) {
+        // No 403 gate here (unlike publicSnapshot): a state frame can only
+        // follow a room the guest is already in. If the room just went
+        // private, the eviction below closes their stream; a snapshot that
+        // cannot be built simply is not sent to them.
+        if (guestState === null) {
+          try { guestState = frame('state', publicSnapshotData(code)); } catch { guestState = false; }
+        }
+        out = guestState || null;
+      } else {
+        out = memberStateFrame(sub.userId);
+      }
+    } else if (sub.guest && event === 'members') {
+      guestPresence ??= frame('members', { members: [], guests: data.guests, listeners: data.listeners });
+      out = guestPresence;
     }
-    try { sub.res.write(out); } catch { dropSub(code, sub); }
+    // Dropping a subscriber must not re-enter publish once per drop: a sweep
+    // that evicts ten stalled sockets would otherwise nest ten deep.
+    if (Number(sub.res.writableLength) > MAX_BUFFERED_BYTES) {
+      dropSub(code, sub, { notify: false });
+      dropped += 1;
+      continue;
+    }
+    if (out) {
+      try { sub.res.write(out); } catch { dropSub(code, sub, { notify: false }); dropped += 1; }
+    }
   }
+  // A terminal room broadcast is followed immediately by bulk teardown. A write
+  // failure during that broadcast must not wedge a roster frame after `ended`.
+  if (dropped && notifyDrops) publish(code, 'members', presencePayload(code));
+}
+
+/**
+ * A guest-shaped snapshot without the route layer: the same object
+ * `publicSnapshot` returns, minus the 403 gate.
+ */
+function publicSnapshotData(code) {
+  const row = mustGetRoom(code);
+  return {
+    ...snapshotFor(row, { userId: null, includeActor: false }),
+    joined: true,
+    guest: true,
+    members: [],
+    listeners: listenerCount(code),
+  };
 }
 
 /** Every member, with the ones holding a live stream marked online. */
@@ -254,7 +439,16 @@ function startTicker(code) {
  * A guest is in the hub but never in `room_members`: there is no account to
  * remember, and presence is the connection itself.
  */
-export function openStream(code, identity, res, { members } = {}) {
+export function openStream(code, identity, res) {
+  // The capacity check runs before `entryFor`: creating the entry first left an
+  // empty `{subs:0, ticker:null}` map entry behind on every refused connection
+  // (only dropSub ever deletes an empty entry), a slow leak in exactly the
+  // situation — 200 streams — where the process is already at its ceiling.
+  if ((hub.get(code)?.subs.size ?? 0) >= MAX_STREAMS_PER_ROOM) {
+    res.write(frame('room', { ended: false, error: 'This room has too many listeners.' }));
+    res.end();
+    return null;
+  }
   const entry = entryFor(code);
   if (entry.subs.size >= MAX_STREAMS_PER_ROOM) {
     res.write(frame('room', { ended: false, error: 'This room has too many listeners.' }));
@@ -284,11 +478,16 @@ export function openStream(code, identity, res, { members } = {}) {
   } else {
     snapshot = {
       ...snapshotFor(getRoomRow(code), { userId: identity.id }),
-      members: members ?? memberRoster(code),
+      // The subscriber was added above. Recompute here rather than reusing the
+      // route's pre-open roster, whose online flags necessarily predate it.
+      members: memberRoster(code),
       listeners: listenerCount(code),
     };
   }
   res.write(frame('snapshot', snapshot));
+  // A room that is already playing has a known end; make sure the boundary is
+  // broadcast even if the only people present are watching, not commanding.
+  scheduleEnd(code);
   publish(code, 'members', presencePayload(code));
   return sub;
 }
@@ -350,11 +549,18 @@ export function createRoom({ host, visibility = 'public', control = 'everyone', 
   // A room with nothing to play has no playhead to share; the UI asks for a
   // track first, which is one honest step instead of an empty page.
   if (!tracks.length) throw new RoomError(400, 'NO_TRACK', 'Play something first — a room needs a track to share.');
-  for (const t of tracks) upsertTrack(t);
+  // One commit for the whole queue: a 60-track room would otherwise pay 60.
+  transaction(() => { for (const t of tracks) upsertTrack(t); });
+  const selected = Number.isInteger(index)
+    ? Math.min(Math.max(0, index), tracks.length - 1)
+    : 0;
   const state = {
     queue: tracks,
-    index: Math.min(Math.max(0, index), tracks.length - 1),
-    positionMs: Math.max(0, Math.round(positionMs)),
+    index: selected,
+    // Store the same bounded playhead the first snapshot reports; otherwise an
+    // oversized position is only clamped on read and a non-finite one becomes
+    // null when the state is serialised.
+    positionMs: clampPosition(positionMs, tracks[selected]),
     anchorAt: Date.now(),
     playing: Boolean(playing),
     updatedBy: { id: host.id, name: host.name },
@@ -393,22 +599,101 @@ export function joinRoom(code, user) {
 
 export function leaveRoom(code, user) {
   const row = assertOpen(mustGetRoom(code));
-  removeRoomMember(code, user.id);
+  const isHost = row.hostId === user.id;
+  // Leaving is not ending. The host owns `rooms.host_id` whether or not a
+  // membership row exists, so deleting their row only made the room report
+  // `joined: false` to its own host and answer their next command with
+  // `403 NOT_MEMBER` — and under `control: 'host'` that stranded the room,
+  // because nobody else may move the playhead. A host keeps the seat; giving it
+  // up explicitly is transferHost(), and ending the room is endRoom().
+  if (!isHost) removeRoomMember(code, user.id);
   // Orphaning a live stream would leave it watching a room it is no longer in.
+  // One account may hold several streams; remove all of them before paying for
+  // one final roster fanout instead of publishing an intermediate roster per
+  // closed socket (quadratic in a room with several duplicate connections).
   const entry = hub.get(code);
-  for (const sub of [...(entry?.subs ?? [])]) if (sub.userId === user.id) dropSub(code, sub);
+  for (const sub of [...(entry?.subs ?? [])]) {
+    if (sub.userId === user.id) dropSub(code, sub, { notify: false });
+  }
   publish(code, 'members', presencePayload(code));
-  return { ok: true, code: row.code };
+  return { ok: true, code: row.code, host: isHost };
 }
 
 export function endRoom(code, user) {
   const row = assertOpen(mustGetRoom(code));
   if (row.hostId !== user.id) throw new RoomError(403, 'HOST_ONLY', 'Only the host can end the room.');
   endRoomRow(code);
-  publish(code, 'room', { ended: true, code });
+  // The terminal frame is the last event, even if writing it drops a socket.
+  // Teardown is deliberately silent: nobody remains to consume the successive
+  // intermediate member lists, and ending N streams must not publish N times.
+  publish(code, 'room', { ended: true, code }, { notifyDrops: false });
   const entry = hub.get(code);
-  for (const sub of [...(entry?.subs ?? [])]) dropSub(code, sub);
+  for (const sub of [...(entry?.subs ?? [])]) dropSub(code, sub, { notify: false });
   return { ok: true };
+}
+
+/**
+ * Hand the host seat to another member.
+ *
+ * This is the escape hatch for the worst room state there is: under
+ * `control: 'host'` nobody but the host may move the playhead or end the room,
+ * so a host who simply walks away used to strand everyone until housekeeping
+ * deleted the room hours later. Only the host may give the seat away (otherwise
+ * any member could seize the room), and only to someone who is actually in it —
+ * handing the room to an id that is not a member would produce a room whose host
+ * cannot see it.
+ *
+ * Both halves of the seat move: `rooms.host_id` (authorization) and the member
+ * row's `role` (what the roster, and therefore the client, draws).
+ */
+export function transferHost(code, user, newHostId) {
+  const row = assertOpen(mustGetRoom(code));
+  if (row.hostId !== user.id) throw new RoomError(403, 'HOST_ONLY', 'Only the host can hand the room over.');
+  const target = Number(newHostId);
+  if (!Number.isInteger(target) || target <= 0) {
+    throw new RoomError(400, 'BAD_INPUT', 'Pick the person to hand the room to.');
+  }
+  if (target === row.hostId) throw new RoomError(409, 'ALREADY_HOST', 'They are already hosting this room.');
+  if (!getRoomMember(code, target)) {
+    throw new RoomError(400, 'NOT_MEMBER', 'Only someone who is in the room can take it over.');
+  }
+
+  transaction(() => {
+    setRoomHost(code, target);
+    setRoomMemberRole(code, target, 'host');
+    // The old host stays a member: losing the seat is not being removed from the
+    // room, and a host who was also listening should keep their place in it.
+    setRoomMemberRole(code, row.hostId, 'member');
+  });
+
+  const fresh = getRoomRow(code);
+  const snapshot = snapshotFor(fresh, { userId: user.id });
+  // State first, then presence, then the room frame: a client applies the
+  // snapshot and re-reads its own permissions from the roster that follows. The
+  // same order updateRoom() uses.
+  publish(code, 'state', snapshot);
+  publish(code, 'members', presencePayload(code));
+  publish(code, 'room', { hostId: fresh.hostId, control: fresh.control, code: fresh.code });
+  scheduleEnd(code);
+  return snapshot;
+}
+
+/**
+ * Mark a room as still in use, without a command.
+ *
+ * Presence is the SSE stream (see `liveCodes`), so a listener on the polling
+ * fallback — a proxy that blocks streaming, a browser without EventSource — is
+ * invisible to `expireRooms` and their room could be deleted while they were
+ * actively following it. `GET /state` is that client's heartbeat, so it says so.
+ * A no-op for a room that is already gone: there is nothing left to keep alive.
+ */
+export function touchRoomPresence(code) {
+  try {
+    touchRoomRow(code);
+  } catch {
+    // A room deleted between the caller's viewRoom() and this write needs no
+    // presence, and the caller already has its snapshot.
+  }
 }
 
 export function updateRoom(code, user, patch = {}) {
@@ -420,20 +705,28 @@ export function updateRoom(code, user, patch = {}) {
   if (control && !CONTROLS.has(control)) throw new RoomError(400, 'BAD_INPUT', 'Control must be everyone or host.');
   updateRoomMeta(code, { visibility, control });
   const fresh = getRoomRow(code);
+  // Going private is a revocation, not a label: anonymous listeners had no
+  // account to remove, so their streams are closed now rather than left open
+  // until they disconnect. The eviction runs BEFORE the state broadcast: a
+  // guest used to receive one last full `state` frame (queue and track intact)
+  // on the same tick the room stopped sharing it, and only then the `room`
+  // eviction.
+  if (fresh.visibility === 'private') {
+    // Drop with notify disabled and publish once after the loop: notifying per
+    // guest would broadcast N roster frames in one tick, all describing the
+    // same intermediate states of a single eviction (mirrors the buffered-drop
+    // sweep in publish).
+    const guests = [...(hub.get(code)?.subs ?? [])].filter((s) => s.guest);
+    for (const sub of guests) {
+      try { sub.res.write(frame('room', { code, removed: true, reason: 'This room is now private.' })); } catch {}
+      dropSub(code, sub, { notify: false });
+    }
+    if (guests.length) publish(code, 'members', presencePayload(code));
+  }
   const snapshot = snapshotFor(fresh, { userId: user.id });
   publish(code, 'state', snapshot);
   publish(code, 'room', { visibility: fresh.visibility, control: fresh.control, code });
-  // Going private is a revocation, not a label: anonymous listeners had no
-  // account to remove, so their streams are closed now rather than left open
-  // until they disconnect.
-  if (fresh.visibility === 'private') {
-    const entry = hub.get(code);
-    for (const sub of [...(entry?.subs ?? [])]) {
-      if (!sub.guest) continue;
-      try { sub.res.write(frame('room', { code, removed: true, reason: 'This room is now private.' })); } catch {}
-      dropSub(code, sub);
-    }
-  }
+  scheduleEnd(code);
   return snapshot;
 }
 
@@ -444,7 +737,12 @@ export function inviteUser(code, host, { name = null, userId = null } = {}) {
   if (row.hostId !== host.id) throw new RoomError(403, 'HOST_ONLY', 'Only the host can invite people.');
   let target = null;
   if (Number.isInteger(userId)) {
-    target = searchUsers('', null, 50).find((u) => u.id === userId) ?? null;
+    // Look the account up directly. Searching for "" and taking the first 50
+    // hits silently refused every user whose name sorts after the fiftieth, and
+    // "no such user" is the honest answer for a disabled one.
+    const u = getUser(userId);
+    if (!u || u.disabled) throw new RoomError(404, 'NO_USER', 'No account with that name.');
+    target = { id: u.id, name: u.name };
   }
   if (!target) {
     const wanted = String(name ?? '').trim().toLowerCase();
@@ -491,23 +789,43 @@ export function applyCommand(code, user, body = {}) {
   const type = String(body.type ?? '');
   const isHost = row.hostId === user.id;
 
-  // Host-only control: a member may still suggest a track (a queue is a
-  // suggestion), but not move everyone's playhead.
-  if (row.control === 'host' && !isHost && type !== 'queue-add') {
-    throw new RoomError(403, 'HOST_ONLY', 'Only the host controls this room.');
-  }
-
   const base = parseRoomState(row) ?? { queue: [], index: 0, positionMs: 0, playing: false };
   const now = Date.now();
   const ph = derivePlayhead(base, now);
+  const dur = durationMs(ph.track);
+  // A natural continuation is not a skip: once the track has really ended, any
+  // member may carry the room forward whatever the control policy says. The
+  // policy gate used to run first, so under `control: 'host'` that exemption
+  // was unreachable and a room froze at the end of EVERY track once the host's
+  // phone went to sleep — the exact case the exemption exists for.
+  const autoAdvance = Boolean(body.auto)
+    // Only forward continuation is natural. `prev` is always transport control:
+    // the shared exemption must never let a member move a host-only room back.
+    && type === 'next'
+    && (ph.ended || (dur != null && ph.positionMs >= dur - AUTO_END_TOLERANCE_MS));
+
+  // Host-only control: a member may still suggest a track (a queue is a
+  // suggestion), but not move everyone's playhead.
+  if (row.control === 'host' && !isHost && type !== 'queue-add' && !autoAdvance) {
+    throw new RoomError(403, 'HOST_ONLY', 'Only the host controls this room.');
+  }
 
   // Two people pressing next at the same moment must advance once. A relative
   // command is therefore only valid against the revision it was formed on;
   // the loser follows the winner. Absolute commands rebase instead — the user
   // asked for a position, not for a change to the old one.
-  const rev = Number.isFinite(body.rev) ? Number(body.rev) : row.rev;
-  if ((type === 'next' || type === 'prev') && rev !== row.rev) {
-    throw new RoomError(409, 'STALE', 'The room already moved on.', snapshotFor(row, { userId: user.id }));
+  //
+  // The revision is REQUIRED for a relative command, and required to be an
+  // integer: a missing or malformed `rev` used to fall back to "current", so
+  // `{type:'next'}` bypassed the very check that makes "two people pressing
+  // next advance once" true.
+  if (type === 'next' || type === 'prev') {
+    if (!Number.isInteger(body.rev)) {
+      throw new RoomError(400, 'BAD_INPUT', 'Say which revision of the room this command is based on.');
+    }
+    if (body.rev !== row.rev) {
+      throw new RoomError(409, 'STALE', 'The room already moved on.', snapshotFor(row, { userId: user.id }));
+    }
   }
 
   const state = {
@@ -560,11 +878,13 @@ export function applyCommand(code, user, body = {}) {
     case 'queue-set': {
       const tracks = normaliseQueue(body.queue);
       if (!tracks.length) throw new RoomError(400, 'NO_TRACK', 'Nothing to play.');
-      for (const t of tracks) upsertTrack(t);
       const i = Number.isInteger(body.index) ? body.index : 0;
+      // Every rejection belongs before the catalogue write. An invalid index is
+      // not consent to insert otherwise valid, attacker-chosen track metadata.
       if (i < 0 || i >= tracks.length) throw new RoomError(400, 'BAD_INPUT', 'No such track in the queue.');
-      state.queue = tracks.slice(0, MAX_QUEUE);
-      state.index = Math.min(i, state.queue.length - 1);
+      transaction(() => { for (const t of tracks) upsertTrack(t); });
+      state.queue = tracks;
+      state.index = i;
       state.positionMs = clampPosition(body.positionMs ?? 0, state.queue[state.index]);
       state.anchorAt = now;
       state.playing = body.playing !== false;
@@ -575,7 +895,7 @@ export function applyCommand(code, user, body = {}) {
       if (!state.queue.length) throw new RoomError(400, 'EMPTY', 'The queue is empty.');
       // A natural continuation is allowed by anyone, but only once the track has
       // really ended; otherwise it is a skip and obeys the control policy.
-      if (body.auto && !ph.ended && !isHost) {
+      if (body.auto && !autoAdvance && !isHost) {
         throw new RoomError(403, 'NOT_ENDED', 'That track has not finished yet.');
       }
       const n = state.queue.length;
@@ -586,18 +906,45 @@ export function applyCommand(code, user, body = {}) {
       const track = normaliseTrack(body.track ?? body);
       if (!track) throw new RoomError(400, 'BAD_INPUT', 'That track cannot be added.');
       if (state.queue.length >= MAX_QUEUE) throw new RoomError(409, 'QUEUE_FULL', 'This room’s queue is full.');
-      upsertTrack(track);
       const dupe = state.queue.findIndex((t) => t.videoId === track.videoId);
+      // Repeating an add remains a 409 no-op. Validate first so even the global
+      // catalogue, not just this room's queue and revision, is left untouched.
       if (dupe >= 0) throw new RoomError(409, 'IN_QUEUE', 'That track is already in the queue.');
+      upsertTrack(track);
       // Adding to an empty room starts it: silence with a queue is a bug.
       if (!state.queue.length) jump(0);
       state.queue.push(track);
       break;
     }
     case 'queue-remove': {
-      const i = Number.isInteger(body.index)
-        ? body.index
-        : state.queue.findIndex((t) => t.videoId === String(body.videoId ?? ''));
+      const wanted = body.videoId == null ? '' : String(body.videoId);
+      // Removal is by TRACK, not by position, whenever the client says which
+      // track it means. Removing "index 2" after the queue shifted underneath
+      // deletes a different song than the one the user pointed at (a retried
+      // request is the obvious way to get there), so:
+      //   * `videoId` is the idempotent form — already gone is the outcome the
+      //     caller wanted, and it must never take a neighbour with it;
+      //   * `index` alone is only honoured against the revision the client was
+      //     looking at, so a stale index is refused (`409 STALE`) instead of
+      //     silently deleting the wrong row.
+      if (wanted) {
+        const i = state.queue.findIndex((t) => t.videoId === wanted);
+        if (i < 0) return snapshotFor(row, { userId: user.id }); // already removed
+        if (i === ph.index) throw new RoomError(400, 'CURRENT', 'That track is playing — skip it instead.');
+        state.queue.splice(i, 1);
+        if (i < ph.index) state.index = ph.index - 1;
+        break;
+      }
+      if (!Number.isInteger(body.index)) {
+        throw new RoomError(400, 'BAD_INPUT', 'Say which track to remove.');
+      }
+      if (!Number.isInteger(body.rev)) {
+        throw new RoomError(400, 'BAD_INPUT', 'Say which revision of the room this command is based on.');
+      }
+      if (body.rev !== row.rev) {
+        throw new RoomError(409, 'STALE', 'The room already moved on.', snapshotFor(row, { userId: user.id }));
+      }
+      const i = body.index;
       if (i < 0 || i >= state.queue.length) throw new RoomError(400, 'BAD_INPUT', 'No such track in the queue.');
       if (i === ph.index) throw new RoomError(400, 'CURRENT', 'That track is playing — skip it instead.');
       state.queue.splice(i, 1);
@@ -617,6 +964,8 @@ export function applyCommand(code, user, body = {}) {
   updateRoomState(code, { state, rev: row.rev + 1, updatedAt: nowIso() });
   const snapshot = snapshotFor(getRoomRow(code), { userId: user.id });
   publish(code, 'state', snapshot);
+  // Arm the derived end broadcast for whatever this command started.
+  scheduleEnd(code);
   return snapshot;
 }
 
@@ -684,7 +1033,7 @@ export function publicSnapshot(code) {
     throw new RoomError(403, 'PRIVATE', 'This room is private. Sign in and ask the host to invite you.');
   }
   const snapshot = {
-    ...snapshotFor(row, { userId: null }),
+    ...snapshotFor(row, { userId: null, includeActor: false }),
     joined: true,
     guest: true,
     // Names of account members are not a public-room resource: a guest gets the

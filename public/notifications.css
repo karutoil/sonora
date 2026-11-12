@@ -53,9 +53,13 @@
   flex-direction:column;
   width:min(360px,calc(100vw - 24px));
   max-height:min(70vh,540px);
+  /* the app's warm charcoal material: page → panel, lit from above, same
+     hairline-and-sheen depth cue as the toast and the profile popover */
+  --notif-surface:var(--panel,#1e1b18);
+  --notif-surface-raised:var(--card,#24211d);
   border-radius:var(--r-md);
   border:1px solid var(--line-2);
-  background:rgba(32,33,39,.985);
+  background:linear-gradient(180deg,var(--notif-surface-raised),var(--notif-surface) 78%);
   color:var(--white);
   box-shadow:var(--shadow-3),inset 0 1px rgba(255,255,255,.07);
   overflow:hidden;
@@ -73,7 +77,7 @@
   position:fixed;
   inset:0;
   z-index:var(--z-overlay);
-  background:rgba(7,7,10,.72);
+  background:rgba(10,8,7,.74);
   animation:notif-fade-in var(--dur-2) var(--ease-out) both
 }
 .notif-backdrop[hidden]{display:none}
@@ -180,7 +184,7 @@
 
 .notif-item{
   display:grid;
-  grid-template-columns:44px minmax(0,1fr);
+  grid-template-columns:48px minmax(0,1fr);
   gap:10px;
   align-items:center;
   width:100%;
@@ -199,17 +203,34 @@
 .notif-item.is-unread{background:var(--accent-soft)}
 .notif-item.is-unread:hover{background:rgba(255,153,123,.19)}
 
+/* The phone sheet is the same warm material, anchored to the bottom edge. */
+@media(max-width:650px){
+  .notif-panel{background:linear-gradient(0deg,var(--notif-surface),var(--notif-surface-raised))}
+}
+
+/* Cover-first: the sleeve leads the row. The 48px box is the row's first grid
+   column, so the size is fixed by the layout; the *frame* is the app's one
+   artwork language — `--r-cover`, a hairline ring, one soft lift — so a
+   notification thumb and a shelf tile read as the same object at two sizes.
+   The ring is drawn outside the frame rather than inset, because the artwork
+   fills the box: a hairline under a full-bleed image is a hairline nobody sees. */
 .notif-thumb{
   display:grid;
   place-items:center;
-  width:44px;
-  height:44px;
-  border-radius:var(--r-xs);
+  width:48px;
+  height:48px;
+  flex:none;
+  border-radius:var(--r-cover,var(--r-xs,8px));
   background:var(--card-2);
   overflow:hidden;
-  box-shadow:inset 0 0 0 1px var(--inset)
+  box-shadow:0 0 0 1px var(--line),0 6px 16px rgba(0,0,0,.34);
+  transition:box-shadow var(--dur-1) var(--ease-out)
 }
-.notif-thumb-img{width:100%;height:100%;object-fit:cover;display:block}
+/* same rest→hover ring step as `.sleeve-tile-art` in app.css: the sleeve is
+   picked up when the row is under the pointer or the keyboard */
+.notif-item:hover .notif-thumb,
+.notif-item:focus-visible .notif-thumb{box-shadow:0 0 0 1px var(--line-2),0 6px 16px rgba(0,0,0,.34)}
+.notif-thumb-img{width:100%;height:100%;object-fit:cover;border-radius:inherit;display:block}
 .notif-thumb-glyph{width:18px;height:18px;fill:none;stroke:var(--soft);stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 
 .notif-copy{display:flex;flex-direction:column;gap:2px;min-width:0}
@@ -333,5 +354,6 @@
   .notif-icon-btn,
   .notif-text-btn,
   .notif-enable,
-  .notif-item{transition:none!important}
+  .notif-item,
+  .notif-thumb{transition:none!important}
 }

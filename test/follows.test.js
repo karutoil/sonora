@@ -20,6 +20,9 @@ const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'sonora-follows-'));
 process.env.SONORA_DB = path.join(TMP, 'follows.db');
 process.env.SONORA_SECRET = 'follows-test-secret';
 process.env.SONORA_PASSPHRASE = 'hunter2hunter2';
+// Fixture-only runs must not even spawn the HTTP server: its normal YouTube
+// warmups would make an otherwise offline unit-test selection touch the network.
+const OFFLINE_UNIT_ONLY = process.env.SONORA_FOLLOWS_OFFLINE === '1';
 
 const db = await import('../src/db.js');
 const { diffReleases, releaseUrl, releaseFromItem, checkArtist, pollFollows } =
@@ -49,9 +52,14 @@ function fakePage(pages) {
   };
 }
 
-/** These three tables are shared by every unit test; each one starts empty. */
+/** These shared tables are reset so one test's baseline cannot seed another. */
 function resetTables() {
-  db.db.exec('DELETE FROM artist_follows; DELETE FROM artist_releases; DELETE FROM notifications;');
+  db.db.exec(`
+    DELETE FROM artist_follows;
+    DELETE FROM artist_releases;
+    DELETE FROM artist_release_state;
+    DELETE FROM notifications;
+  `);
 }
 
 db.bootstrapUser();
@@ -70,6 +78,12 @@ test('a later look reports only ids we have not seen', () => {
   const { fresh, baseline } = diffReleases(['MPRa', 'MPRb'], [{ releaseId: 'MPRa' }, { releaseId: 'MPRb' }, { releaseId: 'MPRc' }]);
   assert.deepEqual(fresh.map((r) => r.releaseId), ['MPRc']);
   assert.deepEqual(baseline, []);
+});
+
+test('an explicitly initialized empty catalogue makes its first releases fresh', () => {
+  const releases = [{ releaseId: 'MPRa' }, { releaseId: 'MPRb' }];
+  assert.deepEqual(diffReleases([], releases, false), { fresh: [], baseline: releases });
+  assert.deepEqual(diffReleases([], releases, true), { fresh: releases, baseline: [] });
 });
 
 test('releaseFromItem normalises an album row and drops unusable ones', () => {
@@ -106,6 +120,7 @@ test('checkArtist records the back catalogue on the first check and notifies not
   assert.equal(first.baseline.length, 2);
   assert.equal(first.name, 'Fixture Artist');
   assert.equal(db.knownReleases(id).length, 2, 'the baseline is persisted for the next check');
+  assert.equal(db.artistReleaseInitialized(id), true);
 });
 
 test('checkArtist reports exactly the release that appeared since the baseline', async () => {
@@ -121,6 +136,24 @@ test('checkArtist reports exactly the release that appeared since the baseline',
   // Third check, same page: nothing is new twice.
   const third = await checkArtist(id, { page: pageOf(id, { albums: [ALBUM_ONE, ALBUM_TWO] }) });
   assert.deepEqual(third.fresh, []);
+});
+
+test('a follow-time check of a known artist fans out fresh releases instead of consuming them', async () => {
+  resetTables();
+  const id = artistId('follow-time');
+  db.followArtist(alice.id, { artistId: id, name: 'Fixture Artist' });
+  await checkArtist(id, { page: pageOf(id, { albums: [ALBUM_ONE] }) });
+
+  // A second follow used to call checkArtist(), store ALBUM_TWO as known, and
+  // discard `fresh`: neither the existing follower nor the new one was notified.
+  db.followArtist(bob.id, { artistId: id, name: 'Fixture Artist' });
+  const result = await checkArtist(id, { page: pageOf(id, { albums: [ALBUM_ONE, ALBUM_TWO] }) });
+
+  assert.deepEqual(result.fresh.map((r) => r.releaseId), [ALBUM_TWO.id]);
+  assert.equal(result.created, 2);
+  for (const user of [alice, bob]) {
+    assert.deepEqual(db.listNotifications(user.id).map((n) => n.title), [ALBUM_TWO.title]);
+  }
 });
 
 // ── unit: pollFollows fan-out ───────────────────────────────────────────
@@ -175,6 +208,164 @@ test('re-running the poll creates no new rows (dedupe is the idempotency key)', 
   assert.equal(db.db.prepare('SELECT COUNT(*) AS n FROM notifications').get().n, 1);
 });
 
+test('a fanout failure rolls back the release baseline and a retry delivers the news', async () => {
+  resetTables();
+  const id = artistId('atomic-fanout');
+  const pages = { [id]: pageOf(id, { albums: [ALBUM_ONE] }) };
+  db.followArtist(alice.id, { artistId: id, name: 'Fixture Artist' });
+  db.followArtist(bob.id, { artistId: id, name: 'Fixture Artist' });
+  await pollFollows({ page: fakePage(pages), now: '2026-01-01T00:00:00.000Z' });
+
+  pages[id] = pageOf(id, { albums: [ALBUM_ONE, ALBUM_TWO] });
+  let failFanout = true;
+  let attempts = 0;
+  const storage = {
+    notify(notification) {
+      const added = db.addNotification(notification);
+      // Fail after the second real insert, not before it: the assertions below
+      // prove that even already-inserted followers are rolled back and retried.
+      attempts += 1;
+      if (failFanout && attempts === 2) throw new Error('injected notification failure');
+      return added;
+    },
+  };
+  const failed = await pollFollows({
+    page: fakePage(pages), storage, now: '2026-01-01T00:01:00.000Z',
+  });
+
+  assert.equal(failed.checked, 0, 'a rolled-back reconciliation is not a successful check');
+  assert.equal(failed.failed, 1);
+  assert.equal(failed.created, 0, 'rolled-back inserts are not counted as created');
+  assert.equal(db.db.prepare('SELECT COUNT(*) AS n FROM notifications').get().n, 0,
+    'the other follower does not retain a half-committed fanout');
+  assert.deepEqual(db.knownReleases(id).map((r) => r.releaseId), [ALBUM_ONE.id],
+    'the fresh release is still owed after the rollback');
+
+  failFanout = false;
+  const retry = await pollFollows({
+    page: fakePage(pages), storage, now: '2026-01-01T02:00:00.000Z',
+  });
+  assert.equal(retry.checked, 1);
+  assert.equal(retry.created, 2);
+  for (const user of [alice, bob]) {
+    assert.deepEqual(db.listNotifications(user.id).map((n) => n.title), [ALBUM_TWO.title]);
+  }
+});
+
+test('a successful empty catalogue stays initialized so its first later release is news', async () => {
+  resetTables();
+  const id = artistId('empty-then-release');
+  db.followArtist(alice.id, { artistId: id, name: 'Fixture Artist' });
+  const pages = { [id]: pageOf(id, { albums: [], singles: [] }) };
+
+  const first = await pollFollows({ page: fakePage(pages) });
+  assert.equal(first.created, 0);
+  assert.deepEqual(first.checked, 1);
+  assert.equal(db.artistReleaseInitialized(id), true, 'empty is a durable successful baseline');
+  assert.deepEqual(db.knownReleases(id), [], 'no synthetic release pollutes the baseline');
+  assert.equal(db.db.prepare(`
+    SELECT COUNT(*) AS n FROM artist_releases
+    WHERE release_id = '__sonora_initialized_empty_v1__'
+  `).get().n, 0, 'the compatibility sentinel is retired');
+  const initializedAt = db.db.prepare(
+    'SELECT initialized_at FROM artist_release_state WHERE artist_id = ?',
+  ).get(id).initialized_at;
+
+  const emptyAgain = await pollFollows({ page: fakePage(pages) });
+  assert.equal(emptyAgain.created, 0);
+  assert.equal(db.db.prepare(
+    'SELECT initialized_at FROM artist_release_state WHERE artist_id = ?',
+  ).get(id).initialized_at, initializedAt, 'polling does not move the original initialization');
+
+  pages[id] = pageOf(id, { albums: [ALBUM_ONE] });
+  const released = await pollFollows({ page: fakePage(pages) });
+  assert.equal(released.created, 1, 'the first real release after an empty baseline must not be swallowed');
+  assert.deepEqual(db.listNotifications(alice.id).map((n) => n.title), [ALBUM_ONE.title]);
+});
+
+test('durable initialization rolls back with a failed reconciliation and can be retried', async () => {
+  resetTables();
+  const id = artistId('empty-rollback');
+  db.followArtist(alice.id, { artistId: id, name: 'Fixture Artist' });
+  const page = pageOf(id, { albums: [], singles: [] });
+
+  await assert.rejects(checkArtist(id, {
+    page,
+    initialize(artist, at) {
+      db.markArtistReleaseInitialized(artist, at);
+      throw new Error('injected initialization failure');
+    },
+  }), /injected initialization failure/);
+  assert.equal(db.artistReleaseInitialized(id), false, 'the inserted state was rolled back');
+  assert.deepEqual(db.knownReleases(id), []);
+
+  await checkArtist(id, { page });
+  const released = await checkArtist(id, { page: pageOf(id, { albums: [ALBUM_ONE] }) });
+  assert.deepEqual(released.fresh.map((r) => r.releaseId), [ALBUM_ONE.id]);
+  assert.equal(released.created, 1, 'the successful retry does not consume the later release');
+});
+
+test('a second follower added during the upstream read joins the same committed fanout', async () => {
+  resetTables();
+  const id = artistId('race-second-follower');
+  db.followArtist(alice.id, { artistId: id, name: 'Fixture Artist' });
+  await pollFollows({ page: pageOf(id, { albums: [ALBUM_ONE] }) });
+
+  const changingPage = async () => {
+    db.followArtist(bob.id, { artistId: id, name: 'Fixture Artist' });
+    return pageOf(id, { albums: [ALBUM_ONE, ALBUM_TWO] })();
+  };
+  const run = await pollFollows({ page: changingPage });
+
+  assert.equal(run.checked, 1);
+  assert.equal(run.created, 2);
+  for (const user of [alice, bob]) {
+    assert.deepEqual(db.listNotifications(user.id).map((n) => n.title), [ALBUM_TWO.title]);
+  }
+});
+
+test('an unfollow during the upstream read is excluded from the committed fanout', async () => {
+  resetTables();
+  const id = artistId('race-unfollow');
+  db.followArtist(alice.id, { artistId: id, name: 'Fixture Artist' });
+  db.followArtist(bob.id, { artistId: id, name: 'Fixture Artist' });
+  await pollFollows({ page: pageOf(id, { albums: [ALBUM_ONE] }) });
+
+  const changingPage = async () => {
+    db.unfollowArtist(bob.id, id);
+    return pageOf(id, { albums: [ALBUM_ONE, ALBUM_TWO] })();
+  };
+  const run = await pollFollows({ page: changingPage });
+
+  assert.equal(run.checked, 1);
+  assert.equal(run.failed, 0, 'one stale follower must not fail everyone else');
+  assert.equal(run.created, 1);
+  assert.deepEqual(db.listNotifications(alice.id).map((n) => n.title), [ALBUM_TWO.title]);
+  assert.deepEqual(db.listNotifications(bob.id), [], 'an unfollowed user gets no release row');
+});
+
+test('an unreadable follower list aborts the check without advancing the baseline', async () => {
+  resetTables();
+  const id = artistId('followers-failure');
+  db.followArtist(alice.id, { artistId: id, name: 'Fixture Artist' });
+  await pollFollows({ page: pageOf(id, { albums: [ALBUM_ONE] }), now: '2026-01-01T00:00:00.000Z' });
+
+  const failed = await pollFollows({
+    page: pageOf(id, { albums: [ALBUM_ONE, ALBUM_TWO] }),
+    storage: { readFollowers() { throw new Error('injected follower read failure'); } },
+    now: '2026-01-01T00:01:00.000Z',
+  });
+  assert.deepEqual(failed, { checked: 0, created: 0, failed: 1 });
+  assert.deepEqual(db.knownReleases(id).map((r) => r.releaseId), [ALBUM_ONE.id]);
+  assert.equal(db.countUnread(alice.id), 0);
+
+  const retry = await pollFollows({
+    page: pageOf(id, { albums: [ALBUM_ONE, ALBUM_TWO] }), now: '2026-01-01T02:00:00.000Z',
+  });
+  assert.equal(retry.created, 1);
+  assert.deepEqual(db.listNotifications(alice.id).map((n) => n.title), [ALBUM_TWO.title]);
+});
+
 test('one artist failing does not stop the sweep, and is retried next time', async () => {
   resetTables();
   const broken = artistId('broken');
@@ -195,6 +386,50 @@ test('one artist failing does not stop the sweep, and is retried next time', asy
     .get(id).at;
   assert.equal(touched(broken), null, 'a failed check stays at the front of the queue');
   assert.ok(touched(healthy), 'a successful check is stamped');
+});
+
+test('three failing artists cannot starve a healthy one', async () => {
+  resetTables();
+  const dead = ['deadOne', 'deadTwo', 'deadThree'].map((tag) => artistId(tag));
+  const healthy = artistId('alive');
+  for (const id of dead) db.followArtist(alice.id, { artistId: id, name: 'Dead Artist' });
+
+  const pages = { [healthy]: pageOf(healthy, { name: 'Healthy Artist', albums: [ALBUM_ONE] }) };
+  const flaky = async (id) => {
+    const page = pages[id];
+    if (page) return page(id);
+    throw new Error('channel is gone');
+  };
+
+  const checkedAt = (id) => db.db.prepare('SELECT last_checked_at AS at FROM artist_follows WHERE artist_id = ?')
+    .get(id).at;
+  const failCount = (id) => db.db.prepare('SELECT fail_count AS n FROM artist_follows WHERE artist_id = ?')
+    .get(id).n;
+
+  // Everything fails. The failure has to be written down, or the same three
+  // dead channels are the first three rows of every future sweep forever.
+  const t0 = '2026-01-01T00:00:00.000Z';
+  const first = await pollFollows({ page: flaky, now: t0, limit: 10 });
+  assert.equal(first.checked, 0);
+  assert.equal(first.failed, 3);
+  for (const id of dead) {
+    assert.equal(failCount(id), 1, 'a failed attempt is recorded on the follow row');
+    assert.equal(checkedAt(id), null, 'a failure is not a check');
+  }
+
+  // A healthy artist is followed. Two hours later the dead channels' backoff
+  // has expired, so they are due again — but a never-failed artist sorts ahead
+  // of anything that has failed, so a one-slot sweep still makes progress.
+  db.followArtist(alice.id, { artistId: healthy, name: 'Healthy Artist' });
+  const run = await pollFollows({ page: flaky, now: '2026-01-01T02:00:00.000Z', limit: 1 });
+
+  assert.equal(run.checked, 1, 'the single slot went to the artist that could answer');
+  assert.equal(run.failed, 0);
+  assert.equal(db.knownReleases(healthy).length, 1, 'the healthy artist is reached and baselined');
+  assert.ok(checkedAt(healthy), 'and it is stamped as checked');
+  for (const id of dead) {
+    assert.equal(checkedAt(id), null, `${id} was retried ahead of the healthy artist`);
+  }
 });
 
 test('a manual check after a follow of a dead channel is quiet, not a flood', async () => {
@@ -292,6 +527,7 @@ const HTTP_ARTIST = `UC${'httpfollows'.padEnd(22, 'z')}`;
 
 let server;
 let cookie = '';
+const httpTest = OFFLINE_UNIT_ONLY ? test.skip : test;
 
 const jfetch = async (p, { cookie: jarOverride, ...opts } = {}) => {
   const jar = jarOverride ?? cookie;
@@ -330,7 +566,7 @@ function serverDb() {
 }
 
 before(async () => {
-  server = await startServer();
+  if (!OFFLINE_UNIT_ONLY) server = await startServer();
 });
 
 after(async () => {
@@ -338,7 +574,7 @@ after(async () => {
   try { fs.rmSync(TMP, { recursive: true, force: true }); } catch {}
 });
 
-test('the follow and notification routes require a session', async () => {
+httpTest('the follow and notification routes require a session', async () => {
   for (const [p, method] of [
     ['/api/follows', 'GET'],
     ['/api/notifications', 'GET'],
@@ -351,7 +587,7 @@ test('the follow and notification routes require a session', async () => {
   }
 });
 
-test('sign in', async () => {
+httpTest('sign in', async () => {
   const { status } = await jfetch('/api/auth/login', {
     method: 'POST', body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
   });
@@ -359,7 +595,7 @@ test('sign in', async () => {
   assert.ok(cookie, 'a session cookie came back');
 });
 
-test('a follow needs a channel id', async () => {
+httpTest('a follow needs a channel id', async () => {
   for (const bad of ['radiohead', 'PLabc', 'UCshort', '']) {
     const { status } = await jfetch(`/api/artists/${encodeURIComponent(bad)}/follow`, {
       method: 'POST', body: JSON.stringify({ name: 'Nope' }),
@@ -368,7 +604,7 @@ test('a follow needs a channel id', async () => {
   }
 });
 
-test('follow → list → artist page → unfollow, and following twice is idempotent', async () => {
+httpTest('follow → list → artist page → unfollow, and following twice is idempotent', async () => {
   const first = await jfetch(`/api/artists/${HTTP_ARTIST}/follow`, {
     method: 'POST', body: JSON.stringify({ name: 'HTTP Fixture Artist', thumb: 'https://img.test/a.jpg' }),
   });
@@ -411,7 +647,7 @@ test('follow → list → artist page → unfollow, and following twice is idemp
   assert.equal(cached.body.following, false, 'the cached payload must not bake in one user’s flag');
 });
 
-test('notifications keep their shape, order and unread count, and can be read', async () => {
+httpTest('notifications keep their shape, order and unread count, and can be read', async () => {
   // Seed two rows (one already read) straight into the server's database: the
   // only HTTP path that creates notifications is a live release, which is not
   // something a test should depend on.
@@ -458,7 +694,7 @@ test('notifications keep their shape, order and unread count, and can be read', 
   assert.equal(all.body.unread, 0);
 });
 
-test('the cached artist page does not carry one user’s following flag', async () => {
+httpTest('the cached artist page does not carry one user’s following flag', async () => {
   // An artist page is cached for ten minutes and shared by every account, so
   // `following` must be computed after the cache read. Two sessions are the only
   // way to prove it: the first user warms the cache while following, the second
@@ -486,7 +722,7 @@ test('the cached artist page does not carry one user’s following flag', async 
   await jfetch(`/api/artists/${HTTP_ARTIST}/follow`, { method: 'DELETE' });
 });
 
-test('a manual check is throttled to once a minute per user', async () => {
+httpTest('a manual check is throttled to once a minute per user', async () => {
   await jfetch(`/api/artists/${HTTP_ARTIST}/follow`, {
     method: 'POST', body: JSON.stringify({ name: 'HTTP Fixture Artist' }),
   });

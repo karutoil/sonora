@@ -914,3 +914,389 @@ test('h: the drawer re-rendering mid-drag does not lose the drag or throw', asyn
     assert.deepEqual(await ctx.errors(), [], 'a re-render during a drag threw');
   });
 });
+
+// ── playback-engine defects (see .audit/playback.md) ─────────────────────
+
+/**
+ * Record the client's own background requests in the page: prefetches and
+ * session saves. Installed as an init script so it wraps the harness stub on
+ * every document load; dispose it before the next navigation.
+ */
+async function spyRequests() {
+  return browser.addInitScript(`(() => {
+    const ux = window.__ux || (window.__ux = {});
+    ux.warm = [];
+    ux.nowBodies = [];
+    const prev = window.fetch;
+    window.fetch = async (input, init) => {
+      const raw = typeof input === 'string' ? input : (input?.url ?? String(input));
+      let url;
+      try { url = new URL(raw, location.href); } catch { return prev(input, init); }
+      const method = String(init?.method || 'GET').toUpperCase();
+      if (url.pathname.startsWith('/api/warm/')) {
+        ux.warm.push(decodeURIComponent(url.pathname.slice('/api/warm/'.length)));
+        return new Response(JSON.stringify({ warming: true }), {
+          status: 202, headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.pathname === '/api/now' && method === 'PUT') ux.nowBodies.push(String(init?.body ?? ''));
+      return prev(input, init);
+    };
+  })()`);
+}
+
+/** Open a row's track menu and click one of its actions. */
+async function rowMenu(videoId, action) {
+  await browser.waitFor(`!!document.querySelector('#page-root .track-row[data-track="${videoId}"]')`, 8000);
+  await browser.eval(`(() => {
+    const row = document.querySelector('#page-root .track-row[data-track="${videoId}"]');
+    if (!row) return false;
+    const r = row.getBoundingClientRect();
+    row.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: r.left + 40, clientY: r.top + 20 }));
+    return true;
+  })()`);
+  await browser.waitFor(`!document.getElementById('context-menu').hidden`, 4000);
+  await browser.eval(`document.querySelector('#context-menu [data-menu-action="${action}"], #context-menu [data-action="${action}"]')?.click()`);
+}
+
+const playerTitle = () => browser.eval(`document.querySelector('#player .player-song-meta strong')?.textContent`);
+
+/** The async row click resolved: playIndex has run and the bar says playing. */
+const waitForPlayingUI = () => browser.waitFor(
+  `document.querySelector('#player .main-toggle')?.getAttribute('aria-label') === 'Pause'`, 5000);
+
+test('i: "Play next" keeps the playing song current even from above the playhead', async (t) => {
+  if (!needBrowser(t)) return;
+  await seedQueue(TRACKS, 1);
+
+  await withPage(browser, BASE, { viewport: VIEW.desktop, page: 'playlist', playlistId: THREE.id }, async () => {
+    await playRow(1, TRACKS[1].title);
+    // Move the song *above* the playhead to play next.
+    await rowMenu(TRACKS[0].videoId, 'next');
+    await browser.waitFor(`document.getElementById('toast-text').textContent === 'Playing next'`, 4000);
+    assert.equal(await playerTitle(), TRACKS[1].title,
+      'queueing a song must not move the playhead to another track');
+
+    // The corrected index is what the server stores, so a reload resumes on the
+    // song that is actually playing. Read it before advancing again, when the
+    // difference between the correct and the shifted index is still visible.
+    await new Promise((r) => setTimeout(r, 400));
+    const now = await fetchNow();
+    const saved = now.state;
+    assert.deepEqual((saved.tracks ?? []).map((x) => x.videoId),
+      [TRACKS[1].videoId, TRACKS[0].videoId, TRACKS[2].videoId],
+      'the saved queue lost the reordered entry');
+    assert.equal(saved.tracks[saved.index]?.videoId, TRACKS[1].videoId,
+      'the saved playhead points at the wrong song after "Play next"');
+
+    // "Next" is now the song just queued — not the one that used to follow.
+    await browser.eval(`document.querySelector('#player [data-action="next"]').click()`);
+    await browser.waitFor(`document.querySelector('#player .player-song-meta strong')?.textContent === ${JSON.stringify(TRACKS[0].title)}`, 5000)
+      .catch(() => {});
+    assert.equal(await playerTitle(), TRACKS[0].title,
+      'after "Play next" on a song above the playhead, next must play that song');
+
+    await openDrawer();
+    assert.deepEqual(await drawerIndexOrder(),
+      [TRACKS[1].videoId, TRACKS[0].videoId, TRACKS[2].videoId],
+      'the queue order after "Play next" is wrong');
+  });
+});
+
+test('j: a failed source does not skip the track the listener picks next', async (t) => {
+  if (!needBrowser(t)) return;
+  await seedQueue(TRACKS, 0);
+
+  await withPage(browser, BASE, { viewport: VIEW.desktop, page: 'playlist', playlistId: THREE.id }, async () => {
+    await playRow(0, TRACKS[0].title);
+    // Row clicks on a collection page resolve after a playlist fetch; wait for
+    // the play intent to have committed before injecting the failure.
+    await waitForPlayingUI();
+    // The stream fails, queueing recovery at the media event's microtask
+    // checkpoint. Press next in the same task, before that checkpoint: the
+    // failed-id guard must not then skip the track the listener chose.
+    await browser.eval(`(() => {
+      document.getElementById('audio').dispatchEvent(new Event('error'));
+      document.querySelector('#player [data-action="next"]').click();
+      return true;
+    })()`);
+    await browser.waitFor(`document.querySelector('#player .player-song-meta strong')?.textContent === ${JSON.stringify(TRACKS[1].title)}`, 4000);
+    // Let any queued recovery and the new track's session writes settle.
+    await new Promise((r) => setTimeout(r, 900));
+    assert.equal(await playerTitle(), TRACKS[1].title,
+      'the failed source\'s retry skipped the track the listener just chose');
+  });
+});
+
+test('a failed next track recovers without waiting for a background timer', async (t) => {
+  if (!needBrowser(t)) return;
+  await seedQueue(TRACKS, 0);
+
+  await withPage(browser, BASE, { viewport: VIEW.desktop, page: 'playlist', playlistId: THREE.id }, async () => {
+    await playRow(0, TRACKS[0].title);
+    await waitForPlayingUI();
+    const nextSource = await browser.eval(`(() => {
+      // Model iOS suspending the error-recovery timer while the PWA is locked.
+      // Media-event work and its microtasks still finish before that freeze.
+      const realSetTimeout = window.setTimeout;
+      window.setTimeout = (fn, delay, ...args) => (
+        delay === 400 ? 0 : realSetTimeout.call(window, fn, delay, ...args)
+      );
+      try {
+        document.getElementById('audio').dispatchEvent(new Event('error'));
+        return new Promise((resolve) => queueMicrotask(() => {
+          // A collection render awaits its data; the source swap itself must
+          // already have happened before any such background work can finish.
+          resolve(document.getElementById('audio').dataset.uxBlockedStream);
+        }));
+      } finally {
+        window.setTimeout = realSetTimeout;
+      }
+    })()`);
+    assert.equal(nextSource, `/api/stream/${TRACKS[1].videoId}`,
+      'a suspended background timer left the failed source waiting until unlock');
+    await browser.waitFor(
+      `document.querySelector('#player .player-song-meta strong')?.textContent === ${JSON.stringify(TRACKS[1].title)}`,
+      4000,
+    );
+  });
+});
+
+test('k: a source swap\'s pause does not paint the transport as paused', async (t) => {
+  if (!needBrowser(t)) return;
+  await seedQueue(TRACKS, 0);
+
+  await withPage(browser, BASE, { viewport: VIEW.desktop, page: 'playlist', playlistId: THREE.id }, async () => {
+    await playRow(0, TRACKS[0].title);
+    await waitForPlayingUI();
+    await playRow(1, TRACKS[1].title);
+    await waitForPlayingUI();
+    // Reassigning `.src` on a playing element queues a `pause` event. The
+    // harness blocks the stream src but not the event, which is the point.
+    await browser.eval(`document.getElementById('audio').dispatchEvent(new Event('pause'))`);
+    const ui = await browser.eval(`({
+      label: document.querySelector('#player .main-toggle')?.getAttribute('aria-label'),
+      playing: document.getElementById('player').classList.contains('is-playing'),
+    })`);
+    assert.equal(ui.label, 'Pause', 'a source-swap pause flipped the play button to "Play" during the cold load');
+    assert.equal(ui.playing, true, 'a source-swap pause cleared the playing state');
+  });
+});
+
+test('l: a station page that lands after another queue is dropped', async (t) => {
+  if (!needBrowser(t)) return;
+  await seedQueue(TRACKS, 0);
+
+  await withPage(browser, BASE, { viewport: VIEW.desktop, page: 'station' }, async () => {
+    // Slowness is applied before the click, and only after the station itself
+    // has painted its real hero (nav() accepts the skeleton too).
+    await browser.waitFor(`!!document.querySelector('#page-root [data-action="play-station"]')`, 8000);
+    await browser.eval(`window.__ux.delays['station-next'] = 1200`);
+    await browser.eval(`document.querySelector('#page-root [data-action="play-station"]').click()`);
+    // Start a playlist while that page is still coming.
+    await nav(browser, 'playlist', { playlistId: THREE.id });
+    await browser.waitFor(`!!document.querySelector('#page-root [data-action="play-collection"]')`, 8000);
+    await browser.eval(`document.querySelector('#page-root [data-action="play-collection"]').click()`);
+    await browser.waitFor(`document.querySelector('#player .player-song-meta strong')?.textContent === ${JSON.stringify(TRACKS[0].title)}`, 5000);
+    // Wait past the delayed station response.
+    await new Promise((r) => setTimeout(r, 1600));
+
+    await openDrawer();
+    const ids = await drawerIndexOrder();
+    assert.deepEqual(ids, TRACKS.map((x) => x.videoId),
+      `a station page landed after the playlist started and tailed the queue: ${JSON.stringify(ids)}`);
+    assert.equal(await browser.eval(`(window.__ux.stationNext || []).length`), 1,
+      'the station should have been asked once before the listener left');
+  });
+});
+
+test('m: prefetch is debounced to the track the listener settles on', async (t) => {
+  if (!needBrowser(t)) return;
+  const dispose = await spyRequests();
+  try {
+    await seedQueue(TRACKS, 0);
+    await withPage(browser, BASE, { viewport: VIEW.desktop }, async () => {
+      await browser.eval(`window.__ux.warm.length = 0`);
+      // Mash next: each skip used to fire its own full download.
+      for (let i = 0; i < 3; i++) {
+        await browser.eval(`document.querySelector('#player [data-action="next"]').click()`);
+        await new Promise((r) => setTimeout(r, 60));
+      }
+      await new Promise((r) => setTimeout(r, 700));
+      const warm = await browser.eval(`window.__ux.warm.slice()`);
+      assert.ok(warm.length <= 2,
+        `mashing next fired ${warm.length} prefetches (${warm.join(', ')}); the abandoned tracks must not each start a download`);
+      assert.equal(warm.at(-1), TRACKS[1].videoId,
+        'the next song of the track the listener settled on must still be prefetched');
+    });
+  } finally {
+    await dispose();
+  }
+});
+
+test('n: an emptied queue promotes the next "Add to queue" to current', async (t) => {
+  if (!needBrowser(t)) return;
+  await seedQueue([TRACKS[0]], 0);
+
+  await withPage(browser, BASE, { viewport: VIEW.desktop }, async () => {
+    assert.equal(await playerTitle(), TRACKS[0].title, 'the single-track session did not restore');
+    // Dislike the only song away: the queue is now empty and index -1.
+    await browser.eval(`document.querySelector('#player [data-action="dislike"]').click()`);
+    await browser.waitFor(`document.querySelector('#player').classList.contains('is-empty')`, 5000);
+    assert.equal(await playerTitle(), 'Nothing playing');
+
+    await nav(browser, 'playlist', { playlistId: THREE.id });
+    await rowMenu(TRACKS[1].videoId, 'queue-add');
+    await browser.waitFor(`document.querySelector('#player .player-song-meta strong')?.textContent === ${JSON.stringify(TRACKS[1].title)}`, 4000)
+      .catch(() => {});
+    assert.equal(await playerTitle(), TRACKS[1].title,
+      'adding a song to an emptied queue left the player on "Nothing playing"');
+    assert.equal(await browser.eval(`document.getElementById('player').classList.contains('is-empty')`), false);
+    assert.equal(await browser.eval(`document.querySelector('#player .main-toggle')?.disabled`), false,
+      'the play button stayed disabled with a song in the queue');
+  });
+});
+
+test('o: disliking a song above the playhead repaints the open queue', async (t) => {
+  if (!needBrowser(t)) return;
+  await seedQueue(TRACKS, 2);
+
+  await withPage(browser, BASE, { viewport: VIEW.desktop, page: 'playlist', playlistId: THREE.id }, async () => {
+    await playRow(2, TRACKS[2].title);
+    await browser.waitFor(`document.querySelectorAll('#page-root .track-row[data-track]').length >= 3`, 6000);
+    // Less-like the top song (above the playhead). It stays in the playlist —
+    // only the play queue drops it — so assert on the queue, not the rows.
+    await browser.eval(`document.querySelector('#page-root .track-row[data-track="${TRACKS[0].videoId}"] [data-action="dislike"]').click()`);
+    await browser.waitFor(`(window.__ux?.dislikes ?? []).includes('${TRACKS[0].videoId}')`, 6000);
+    await new Promise((r) => setTimeout(r, 300));
+
+    await openDrawer();
+    const rows = await browser.eval(`[...document.querySelectorAll('#queue-drawer [data-queue-row]')]
+      .sort((a, b) => Number(a.dataset.index) - Number(b.dataset.index))
+      .map((r) => ({ video: r.dataset.video, index: Number(r.dataset.index) }))`);
+    assert.deepEqual(rows.map((r) => r.video), [TRACKS[1].videoId, TRACKS[2].videoId],
+      'the removed song is still in the open queue drawer');
+    assert.deepEqual(rows.map((r) => r.index), [0, 1],
+      'the drawer kept stale data-index values after the removal');
+    assert.equal(await playerTitle(), TRACKS[2].title, 'removing a song above the playhead changed the playing song');
+  });
+});
+
+test('p: the session save stays under the keepalive body cap', async (t) => {
+  if (!needBrowser(t)) return;
+  // 60 entries at the server's per-field maxima exceed the 64 KiB keepalive
+  // budget once JSON punctuation is added.
+  const LONG = Array.from({ length: 60 }, (_, i) => ({
+    videoId: `lng${String(i).padStart(8, '0')}`,
+    title: `Track ${i} ${'t'.repeat(290)}`,
+    channel: 'c'.repeat(198),
+    thumb: `https://i.ytimg.com/vi/lng/vi_${'x'.repeat(456)}.jpg`,
+    durationS: 200,
+  }));
+  const long = await seedMultiTrackPlaylist(`Long Queue ${Date.now().toString(36)}`, LONG);
+
+  const dispose = await spyRequests();
+  try {
+    await withPage(browser, BASE, { viewport: VIEW.desktop, page: 'playlist', playlistId: long.id }, async () => {
+      await waitForRows(1);
+      await browser.eval(`document.querySelectorAll('#page-root .track-row[data-track]')[0].click()`);
+      await browser.waitFor(`document.querySelector('#player .player-song-meta strong')?.textContent?.startsWith('Track 0')`, 6000);
+      await browser.eval(`window.__ux.nowBodies.length = 0`);
+
+      // A queue edit persists the whole session window.
+      await openDrawer();
+      assert.equal(await altArrow(LONG[0].videoId, 'down'), true, 'no queue row to reorder');
+      await browser.waitFor(`window.__ux.nowBodies.length > 0`, 5000);
+
+      const bodies = await browser.eval(`window.__ux.nowBodies.slice()`);
+      const body = bodies.at(-1);
+      assert.ok(body.length <= 58_000,
+        `the session save body is ${body.length} bytes; the browser caps keepalive at 64 KiB and throws, so the position silently stops updating`);
+      const payload = JSON.parse(body);
+      assert.ok(Number.isSafeInteger(payload.clientSavedAt) && payload.clientSavedAt >= 0,
+        'browser sends its own save time so arrival order is not mistaken for write order');
+      assert.ok(Number.isSafeInteger(payload.clientSaveSeq) && payload.clientSaveSeq > 0,
+        'same-millisecond browser saves carry a positive sequence');
+      assert.equal(payload.queue.length, 60, 'the 60-track window must survive the trim');
+      assert.ok(payload.queue.some((x) => x.thumb === ''),
+        'the body was not over the cap, so this fixture no longer proves the trim');
+      // The save still reached the server and still points at the playing song.
+      await new Promise((r) => setTimeout(r, 400));
+      const now = await fetchNow();
+      assert.equal(now.state?.clientSavedAt, payload.clientSavedAt, 'server persisted the browser ordering stamp');
+      assert.equal(now.state?.clientSaveSeq, payload.clientSaveSeq, 'server persisted the browser sequence');
+      assert.equal(now.state?.tracks?.[now.state.index]?.videoId, LONG[0].videoId,
+        'the trimmed session lost the playhead');
+    });
+  } finally {
+    await dispose();
+  }
+});
+
+test('q: a shared-queue removal targets the track, not a stale position', async (t) => {
+  if (!needBrowser(t)) return;
+  await seedQueue();
+
+  const cookie = await loginCookie();
+  const created = await fetch(`${BASE}/api/rooms`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', cookie },
+    body: JSON.stringify({ visibility: 'public', control: 'everyone', queue: TRACKS, index: 0, playing: false }),
+  });
+  if (!created.ok) assert.fail(`room create failed: ${created.status} ${await created.text()}`);
+  const room = await created.json();
+
+  await withPage(browser, BASE, { viewport: VIEW.desktop }, async (ctx) => {
+    await browser.eval(`localStorage.setItem('sonora.room', JSON.stringify({ code: ${JSON.stringify(room.code)}, at: Date.now() }))`);
+    await ctx.goto();
+    await browser.waitFor(`!document.getElementById('room-pill').hidden`, 10_000);
+
+    // Record the room commands this page sends, then open the real room page.
+    await browser.eval(`(() => {
+      window.__roomCommands = [];
+      const orig = window.fetch;
+      window.fetch = (input, init) => {
+        const raw = typeof input === 'string' ? input : (input?.url ?? String(input));
+        let u; try { u = new URL(raw, location.href); } catch { return orig(input, init); }
+        if (/^\\/api\\/rooms\\/[^/]+\\/command$/.test(u.pathname) && String(init?.method || '').toUpperCase() === 'POST') {
+          try { window.__roomCommands.push(JSON.parse(init.body)); } catch {}
+        }
+        return orig(input, init);
+      };
+      return true;
+    })()`);
+    await browser.eval(`document.getElementById('room-pill').click()`);
+    await browser.waitFor(`!!document.querySelector('[data-action="open-room-page"]')`, 5000);
+    await browser.eval(`document.querySelector('[data-action="open-room-page"]').click()`);
+    await browser.waitFor(`document.querySelectorAll('#page-root .room-queue-remove').length >= 2`, 10_000);
+
+    const target = await browser.eval(`(() => {
+      const btn = document.querySelector('#page-root .room-queue-remove');
+      const id = btn.dataset.videoId;
+      btn.click();
+      return id;
+    })()`);
+    assert.ok(target, 'the room remove button carries no data-video-id');
+    await browser.waitFor(`(window.__roomCommands || []).some((c) => c.type === 'queue-remove')`, 5000)
+      .catch(() => {});
+    const cmd = await browser.eval(`(window.__roomCommands || []).find((c) => c.type === 'queue-remove')`);
+    assert.ok(cmd, 'pressing remove sent no room command');
+    assert.equal(cmd.videoId, target, 'the removal must name the track it removes');
+    assert.equal('index' in cmd, false,
+      'the removal still relies on a position, which a concurrent queue change can make stale');
+
+    // The server lost exactly that song, and kept the rest in order.
+    const want = TRACKS.filter((x) => x.videoId !== target).map((x) => x.videoId).join();
+    let ids = '';
+    for (let i = 0; i < 24; i++) {
+      const res = await fetch(`${BASE}/api/rooms/${room.code}/state`, { headers: { cookie } });
+      const snap = await res.json().catch(() => null);
+      ids = (snap?.queue ?? []).map((x) => x.videoId).join();
+      if (ids === want) break;
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    assert.equal(ids, want, `the shared queue did not lose exactly the chosen track: ${ids}`);
+    await browser.eval(`localStorage.removeItem('sonora.room')`);
+    assert.deepEqual(await ctx.errors(), [], 'removing a shared queue row logged console errors');
+  });
+});

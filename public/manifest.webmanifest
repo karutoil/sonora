@@ -14,7 +14,23 @@
   "dir": "ltr",
   "categories": ["music", "entertainment", "lifestyle"],
   "prefer_related_applications": false,
-  "launch_handler": { "client_mode": "navigate-existing" },
+  "launch_handler": { "client_mode": "focus-existing" },
+  "screenshots": [
+    {
+      "src": "/screenshots/narrow.png",
+      "sizes": "390x844",
+      "type": "image/png",
+      "form_factor": "narrow",
+      "label": "Discover, with today's picks and recent listening"
+    },
+    {
+      "src": "/screenshots/wide.png",
+      "sizes": "1280x800",
+      "type": "image/png",
+      "form_factor": "wide",
+      "label": "The full library in a desktop window"
+    }
+  ],
   "icons": [
     {
       "src": "/icons/icon-192.png",
@@ -59,28 +75,28 @@
       "short_name": "Discover",
       "description": "Today's picks and your recent listening",
       "url": "/?page=home",
-      "icons": [{ "src": "/icons/icon-96.png", "sizes": "96x96", "type": "image/png" }]
+      "icons": [{ "src": "/icons/shortcuts/wave.png", "sizes": "96x96", "type": "image/png" }]
     },
     {
       "name": "Search",
       "short_name": "Search",
       "description": "Find a song, album or artist",
       "url": "/?page=search",
-      "icons": [{ "src": "/icons/icon-96.png", "sizes": "96x96", "type": "image/png" }]
+      "icons": [{ "src": "/icons/shortcuts/search.png", "sizes": "96x96", "type": "image/png" }]
     },
     {
       "name": "Liked songs",
       "short_name": "Liked",
       "description": "Everything you have hearted",
       "url": "/?collection=liked",
-      "icons": [{ "src": "/icons/icon-96.png", "sizes": "96x96", "type": "image/png" }]
+      "icons": [{ "src": "/icons/shortcuts/heart.png", "sizes": "96x96", "type": "image/png" }]
     },
     {
       "name": "Radio",
       "short_name": "Radio",
       "description": "Endless stations built from your library",
       "url": "/?page=radio",
-      "icons": [{ "src": "/icons/icon-96.png", "sizes": "96x96", "type": "image/png" }]
+      "icons": [{ "src": "/icons/shortcuts/radio.png", "sizes": "96x96", "type": "image/png" }]
     }
   ]
 }

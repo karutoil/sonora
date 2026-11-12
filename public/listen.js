@@ -13,6 +13,7 @@
 // whole set list even though they cannot change it.
 
 import { createAudioSession } from './audio-session.js';
+import { createMediaSession } from './media-session.js';
 import { createRoomSync } from './rooms.js';
 
 const code = document.body.dataset.room;
@@ -25,19 +26,58 @@ const $ = (id) => document.getElementById(id);
 const audioSession = createAudioSession();
 
 /**
+ * Whether this element honours writes to `volume`.
+ *
+ * iOS Safari makes HTMLMediaElement.volume read-only: the assignment is accepted
+ * and silently discarded, so a page that mutes by setting volume to 0 shows
+ * "Muted" and a slider at 0 while the room keeps playing at full volume — and
+ * the guest has no way to silence it (this page claims the `playback` audio
+ * category, so the hardware Ring/Silent switch does not help either). Detect it
+ * once, by writing a value and reading it back, because both things that depend
+ * on it — muting and the 5% starting point — fail silently.
+ */
+const volumeWritable = (() => {
+  const before = Number(audio.volume);
+  const probe = before === 0.5 ? 0.25 : 0.5;
+  try { audio.volume = probe; } catch { return false; }
+  const ok = Math.abs(Number(audio.volume) - probe) < 0.01;
+  try { audio.volume = before; } catch { /* it is not writable; nothing lost */ }
+  return ok;
+})();
+
+/**
  * A room joins at 5%, not at 100%.
  *
  * Someone opening a link in a quiet room, a lecture or a sleeping house should
  * not have the room shouted at them; the control is right there if they want it
  * louder. Deliberately not persisted: this is a fresh visitor, not a profile.
+ *
+ * Where the engine ignores volume writes (see `volumeWritable`) that 5% cannot
+ * exist at all, so the same intent is expressed in the one control every engine
+ * honours: the element starts muted, which the mute button shows as "Unmute".
+ * Silence the guest can undo in one tap beats a room at full volume they cannot
+ * turn down.
  */
 const DEFAULT_VOLUME = 0.05;
 let volume = DEFAULT_VOLUME;
-let muted = false;
+let muted = !volumeWritable;
 
 let started = false;
 let currentId = null;
 let pendingResumeMs = null;
+// A source swap (or a retry) is in flight. The Media Session metadata must keep
+// saying "playing" through it: the pause a `src` assignment queues is not a
+// listener deciding to stop, and publishing it empties the lock-screen widget
+// for the whole cold load.
+let switching = false;
+// The element has no data to play right now. `/api/stream` can block for a
+// whole yt-dlp download, which is a minute of apparent nothing on a cold track.
+let buffering = false;
+// Failed loads of the current track's stream, and which track they belong to —
+// see the `error` handler for why this is bounded.
+let streamAttempts = 0;
+let streamAttemptsId = null;
+let streamRetry = null;
 let lastBarAt = 0;
 let lastMetaAt = 0;
 let lastQueueSig = '';
@@ -311,6 +351,16 @@ const paintStatus = (status, error) => {
   setText('listen-stage-label', {
     live: 'Live', polling: 'Live', connecting: 'Connecting', error: 'Reconnecting', ended: 'Ended', idle: 'Ready',
   }[status] ?? 'Live');
+  if (status === 'ended' || status === 'private') {
+    // A terminal room has no playhead any more, and the correction loop that
+    // would otherwise be the only thing that ever touches this element has
+    // already been stopped. Without this the last track plays on — for the
+    // several minutes it has left — underneath "This room has ended", and this
+    // page offers no pause control at all. `rooms.js` pauses through the same
+    // hook; this is the page's own guarantee rather than a second opinion on it,
+    // and it is idempotent.
+    try { audio.pause(); } catch { /* nothing to pause yet */ }
+  }
   if (status === 'ended') {
     const overlay = $('listen-overlay');
     if (overlay) overlay.hidden = false;
@@ -332,6 +382,16 @@ const paintSync = (ms) => {
     el.textContent = '—';
     return;
   }
+  // "Off by 3.2s" is not the answer to a stall: the number is a claim about
+  // audio moving, and while the element is waiting for data nothing is. Say what
+  // is actually happening instead — a cold `/api/stream` is a minute of silence
+  // behind a disabled button, and a frozen progress bar with no explanation is
+  // indistinguishable from a broken page.
+  if (buffering) {
+    el.dataset.sync = 'warn';
+    el.textContent = 'Buffering…';
+    return;
+  }
   // Before the visitor has started playback the element is parked at the room's
   // position and cannot follow, so the honest label is "waiting for you", not a
   // growing "off by" — the number is a claim about *playing* audio.
@@ -345,6 +405,20 @@ const paintSync = (ms) => {
   else if (d < 1000) { el.dataset.sync = 'warn'; el.textContent = `Sync ${(d / 1000).toFixed(1)}s`; }
   else { el.dataset.sync = 'bad'; el.textContent = `Off by ${(d / 1000).toFixed(1)}s`; }
 };
+
+/**
+ * Is the element waiting for data?
+ *
+ * Driven from the element's own events (`waiting`/`stalled` start it,
+ * `playing`/`canplay` end it) rather than from a timer, because only the engine
+ * knows whether it has enough audio to move.
+ */
+function setBuffering(on) {
+  if (buffering === on) return;
+  buffering = on;
+  document.body.dataset.buffering = on ? '1' : '0';
+  paintSync(Math.abs(sync.driftMs));
+}
 
 function paintProgress() {
   const dur = Number.isFinite(audio.duration) && audio.duration > 0
@@ -366,6 +440,9 @@ function paintProgress() {
   // The venue draws the same clock on the projector and under the room; it is
   // fed from here so there is one timer, not two.
   venue?.paintProgress({ currentTime: cur, duration: dur, ended: Boolean(sync.room?.ended) });
+  // The lock screen's own bar, from the same clock. media-session.js throttles
+  // it to about one call a second, which is what iOS needs.
+  nowPlaying.position();
 }
 
 function markPlaying(on) {
@@ -386,9 +463,15 @@ const paintVolume = () => {
   const label = $('listen-vol-label');
   const btn = $('listen-mute');
   const miniBtn = $('listen-mini-mute');
-  const effective = muted ? 0 : volume;
-  audio.volume = effective;
-  audio.muted = false; // volume 0 is the mute; the element's flag is not used
+  const level = Math.min(1, Math.max(0, Number(volume) || 0));
+  // The flag is the mute, and the only mute iOS honours: a `volume = 0` there is
+  // accepted and ignored, which is how this page used to claim "Muted" while the
+  // room played at full volume. Keep writing the level too, and not only where
+  // it works: a slider and an element that disagree is the bug this finding is
+  // about, and on iOS the write is a no-op, so there is nothing to lose by it.
+  audio.muted = muted;
+  try { audio.volume = muted ? 0 : level; } catch { /* iOS: read-only */ }
+  const effective = muted ? 0 : level;
   if (slider) {
     slider.value = String(Math.round(effective * 100));
     slider.style.setProperty('--fill', `${Math.round(effective * 100)}%`);
@@ -420,6 +503,9 @@ async function ensureVenue() {
         onExit: () => setView('player'),
         onMute: () => toggleMute(),
         onShare: () => copyRoomLink($('listen-copy')),
+        // The venue's gate is the same one tap, in the same gesture: a guest in
+        // the room view must be able to unlock audio without leaving it.
+        onStart: () => startPlayback(),
         onVolume: (next) => {
           volume = Math.min(1, Math.max(0, next));
           if (volume > 0) muted = false;
@@ -434,21 +520,50 @@ async function ensureVenue() {
   return venueLoading;
 }
 
+// Two clicks in quick succession must not interleave: the venue's module is a
+// lazy import, so `setView` really can be in flight when the next one starts.
+// The newest request wins and the older one stops applying anything.
+let viewToken = 0;
+
 async function setView(next, { persist = true } = {}) {
   const target = next === 'venue' ? 'venue' : 'player';
+  const token = (viewToken += 1);
+  const previous = view;
   view = target;
   document.body.dataset.view = view;
   for (const btn of viewButtons) btn.setAttribute('aria-pressed', String(btn.dataset.view === view));
   if (view === 'venue') {
-    const api = await ensureVenue();
-    api.show();
-    if (sync.room) api.paint(sync.room);
-    api.paintVolume({ muted, volume });
+    try {
+      const api = await ensureVenue();
+      if (token !== viewToken) return; // a newer click already decided
+      api.show();
+      if (sync.room) api.paint(sync.room);
+      api.paintVolume({ muted, volume });
+      // The room draws the same clock as the player, and it may be a paused room
+      // whose element will not fire another `timeupdate`: paint it now rather
+      // than opening the venue on a progress bar that only fills once sound
+      // starts.
+      paintProgress();
+      paintGate();
+    } catch (err) {
+      if (token !== viewToken) return;
+      // The venue is a lazy chunk, so it can genuinely fail to arrive (offline,
+      // a proxy, a deploy that replaced the hashed file). A view that cannot
+      // load must not take the room's sound down with it: fall back to the
+      // player and say why, rather than leaving a blank panel and a stuck
+      // `data-view`.
+      view = previous === 'venue' ? 'player' : previous;
+      document.body.dataset.view = view;
+      for (const btn of viewButtons) btn.setAttribute('aria-pressed', String(btn.dataset.view === view));
+      venueLoading = null;
+      showError(`The room view could not load (${err?.message ?? 'network'}). The player still works.`);
+    }
   } else {
     venue?.hide();
     paintProgress();
+    paintGate();
   }
-  if (persist) saveView(view);
+  if (persist && view === target) saveView(view);
   updateMini();
 }
 
@@ -464,20 +579,102 @@ for (const btn of viewButtons) {
  * (a phone that locked, a tab that was backgrounded) the overlay comes back
  * with an honest "Tap to resume" rather than silent nothing.
  */
-function showResume() {
-  // A stale rejection must not undo a successful start: play() promises reject
-  // with AbortError when a src changes under them, and the correction loop tries
-  // play() on its own (without a gesture) until the visitor unlocks audio.
+function showResume(err) {
+  // A rejection is not a refusal. `play()` rejects with AbortError when a source
+  // swap interrupts it, and that is routine here rather than exceptional: the
+  // room's `/api/stream` can block for the whole download of an uncached track,
+  // so the guest's play() promise stays pending for tens of seconds — and any
+  // next-track event in that window aborts it. The old code treated that
+  // AbortError as an autoplay refusal, so a full-screen "Tap to resume" came up
+  // over a track that was in fact starting, and `started` was dropped, which is
+  // what stops the room from following itself. Only NotAllowedError means the
+  // browser refused; an unnamed rejection is treated the same way (the safe
+  // answer, since there is nothing to inspect).
+  const name = err?.name;
+  if (name && name !== 'NotAllowedError') return;
+  // A stale refusal must not undo a successful start.
   if (!audio.paused) return;
-  if (sync.status === 'ended') return;
-  const overlay = $('listen-overlay');
-  if (!overlay) return;
-  overlay.hidden = false;
-  setStartButton('Tap to resume', false);
+  if (sync.status === 'ended' || sync.status === 'private') return;
+  // The swap this rejection came from is over, whatever the source is doing
+  // now: leaving the marker armed would keep the lock screen saying "playing".
+  switching = false;
+  // The browser refused a play() that had no gesture behind it (or that it no
+  // longer trusts), so the visitor's unlock is spent: the gate has to come back
+  // in whichever view they are looking at.
+  started = false;
+  paintGate('Tap to resume');
 }
 
 // The room page uses one shared engine; a guest scores `guests` in the snapshot
 // only, so the count shown here is the room's, not this tab's.
+
+/** How many times a failed `/api/stream` is re-requested before giving up. */
+const STREAM_RETRIES = 3;
+/** The first retry is quick: the room's queue is not waiting for this client. */
+const STREAM_RETRY_MS = 1200;
+
+/**
+ * Point the element at the room's stream.
+ *
+ * `retry` pads the URL, and only that: a request that failed (a truncated
+ * response, a decode error) may still sit in the HTTP cache, and re-assigning
+ * the identical URL could be answered from it. `/api/stream/:videoId` reads the
+ * path only, so a query string is free.
+ */
+function loadSource(videoId, { retry = false } = {}) {
+  // Attempts are counted per track, not per assignment — see scheduleStreamRetry.
+  if (streamAttemptsId !== videoId) { streamAttemptsId = videoId; streamAttempts = 0; }
+  currentId = videoId;
+  // A `src` assignment queues a pause on an element the OS still counts as
+  // playing. That is a swap, not a listener stopping: media-session.js keeps
+  // saying "playing" while this flag is up.
+  switching = true;
+  clearTimeout(streamRetry);
+  streamRetry = null;
+  audio.src = retry ? `/api/stream/${videoId}?r=${streamAttempts}` : `/api/stream/${videoId}`;
+  audio.load();
+}
+
+/**
+ * A failed stream is retried, not abandoned.
+ *
+ * The source is set *before* it loads, so one failed `/api/stream` — a 503 while
+ * the server's yt-dlp download is BOT_GATED, a dropped connection, a decode
+ * failure — used to be the last word on that track: `ensureLoaded()`
+ * short-circuits because the id already matches, the correction loop refuses to
+ * run at all without a loaded source, and the guest gets one small red line and
+ * then silence for the remaining minutes of the track (the room only advances on
+ * the *host's* player). A cold download usually works on the next try, so drop
+ * the id and ask again after a short backoff.
+ *
+ * Returns false once the attempts are spent; the caller says so.
+ */
+function scheduleStreamRetry(videoId) {
+  if (streamAttemptsId !== videoId) { streamAttemptsId = videoId; streamAttempts = 0; }
+  streamAttempts += 1;
+  if (streamAttempts > STREAM_RETRIES) {
+    // Out of attempts. The id is kept on purpose: a null `currentId` makes every
+    // incoming snapshot look like a track change, and each one would re-load the
+    // stream — a request loop against a track that cannot be played.
+    currentId = videoId;
+    return false;
+  }
+  // Nothing has this track loaded while the retry waits, which also keeps the
+  // corrector out of the element instead of seeks against a dead source.
+  currentId = null;
+  clearTimeout(streamRetry);
+  streamRetry = setTimeout(() => {
+    streamRetry = null;
+    // Anything may have happened meanwhile: the room moved on, a snapshot loaded
+    // the track, or the page went away.
+    if (currentId || sync.room?.track?.videoId !== videoId) return;
+    loadSource(videoId, { retry: true });
+    if (started && sync.room?.playing) audio.play().catch(showResume);
+  }, STREAM_RETRY_MS * streamAttempts);
+  setBuffering(true);
+  return true;
+}
+
 const sync = createRoomSync({
   api,
   audio,
@@ -496,14 +693,38 @@ const sync = createRoomSync({
       if (currentId === track.videoId && audio.src && !audio.src.startsWith('data:')) {
         applyPendingResume();
       } else {
-        currentId = track.videoId;
-        audio.src = `/api/stream/${track.videoId}`;
-        audio.load();
+        loadSource(track.videoId);
       }
       paintProgress();
       if (snapshot.playing && started) audio.play().catch(showResume);
     },
-    play: () => { if (started) audio.play().catch(showResume); },
+    /**
+     * The corrector asking for sound.
+     *
+     * A finished element is the case that matters: `rooms.js` only calls a track
+     * finished when it knows the catalogue's duration (`atEnd`), and for a track
+     * it does not know, `play()` on an `ended` element restarts it at 0:00 — the
+     * next tick sees a huge negative drift, hard-seeks to the room's ever-larger
+     * position, lands on the end again, and repeats. The audible result is the
+     * first couple of seconds of the track chopped in a loop until the host
+     * advances. The room's position is the truth: go there and stay quiet. If
+     * that position is past the end the element stays ended, which is exactly
+     * where the room is.
+     */
+    play: () => {
+      if (!started) return;
+      if (audio.ended) {
+        const target = Math.max(0, (sync.positionMs ?? 0) / 1000);
+        // Only when the room really has a different answer: assigning the same
+        // currentTime every tick would fire `seeked` (and a repaint) once a
+        // second for nothing.
+        if (Number.isFinite(target) && Math.abs(target - (Number(audio.currentTime) || 0)) > 0.25) {
+          try { audio.currentTime = target; } catch { /* not seekable */ }
+        }
+        return;
+      }
+      audio.play().catch(showResume);
+    },
     pause: () => { audio.pause(); },
     seek: (seconds) => {
       try { audio.currentTime = Math.max(0, seconds); } catch { /* not seekable yet */ }
@@ -521,65 +742,117 @@ const sync = createRoomSync({
       // The venue is a view of the same snapshot: it never fetches, and it
       // never needs to know that the player exists.
       venue?.paint(snapshot);
+      // The gate's label depends on whether the room has a track at all, and a
+      // guest can open the venue before the first snapshot lands.
+      paintGate();
     },
-    onMembers: () => paintListeners(),
-    onStatus: ({ status, error }) => paintStatus(status, error),
+    onMembers: () => {
+      paintListeners();
+      // The venue's crowd is the room's count, so it follows member events, not
+      // only the next state frame.
+      venue?.setListeners(sync.listeners);
+    },
+    onStatus: ({ status, error }) => { paintStatus(status, error); paintGate(); },
     // The correction loop's drift is only meaningful while this element is
     // actually following the room; `paintSync` decides that from `started`.
     onDrift: (ms) => paintSync(ms),
-    notify: (message, level) => { if (level === 'error') showError(message); },
+    notify: (message, level) => {
+      // A terminal reason (the room ended, went private, or the guest cookie
+      // expired) is the one 'info' a visitor must actually see — the badge
+      // alone only says the room is over, not why. Everything else stays quiet.
+      if (level === 'error' || sync.status === 'ended' || sync.status === 'private') showError(message);
+    },
   },
 });
 
 /**
  * One tap, and the room is playing.
  *
- * The page arrives with the guest cookie already set (the server mints it with
- * the HTML), so everything that does not need a gesture has already happened by
- * the time the visitor taps: the stream is open, the clock is calibrated and the
- * *real* audio source is loaded and seeked. The tap is therefore a plain
- * play() on a ready element — which every browser allows — rather than a dance
- * of silent placeholders that leaves a guest pressing Listen live twice.
+ * This is the page's only entry point into sound, and it is shared by the
+ * player's overlay and the venue's own button: the venue hides `.layout`, so an
+ * overlay inside it would be invisible exactly when a guest needs it. The page
+ * arrives with the guest cookie already set (the server mints it with the
+ * HTML), so by the time the visitor taps, the tap is a plain play() on a ready
+ * element — which every browser allows — rather than a dance of silent
+ * placeholders that leaves a guest pressing Listen live twice. The corollary,
+ * and the whole reason the body is ordered the way it is: the play() comes first
+ * and synchronously, because a promise chain in front of it spends the very
+ * activation that makes it legal.
  */
-$('listen-start')?.addEventListener('click', async () => {
+async function startPlayback() {
   const btn = $('listen-start');
-  const overlay = $('listen-overlay');
   if (!sync.room?.track) {
     setStartButton('Waiting for music', true);
+    paintGate();
     return;
   }
   if (btn) btn.disabled = true;
   clearError();
   audioSession.claim();
+  // Everything that needs the tap's user activation happens here, before the
+  // first `await`: activation is spent by the first one, and both calls below can
+  // take seconds. `calibrate()` is three sequential `/time` probes once its 60 s
+  // cooldown has lapsed, and `ensureLoaded()` can start a blocking `/api/stream`
+  // request that waits for a whole yt-dlp download. Awaiting them first is why a
+  // guest on a slow link tapped, read "Could not start audio: …" and had to tap
+  // again — the play() arrived with no activation left behind it.
+  sync.ensureLoaded();
+  // Re-assert the level inside the gesture: some engines only apply a media
+  // element's volume once the page has been interacted with, and this is the
+  // one interaction this page ever gets.
+  paintVolume();
+  // A paused room must not make a sound on join. Starting and immediately
+  // suspending still counts as the gesture that unlocks the element, so the host
+  // pressing play later needs no second tap from this visitor. An element that
+  // has already finished must not be started at all — `play()` on an `ended`
+  // element restarts it at 0:00, which is the same trap `hooks.play` guards
+  // against for a track whose length the catalogue never supplied.
+  const playCall = audio.ended ? null : audio.play();
+  if (!sync.room?.playing) audio.pause();
+  playCall?.catch?.(showResume);
+  // From here on the room may start playback on its own: the visitor has given
+  // this page the one gesture it needs, and `hooks.play` gates on this.
+  started = true;
+  paintSync(Math.abs(sync.driftMs));
+  paintProgress();
+  paintGate();
   try {
+    // The room's clock is worth having, but never at the price of the tap: the
+    // sound is already on its way, and a failed probe keeps the previous offset.
     await sync.calibrate();
-    // Seek to the room's position as part of the gesture: a seek before the
-    // tap could land on a source that has not buffered.
-    sync.ensureLoaded();
-    audio.volume = muted ? 0 : volume;
-    if (sync.room?.playing) {
-      await audio.play();
-    } else {
-      // A paused room must not make a sound on join. Starting and immediately
-      // suspending still counts as the gesture that unlocks the element, so the
-      // host pressing play later needs no second tap from this visitor.
-      await audio.play();
-      audio.pause();
-    }
-    if (overlay) overlay.hidden = true;
-    // From here on the room may start playback on its own: the visitor has
-    // given this page the one gesture it needs, and `hooks.play` gates on this.
-    started = true;
-    paintSync(Math.abs(sync.driftMs));
     paintProgress();
-  } catch (err) {
-    // Autoplay was refused even with a gesture (rare: an extension, or a
-    // browser that treats the fetch-then-play chain as untrusted). Say so.
-    showError(err?.message ? `Could not start audio: ${err.message}` : 'Could not start audio.');
+  } catch {
+    // The room is still playable on an older offset.
   } finally {
     if (btn && sync.status !== 'ended') btn.disabled = false;
+    paintGate();
   }
-});
+}
+
+/**
+ * The gate: "listen live", "tap to resume", or nothing.
+ *
+ * Both views ask the same question — has this visitor unlocked audio? — so both
+ * are painted from one place. The venue cannot show the player's overlay (it
+ * hides that whole column), so it gets its own button on the stage; a guest in
+ * the venue who is refused autoplay must still be able to start the room.
+ */
+function paintGate(label) {
+  const overlay = $('listen-overlay');
+  // 'ended' and 'private' are both terminal: the page is over either way, and
+  // the gate is where the reason lives — it is just no longer a button to press.
+  const gone = sync.status === 'ended' || sync.status === 'private';
+  const needsTap = !gone && !started;
+  const text = !sync.room?.track ? 'Waiting for music' : (label ?? 'Listen live');
+  // A terminal room keeps its cover: the sleeve is still what the room played,
+  // and the overlay is where the "this room is over" answer lives.
+  if (overlay) overlay.hidden = !(needsTap || gone);
+  if (needsTap) setStartButton(text, !sync.room?.track);
+  if (gone) setStartButton(sync.status === 'ended' ? 'Room ended' : 'Invite only', true, END_ICON);
+  venue?.paintGate({ needsTap, ended: gone, label: text, ready: Boolean(sync.room?.track) });
+}
+
+$('listen-start')?.addEventListener('click', startPlayback);
 
 $('listen-volume')?.addEventListener('input', (e) => {
   volume = Math.min(1, Math.max(0, Number(e.target.value) / 100));
@@ -600,11 +873,19 @@ function applyPendingResume() {
   if (pendingResumeMs == null) return;
   const duration = audio.duration;
   if (!Number.isFinite(duration) || duration <= 0) return;
-  const seconds = pendingResumeMs / 1000;
+  const seconds = Number.isFinite(pendingResumeMs) ? Math.max(0, pendingResumeMs / 1000) : null;
   pendingResumeMs = null;
-  if (Number.isFinite(seconds) && seconds > 0 && seconds < duration - 0.5) {
-    try { audio.currentTime = seconds; } catch { /* not seekable yet */ }
-  }
+  // A position this page cannot trust is not a reason to seek anywhere: leave
+  // the element where it is and let the corrector decide.
+  if (seconds == null) return;
+  // Joining in a track's last half-second is not a reason to start at 0:00.
+  // Skipping the seek there meant the guest heard a burst of the intro, then the
+  // corrector's hard seek to the real position, then silence — three separate
+  // lies about where the room is. Land on the last audible moment instead: the
+  // element reaches its own end a moment later, which is exactly where the room
+  // already is.
+  const target = Math.min(seconds, Math.max(0, duration - 0.5));
+  try { audio.currentTime = target; } catch { /* not seekable yet */ }
 }
 
 // ── sharing ────────────────────────────────────────────────────────────
@@ -697,25 +978,116 @@ window.addEventListener('scroll', queueMini, { passive: true });
 window.addEventListener('resize', queueMini);
 mobileQuery.addEventListener?.('change', queueMini);
 
+// ── the lock screen ────────────────────────────────────────────────────
+/**
+ * The Now Playing widget.
+ *
+ * This is the page people background and lock, and it had no Media Session at
+ * all: no artwork, no title, no scrubber, and no controls — while the system
+ * pause button's default action went straight to the element, which the room's
+ * correction loop then undid within a second, so a guest who paused from the
+ * lock screen heard the music stop and start again forever.
+ *
+ * A guest cannot move the room's playhead (that is the whole contract of the
+ * page), so only the two controls that apply to this device are handled here:
+ *
+ *  - `pause` is honoured locally, by dropping `started` — the same gate the "Tap
+ *    to resume" overlay uses — so the corrector stops asking for sound instead
+ *    of fighting the listener.
+ *  - `play` re-takes the audio session and starts the element synchronously,
+ *    before anything awaits, exactly as the tap does.
+ *
+ * The scrubber is a local seek and the corrector pulls it back to the room's
+ * position within a second. That is what a shared playhead means; the
+ * alternative, publishing no position state at all, leaves the widget looking
+ * dead on the one screen a listener actually sees.
+ */
+const nowPlaying = createMediaSession({
+  audio,
+  getTrack: () => sync.room?.track ?? null,
+  base: location.href,
+  // Warm the artwork before the screen locks: iOS fetches artwork lazily, and
+  // the lock is the worst possible time for a cold fetch.
+  warmArtwork: (src) => { const img = new Image(); img.src = src; },
+  handlers: {
+    play: () => {
+      if (sync.status === 'ended' || sync.status === 'private') return;
+      audioSession.claim();
+      started = true;
+      // Synchronously, for the same reason `startPlayback` does it: whatever
+      // activation a media-session action carries is spent by an await, and the
+      // room's clock is never worth the sound.
+      sync.ensureLoaded();
+      if (sync.room?.playing && !audio.ended) audio.play().catch(showResume);
+      paintSync(Math.abs(sync.driftMs));
+      paintGate();
+    },
+    pause: () => {
+      // Asked for by a person — on the lock screen, on headphones, in the car —
+      // so it must outlive the next correction tick. `started` is that promise.
+      started = false;
+      try { audio.pause(); } catch { /* already stopped */ }
+      paintSync(Math.abs(sync.driftMs));
+      paintGate('Tap to resume');
+    },
+  },
+  hooks: {
+    // A source swap is not a pause: publishing it as one empties the widget for
+    // the whole cold load (media-session.js has the reasoning in full).
+    isSwitching: () => switching,
+  },
+});
+
+// Registered once up front as well: a room that is paused when the guest arrives
+// never fires `playing`, and a lock screen with no controls is the failure this
+// whole block exists to prevent. Registration is idempotent by design.
+nowPlaying.installHandlers();
+
 // ── audio element events ───────────────────────────────────────────────
 
 audio.addEventListener('loadedmetadata', () => {
   applyPendingResume();
   paintProgress();
+  // Duration is finally known: the lock screen can draw its bar, and this may be
+  // the first moment the track can name itself.
+  nowPlaying.sync({ metadata: true, force: true });
 });
-audio.addEventListener('durationchange', paintProgress);
-audio.addEventListener('seeked', paintProgress);
+audio.addEventListener('durationchange', () => {
+  paintProgress();
+  nowPlaying.sync({ force: true });
+});
+audio.addEventListener('seeked', () => {
+  paintProgress();
+  nowPlaying.sync({ force: true });
+});
 audio.addEventListener('playing', () => {
+  // Playing is the truth, so it also ends every doubt: the element has audio,
+  // whatever a rejected play() said earlier. `started` is set unconditionally
+  // here on purpose — gating this on `started` is exactly what used to leave a
+  // full-screen "Tap to resume" overlay sitting over a track that was playing.
+  started = true;
+  switching = false;
+  // A load that reached `playing` worked, so the retry budget starts again.
+  streamAttempts = 0;
+  streamAttemptsId = null;
+  clearTimeout(streamRetry);
+  streamRetry = null;
+  setBuffering(false);
   markPlaying(true);
   paintSync(Math.abs(sync.driftMs));
   paintProgress();
-  const overlay = $('listen-overlay');
-  if (overlay && started) overlay.hidden = true;
+  paintGate();
+  // Re-registered on every play: iOS drops Media Session handlers across an
+  // audio-session interruption (a call, Siri), and the metadata is refreshed so
+  // a track that started while the phone was already locked names itself.
+  nowPlaying.installHandlers();
+  nowPlaying.sync({ metadata: true, force: true });
 });
 audio.addEventListener('pause', () => {
   markPlaying(false);
   paintSync(Math.abs(sync.driftMs));
   paintProgress();
+  nowPlaying.sync({ force: true });
 });
 audio.addEventListener('volumechange', () => {
   // Keep the control honest if anything else moves the volume.
@@ -726,13 +1098,46 @@ audio.addEventListener('volumechange', () => {
     label.textContent = muted ? 'Muted' : `${shown}%`;
   }
 });
+// Buffering, from the element's own witness. `/api/stream` answers a cache miss
+// only after the whole yt-dlp download, so joining a room whose track is cold is
+// a minute of silence behind a button that looks stuck, and a mid-track stall
+// freezes the progress bar with no explanation. `waiting`/`stalled` start it;
+// `canplay` (and `playing`) end it.
+audio.addEventListener('waiting', () => setBuffering(true));
+audio.addEventListener('stalled', () => setBuffering(true));
+audio.addEventListener('canplay', () => {
+  // The swap is over once the new source has data: from here the element's own
+  // `paused` is the truth again, and the lock screen may say so. Without this a
+  // room that loads a track while paused would leave the widget claiming
+  // "playing" for as long as nothing else touched it.
+  switching = false;
+  setBuffering(false);
+});
 audio.addEventListener('error', () => {
-  // A source we swapped away from can abort mid-load; only a real failure in
-  // the track we are on is worth telling a listener about.
-  if (started && audio.src) showError('This track could not be played here. It may have been removed.');
+  // A source we swapped away from aborts mid-load (MEDIA_ERR_ABORTED, code 1);
+  // a room that advances twice in a second does that routinely, and the old
+  // error event used to arrive *after* the new track was already playing — so
+  // a healthy room could show "this track could not be played". Only a real
+  // decode/network failure in the track we are actually on is worth acting on.
+  const code = audio.error?.code;
+  if (code === 1) return;
+  // A failed source never reaches `playing`, which is what normally clears this.
+  switching = false;
+  if (!currentId) return;
+  if (!String(audio.src ?? '').includes(encodeURIComponent(currentId))) return;
+  // Retried rather than believed: see scheduleStreamRetry. One 503 behind a
+  // BOT_GATED download used to cost the guest the rest of the song.
+  if (scheduleStreamRetry(currentId)) return;
+  setBuffering(false);
+  if (started) showError('This track could not be played here. It may have been removed.');
 });
 
 audio.addEventListener('timeupdate', () => {
+  // A moving playhead is proof that data is flowing, so it is also the honest
+  // end of a buffering state: `stalled` can fire on a network hiccup the
+  // element rides out, and there would be no `canplay` afterwards to clear a
+  // "Buffering…" nobody can see the end of.
+  setBuffering(false);
   // The bars are patched at most ~4x a second: a CSS transition at every
   // timeupdate is a repaint per frame for no visible gain.
   const now = Date.now();
@@ -746,8 +1151,9 @@ audio.addEventListener('timeupdate', () => {
   }
 });
 
-// Set up the 5% starting point before anything can play.
-audio.volume = DEFAULT_VOLUME;
+// Set up the level before anything can play. `paintVolume` owns both halves of
+// it now — the element's `muted` flag (the only one iOS honours) and the slider's
+// volume — so there is exactly one place that decides what a fresh guest hears.
 paintVolume();
 paintProgress();
 updateMini();
@@ -761,12 +1167,15 @@ updateMini();
   try {
     await sync.load(code);
     started = true;
-    if (!sync.room?.track) { started = false; return; }
+    if (!sync.room?.track) { paintGate(); return; }
     sync.ensureLoaded();
     if (sync.room?.playing) {
-      await audio.play();
-      const overlay = $('listen-overlay');
-      if (overlay) overlay.hidden = true;
+      // The one play() on this page that is allowed to be refused: there is no
+      // gesture behind it. `showResume` puts the gate back with an honest label
+      // instead of leaving a silent room, and the tap is the fix. The overlay is
+      // cleared by the `playing` handler, not here: a gate that disappears before
+      // the room makes a sound is a promise the page has not kept yet.
+      audio.play().catch(showResume);
       paintSync(Math.abs(sync.driftMs));
       paintProgress();
       return;
@@ -774,8 +1183,19 @@ updateMini();
   } catch {
     // Fall through: the overlay is the answer, and the tap reports the detail.
   }
-  started = false;
+  // A paused room is not a failure: there is simply nothing to play yet. This
+  // path must NOT clear `started`.
+  //
+  // It used to (`started = false`), and that made a paused room unstartable for
+  // any guest who tapped first: `load()` is a round trip, the gate is clickable
+  // before it resolves, so the tap set `started = true`, this branch then reset
+  // it to false, and `hooks.play` — which gates on `started` — refused every
+  // later start. The host pressing play could never make that guest play, and
+  // the overlay sat on "Listen live" for the life of the page. `started` is only
+  // ever cleared when the browser actually refuses (showResume) or the listener
+  // pauses from the OS.
   paintSync(Math.abs(sync.driftMs));
+  paintGate();
 })();
 
 // A remembered venue (or a `?view=venue` link) opens once the room is known, and
@@ -788,6 +1208,24 @@ document.addEventListener('visibilitychange', () => {
   // Both directions: the category can be lost while the screen is off, and the
   // guest has no second gesture to give when it comes back.
   audioSession.repair();
+  // ...and the lock-screen handlers go with it. A guest locks the phone mid-room
+  // constantly, and the interruption that pauses the element arrives as no event
+  // a paused-but-looping stream will ever re-fire. media-session.js keeps
+  // re-asserting from the playhead while hidden; this covers the moment of
+  // locking itself and the return.
+  nowPlaying.installHandlers();
   if (document.visibilityState === 'visible' && started) sync.syncNow();
   if (document.visibilityState === 'visible') queueMini();
+});
+
+// ...and an interruption (a call, Siri, Maps taking the output) can end while the
+// listener is still in the other app: no `visibilitychange`, no `playing`, no
+// resume — nothing this page can see except the audio session's own state, which
+// is why audio-session.js listens for it. The guest page never wired this hook,
+// so an interruption that ended in a pocket left a silent "Live" page until the
+// phone was unlocked and the tab woken. Both calls are cheap and idempotent: the
+// claim is one assignment, and a resync is one poll.
+audioSession.onResume(() => {
+  audioSession.claim();
+  if (started) sync.syncNow();
 });

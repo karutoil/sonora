@@ -72,29 +72,63 @@ cp .env.example .env
 # Edit .env and set the two required values:
 #   SONORA_SECRET      (required)    -> the output of:  openssl rand -hex 32
 #   SONORA_PASSPHRASE  (first run)   -> a passphrase you will remember
-# SONORA_USER (default `toil`) is the name of that first account.
+# .env.example sets SONORA_USER=admin; change it if you prefer another name.
 # Every other variable is optional and has a working default.
 
-podman compose up -d --build     # or: docker compose up -d --build
-podman compose logs -f
+# Docker:
+docker compose up -d --build
+
+# Rootless Podman (the override maps uid/gid 1000 to your host account):
+podman compose -f compose.yaml -f compose.podman.yaml up -d --build
+podman compose -f compose.yaml -f compose.podman.yaml logs -f
 ```
 
 Open **http://127.0.0.1:8130** and sign in with the `SONORA_USER` / `SONORA_PASSPHRASE` you set.
 The first account is created only while the database has no users, and is an admin.
 
 ```bash
-podman compose down              # stop; data stays in ./data
-podman compose up -d             # start again without rebuilding
+podman compose -f compose.yaml -f compose.podman.yaml down   # data stays in ./data
+podman compose -f compose.yaml -f compose.podman.yaml up -d  # no rebuild
 ```
+
+For Docker, replace `podman compose` with `docker compose` and omit both `-f`
+options. `./data` must be writable by uid/gid 1000 under Docker. If an older root
+container already owns it, run `sudo chown -R 1000:1000 data` for Docker, or
+`sudo chown -R "$(id -u):$(id -g)" data`
+for the rootless Podman override. The override is required for Podman: plain `podman compose up`
+maps container uid 1000 to a subuid that cannot write a directory owned by your host account.
+
+> The override also sets `x-podman.in_pod: false`. `podman-compose` joins every project to a pod by
+> default, and `podman` refuses `--userns` together with `--pod`, so without that setting the
+> documented command fails with "--userns and --pod cannot be set together". Keep both files
+> together: the override exists for its side effect on the mount, not just its comment.
 
 `./data` holds the SQLite database, the audio cache and the imported YouTube cookie jar. It is
 bind-mounted, so the container and a local dev server share the same state — just never run both
 at once (SQLite is the reason).
 
+> **"attempt to write a readonly database" on start.** This is file ownership, not corruption. The
+> container runs as uid/gid 1000 and `./data` is a bind mount, so if the directory belongs to a
+> different user, SQLite opens the file for reading and then dies on the first `CREATE TABLE` of
+> the migration. Fix the mount, then start again — the migration is transactional and retries from
+> a consistent file:
+>
+> ```bash
+> # Docker
+> sudo chown -R 1000:1000 data
+>
+> # Rootless Podman (start with the override so keep-id applies)
+> sudo chown -R "$(id -u):$(id -g)" data
+> podman compose -f compose.yaml -f compose.podman.yaml up -d
+> ```
+>
+> The server now checks this before opening the database and reports the path, the effective uid/gid
+> and both repair commands, so the raw SQLite error should no longer be the first thing you see.
+
 > `SONORA_SECRET` is mandatory in a container. The app deliberately falls back to a random
 > per-process key when it is unset (right for a laptop, wrong for a container: every restart would
 > sign all devices out and lose the key that encrypts the stored YouTube cookie jar). The
-> entrypoint refuses to start with an empty value.
+> entrypoint refuses to start with an unset, empty or whitespace-only value.
 
 ### Option B — local development
 
@@ -114,8 +148,8 @@ Useful scripts:
 | --- | --- |
 | `npm start` | Run the server (data in `./data`) |
 | `npm run dev` | Same, with `--watch` |
-| `npm test` | Full suite (needs network + a browser — see [Testing](#testing)) |
-| `npm run test:parallel` | Same suite without `--test-concurrency=1` |
+| `npm test` | Full suite, 8 files at a time (needs network + a browser — see [Testing](#testing)) |
+| `npm run test:serial` | Same suite one file at a time — for bisecting a flake |
 | `npm run admin -- list` | List accounts, roles and status |
 | `npm run admin -- promote <name>` | Grant admin (also `demote`, `disable`, `enable`) |
 
@@ -140,7 +174,7 @@ first account. Every other variable is optional.** The **Need** column says whic
 | --- | --- | --- | --- |
 | `SONORA_SECRET` | **Required** in a container; optional in dev | random per process | Signs session cookies **and** derives the AES key for an imported YouTube cookie jar. Set it explicitly in production. |
 | `SONORA_PASSPHRASE` | **First run** | — | Passphrase for the bootstrap account. Only used while the users table is empty. |
-| `SONORA_USER` | Optional | `toil` | Name of the bootstrap account. Set this explicitly for a new instance. |
+| `SONORA_USER` | Optional | `toil` (`admin` in `.env.example`) | Name of the bootstrap account. Set this explicitly for a new instance. |
 | `PORT` | Optional | `8130` | HTTP port. |
 | `HOST` | Optional | `127.0.0.1` | Bind address. Containers set `0.0.0.0`. |
 | `SONORA_BIND` | Optional | `127.0.0.1` | Host address the compose file publishes on. Use `0.0.0.0` for LAN access. |
@@ -165,7 +199,8 @@ first account. Every other variable is optional.** The **Need** column says whic
 | `SONORA_SESSION_DAYS` | Optional | `90` | Legacy alias, kept so older deployments keep working. |
 | `SONORA_LOGIN_RATE_MAX` | Optional | `10` | Sign-in attempts per window, per client. |
 | `SONORA_LOGIN_RATE_WINDOW` | Optional | `1 minute` | Rate-limit window. |
-| `SONORA_TRUST_PROXY` | Optional | `1` | Trust `X-Forwarded-*` from a tunnel/proxy (needed for correct client IPs). |
+| `SONORA_TRUST_PROXY` | Conditional | `0` | Number of trusted proxy hops. Set `1` only when one known tunnel/proxy is in front (needed for correct client IPs). |
+| `SONORA_SECURE_COOKIES` | Conditional | `auto` | `Secure` cookies on HTTPS/localhost. Use `always` or `never` only for a proxy setup whose scheme cannot be detected. |
 | `SONORA_ROOM_HOURS` | Optional | `12` | Idle hours before an empty room is deleted. |
 | `SONORA_ROOM_MAX_MEMBERS` | Optional | `50` | Member cap per room. |
 
@@ -195,7 +230,7 @@ IPs behind *"Sign in to confirm you're not a bot"*. None is required to run.
 | `SONORA_YT_COOKIE` | Optional | — | Raw `Cookie:` header used by `youtubei.js` for metadata. |
 | `SONORA_POT_PROVIDER` | Optional | `http://127.0.0.1:4416` | `bgutil` PO-token provider endpoint; empty disables it. |
 | `SONORA_JS_RUNTIME` | Optional | autodetected Deno | JS runtime for `yt-dlp` (`node:/usr/local/bin/node`, `deno:/path`). |
-| `SONORA_URL_TTL_MS` | Optional | `10800000` (3 h) | Stream URL cache lifetime. |
+| `SONORA_URL_TTL_MS` | Optional | `10800000` (3 h) | Reserved legacy diagnostic setting; no longer changes playback or fetching. |
 | `SONORA_RESOLVE_TIMEOUT_MS` | Optional | `25000` | Metadata request timeout. |
 
 ### Container-only (compose)
@@ -209,6 +244,7 @@ IPs behind *"Sign in to confirm you're not a bot"*. None is required to run.
 | Variable | Need | Default | Purpose |
 | --- | --- | --- | --- |
 | `CHROME_BIN` | Optional | autodetected | Chromium binary for the browser-based UI tests. |
+| `SONORA_FOLLOWS_OFFLINE` | Optional | unset | Set to `1` to run only the mock-backed follows/release tests; the live HTTP cases explicitly skip. Used by CI's offline job. |
 
 ## How it works
 
@@ -224,7 +260,7 @@ Fastify (src/server.js) ──► SQLite (node:sqlite, ./data/sonora.db)
         └──► GET /api/stream/:videoId ──► ranged reads from the cache
 ```
 
-Three measured constraints shaped the design, and each is explained in [`PLAN.md`](PLAN.md):
+Four measured constraints shaped the design, and each is explained in [`PLAN.md`](PLAN.md):
 
 1. **googlevideo URLs are IP-bound and expire.** The phone cannot play a URL the server resolved,
    so every byte goes through `GET /api/stream/:videoId`.
@@ -232,7 +268,15 @@ Three measured constraints shaped the design, and each is explained in [`PLAN.md
    stalls one megabyte into every song. So the server downloads the whole file once, then serves
    ranges off disk. Seeking becomes instant and replay is free.
 3. **iOS closes the audio session when a track ends naturally.** The player loops the element and
-   switches tracks inside the event, so background playback survives.
+   switches tracks inside the event, and while the app is in the background it never pauses
+   between tracks — a pause there is the silence in which iOS tears the session (and the
+   Now Playing widget) down, and it does not give it back until the app is reopened.
+4. **A locked iPhone stops running the page's script.** Media keeps playing in the media
+   process, but no `timeupdate` arrives, so a player that starts the next track *from* a
+   track boundary cannot start it. On iOS the element is therefore handed the queue as one
+   continuous server-built stream (`/api/queue-stream/…`) just before the page goes hidden,
+   and the per-track player is restored — at the right track and second — on the way back
+   in. Other platforms keep the per-track handoff, whose events do arrive there.
 
 There is **no build step**. `public/` is served as-is, which is what makes an offline cache and a
 single-document offline shell practical.
@@ -245,15 +289,53 @@ npm test          # full suite
 ```
 
 The full suite is intentionally end-to-end: several tests **hit live YouTube**, and the UI,
-layout, safe-area, passkey and room tests drive a **real Chromium**. They are therefore
-network-dependent and slower (~40 s on a warm cache). Install Chromium or set `CHROME_BIN`; tests
-that need a browser skip cleanly when none is found.
+layout, safe-area, passkey and room tests drive a **real Chromium**. Install Chromium or set
+`CHROME_BIN`; locally, tests that need a browser skip cleanly when none is found. CI installs and
+verifies Chromium so a missing browser cannot silently pass. Browser setup and live-network tests
+make the full suite slower than the fixture-only checks; timing depends on host and network
+conditions.
 
-For a fast, fully offline check (the same thing CI runs):
+CI has separate enforcing offline and browser jobs. Its image build/smoke test and both test jobs
+must pass before GHCR publication. The offline job includes mock-backed follows/release tests and
+fixture-only library/station HTTP suites; its seven live follows HTTP cases report explicit skips.
+Live-YouTube end-to-end, library, search-types, station-endless, lockscreen and real-CDN latency
+checks remain developer-run, not release gates. The shared live-audio download gate may skip only
+an explicit `503` response with code `BOT_GATED`: `BUSY`, `ENOSPC`, timeouts, empty/malformed results,
+502s, budget errors and other server failures remain failures. Separately, the live-broadcast test
+reports a content-availability skip when current search results contain no live broadcast. Upstream
+availability therefore limits what a developer run can prove; it never turns a server error green.
+
+For the same serial backend/container selection used by the CI unit job (which must
+stay offline):
 
 ```bash
-node --no-warnings --test --test-concurrency=1 test/db.test.js test/search-rank.test.js
+SONORA_FOLLOWS_OFFLINE=1 node --no-warnings --test --test-concurrency=1 \
+  test/config.test.js \
+  test/db.test.js \
+  test/search-rank.test.js \
+  test/auth.test.js \
+  test/cookies.test.js \
+  test/admin.test.js \
+  test/rooms.test.js \
+  test/rooms-idle.test.js \
+  test/migration.test.js \
+  test/station.test.js \
+  test/audio.test.js \
+  test/ratelimit.test.js \
+  test/playback.test.js \
+  test/media-session.test.js \
+  test/container.test.js \
+  test/proxy.test.js \
+  test/youtube.test.js \
+  test/lifecycle.test.js \
+  test/follows.test.js \
+  test/harness.test.js \
+  test/library-integrity.test.js \
+  test/station-routes.test.js
 ```
+
+The browser job runs the 18 fixture-driven `*.test.js` files listed in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml); run them explicitly when changing UI code.
 
 ## Project layout
 
@@ -264,7 +346,8 @@ scripts/        admin CLI, container entrypoint, healthcheck, icon generator
 test/           unit, integration, browser and end-to-end tests
 docs/           design records: UI, UX, auth and rooms
 Containerfile   production image (Node + yt-dlp + ffmpeg + PO-token plugin)
-compose.yaml    single-service stack; publishes 127.0.0.1:8130 and mounts ./data
+compose.yaml    hardened single-service stack; publishes 127.0.0.1:8130 and mounts ./data
+compose.podman.yaml  rootless-Podman keep-id override for the ./data bind mount
 ```
 
 ## Deployment notes
@@ -286,7 +369,7 @@ The rename was mechanical, but three things live outside the source tree:
    stop the server first and move the file (plus its `-wal` and `-shm` siblings):
 
    ```bash
-   podman compose down
+   podman compose -f compose.yaml -f compose.podman.yaml down
    mv data/muse.db data/sonora.db
    ```
 
@@ -295,7 +378,7 @@ The rename was mechanical, but three things live outside the source tree:
 
    ```bash
    podman rm -f muse
-   podman compose up -d --build
+   podman compose -f compose.yaml -f compose.podman.yaml up -d --build
    ```
 
 Two consequences are expected and one-time: session and passkey cookies were renamed, so every
@@ -313,11 +396,15 @@ YouTube cookie jar is discarded and must be re-imported (Admin → YouTube). The
 - **Keep `SONORA_SECRET` stable.** Rotating it invalidates every session and makes the encrypted
   YouTube cookie jar unreadable (you will need to re-import cookies).
 - **Do not run the container and `npm start` against the same `./data` at the same time.**
+- **Container privileges stay bounded.** The compose service drops all capabilities, sets
+  `no-new-privileges`, and limits the container to 256 PIDs. Commented `cpus: 2` / `mem_limit: 2g`
+  examples are optional starting points, not defaults; tune them to the host before enabling.
 
 ## Security notes
 
 - All state is local. There is no telemetry and no third-party service beyond YouTube itself.
-- Session cookies are `HttpOnly`, signed, and `Secure` outside dev. Refresh tokens rotate on use;
+- Session cookies are `HttpOnly`, signed, and `Secure` on HTTPS/localhost by default (`auto` mode).
+  Refresh tokens rotate on use;
   replaying an old one revokes the device. Passkeys are optional and revocable per device.
 - The imported YouTube cookie jar is encrypted at rest with a key derived from `SONORA_SECRET` and is
   never sent back to a client.
@@ -334,6 +421,8 @@ YouTube cookie jar is discarded and must be re-imported (Admin → YouTube). The
 | [`docs/ux-spec.md`](docs/ux-spec.md) | The production-polish contract the UI was built against |
 | [`docs/auth.md`](docs/auth.md) | Credentials, sessions, devices and passkeys |
 | [`docs/rooms.md`](docs/rooms.md) | Listen Together: database, wire format, sync algorithm, limits |
+| [`docs/sleeve-first-direction.md`](docs/sleeve-first-direction.md) | The sleeve-first visual direction: one real cover as the front door |
+| [`docs/sleeve-first-v2.md`](docs/sleeve-first-v2.md) | The unification pass — the class-name contract shared by `public/app.css` and `public/app.js` |
 | [`PLAN.md`](PLAN.md) | The engineering plan and the measurements behind the design |
 | [`.env.example`](.env.example) | Every environment variable, with explanations |
 

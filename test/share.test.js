@@ -38,6 +38,7 @@ const UNKNOWN = 'zzzzzzzzzzz';
 let proc;
 let base;
 let dir;
+let cookie = '';
 
 before(async () => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sonora-share-'));
@@ -59,6 +60,8 @@ before(async () => {
       SONORA_JS_RUNTIME: '',
       // Left empty on purpose: the card must fall back to the request's Host.
       SONORA_PUBLIC_URL: '',
+      // Direct clients must not be able to forge the public origin or IP bucket.
+      SONORA_TRUST_PROXY: '0',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -83,7 +86,7 @@ before(async () => {
     body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
   });
   assert.ok(login.ok, `login failed: ${login.status} ${await login.text()}`);
-  const cookie = (login.headers.getSetCookie?.()[0] ?? login.headers.get('set-cookie')).split(';')[0];
+  cookie = (login.headers.getSetCookie?.()[0] ?? login.headers.get('set-cookie')).split(';')[0];
 
   // Seeding through the real API: a like remembers the track's metadata, which
   // is exactly how a track the sharer only ever saw in a list gets a row.
@@ -187,6 +190,76 @@ test('the in-app artwork route stays private', async () => {
   assert.equal(res.status, 401);
 });
 
+test('the API track looked up by a share link answers for an unseen id', async () => {
+  // A shared /t/<id> link for a track this instance never upserted used to get
+  // a 404 from /api/track/:id ("sonora has not seen yet") even though /t/<id>
+  // renders a card and /api/stream/<id> would serve the bytes. The player
+  // tolerates a null title/duration, so a valid id must be playable.
+  const unknown = await fetch(`${base}/api/track/${UNKNOWN}`, { headers: { cookie } });
+  assert.equal(unknown.status, 200, 'a valid but unseen id is not an error');
+  const body = await unknown.json();
+  assert.equal(body.track.videoId, UNKNOWN);
+  assert.equal(body.track.unknown, true);
+  assert.equal(body.track.title, null);
+  assert.equal(body.track.durationS, null);
+
+  // A known track still carries its real metadata, so the fallback did not
+  // replace the normal answer.
+  const known = await fetch(`${base}/api/track/${VIDEO}`, { headers: { cookie } });
+  assert.equal(known.status, 200);
+  const knownBody = await known.json();
+  assert.equal(knownBody.track.videoId, VIDEO);
+  assert.match(knownBody.track.title, /Fixture Song/);
+  assert.equal(knownBody.track.unknown, undefined);
+
+  // A malformed id is still a 400: the fallback is for real ids only.
+  assert.equal((await fetch(`${base}/api/track/not-a-video-id`, { headers: { cookie } })).status, 400);
+  assert.equal((await fetch(`${base}/api/track/${UNKNOWN}`)).status, 401, 'and it still needs a session');
+});
+
+test('release covers on yt3.googleusercontent.com are proxied, not refused', async () => {
+  // Album covers moved to yt3.googleusercontent.com, which was on neither this
+  // allowlist nor the client's: the browser fetched them from Google (so the
+  // art proxy was bypassed) and /api/img?u= answered 400 for them.
+  //
+  // The client no longer keeps its own list — it rewrites *every* https artwork
+  // URL onto /api/img?u= — so this allowlist is now the single gate and a host
+  // missing here is a broken cover. Google shards the art across numbered hosts
+  // (lh3-lh6.googleusercontent.com, yt1-yt5.ggpht.com), which is why the
+  // families are matched by suffix rather than enumerated.
+  for (const host of [
+    'yt3.googleusercontent.com',
+    'lh4.googleusercontent.com',
+    'yt4.ggpht.com',
+  ]) {
+    const url = encodeURIComponent(`https://${host}/ytc/release-cover.jpg`);
+    const res = await fetch(`${base}/api/img?u=${url}`, { headers: { cookie } });
+    // Offline the upstream fetch fails, which is a 404 (or the body is served).
+    // What must not happen is the host being refused.
+    assert.notEqual(res.status, 400, `${host} must be allowlisted`);
+    await res.arrayBuffer();
+  }
+
+  // A lookalike domain is not "the same family": the leading dot matters.
+  const lookalike = encodeURIComponent('https://evilgoogleusercontent.com/x.jpg');
+  const bad = await fetch(`${base}/api/img?u=${lookalike}`, { headers: { cookie } });
+  assert.equal(bad.status, 400);
+  assert.match((await bad.json()).error, /not allowed/i);
+
+  // A host that is not a YouTube image host is still refused.
+  const other = await fetch(`${base}/api/img?u=${encodeURIComponent('https://example.com/x.jpg')}`, {
+    headers: { cookie },
+  });
+  assert.equal(other.status, 400);
+  assert.match((await other.json()).error, /not allowed/i);
+
+  // Nor is a non-default port on an allowed host.
+  const port = await fetch(`${base}/api/img?u=${encodeURIComponent('https://i.ytimg.com:8443/x.jpg')}`, {
+    headers: { cookie },
+  });
+  assert.equal(port.status, 400);
+});
+
 test('oEmbed describes the same track', async () => {
   const url = `${base}/t/${VIDEO}`;
   const res = await fetch(`${base}/oembed.json?url=${encodeURIComponent(url)}`);
@@ -194,10 +267,302 @@ test('oEmbed describes the same track', async () => {
   assert.equal(res.headers.get('access-control-allow-origin'), '*');
   const body = await res.json();
   assert.equal(body.version, '1.0');
+  assert.equal(body.type, 'link');
+  assert.equal(body.url, url);
+  assert.equal(body.html, undefined, 'a link card must not pretend to be an incomplete rich embed');
+  assert.equal(body.width, undefined);
+  assert.equal(body.height, undefined);
+  assert.equal(res.headers.get('cache-control'), 'public, max-age=300');
   assert.equal(body.provider_name, 'sonora');
   assert.equal(body.title, 'Fixture Song \u2014 Fixture Artist');
   assert.equal(body.author_name, 'Fixture Artist');
   assert.equal(body.thumbnail_url, `${base}/t/${VIDEO}/art.jpg`);
+});
+
+test('oEmbed rejects malformed, non-canonical, foreign and unknown targets without caching', async () => {
+  const canonical = `${base}/t/${VIDEO}`;
+  const malformed = [
+    null,
+    'not a URL',
+    `javascript:/t/${VIDEO}`,
+    `${base}/t/not-an-id`,
+    `${base}/t/${VIDEO}/`,
+    `${base}/t/${VIDEO}?download=1`,
+    `${base}/t/${VIDEO}#fragment`,
+    `${base}/prefix/t/${VIDEO}`,
+    `https://evil.example/t/${VIDEO}`,
+    `https://evil.example/?next=${encodeURIComponent(`/t/${VIDEO}`)}`,
+    `https://user:pw@127.0.0.1:${new URL(base).port}/t/${VIDEO}`,
+  ];
+  for (const target of malformed) {
+    const query = target === null ? '' : `?url=${encodeURIComponent(target)}`;
+    const res = await fetch(`${base}/oembed.json${query}`);
+    assert.equal(res.status, 400, `unsafe target was accepted: ${target}`);
+    assert.equal(res.headers.get('cache-control'), 'no-store', `unsafe target was cacheable: ${target}`);
+    assert.equal(res.headers.get('access-control-allow-origin'), '*');
+    await res.arrayBuffer();
+  }
+  // Duplicate parameters are not silently coerced into a comma-joined URL.
+  const duplicate = await fetch(`${base}/oembed.json?url=${encodeURIComponent(canonical)}&url=${encodeURIComponent(canonical)}`);
+  assert.equal(duplicate.status, 400);
+  assert.equal(duplicate.headers.get('cache-control'), 'no-store');
+  await duplicate.arrayBuffer();
+
+  const unknown = await fetch(`${base}/oembed.json?url=${encodeURIComponent(`${base}/t/${UNKNOWN}`)}`);
+  assert.equal(unknown.status, 404, 'a well-formed URL for a track we do not know is not a successful embed');
+  assert.equal(unknown.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(await unknown.json(), { error: 'Track not found.' });
+});
+
+test('unmatched GET and HEAD responses are uncacheable and carry baseline security headers', async () => {
+  for (const method of ['GET', 'HEAD']) {
+    const res = await fetch(`${base}/definitely-not-a-route-${method}`, { method });
+    assert.equal(res.status, 404);
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+    assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(res.headers.get('x-frame-options'), 'SAMEORIGIN');
+    assert.equal(res.headers.get('referrer-policy'), 'same-origin');
+    const bodyBytes = (await res.arrayBuffer()).byteLength;
+    if (method === 'HEAD') assert.equal(bodyBytes, 0);
+    else assert.ok(bodyBytes > 0);
+  }
+  const malformedCard = await fetch(`${base}/t/not-a-video-id`);
+  assert.equal(malformedCard.headers.get('cache-control'), 'no-store');
+  await malformedCard.arrayBuffer();
+});
+
+test('static dotfiles are denied while the app shell and modules still load', async () => {
+  const filename = `.sonora-share-test-secret-${process.pid}`;
+  const filenamePath = path.join(new URL('../public', import.meta.url).pathname, filename);
+  fs.writeFileSync(filenamePath, 'never-return-this-secret', { flag: 'wx' });
+  try {
+    for (const method of ['GET', 'HEAD']) {
+      const res = await fetch(`${base}/${filename}`, { method });
+      assert.equal(res.status, 403);
+      assert.equal(res.headers.get('cache-control'), 'no-store');
+      assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+      assert.ok(!(await res.text()).includes('never-return-this-secret'));
+    }
+    const [shell, module] = await Promise.all([fetch(`${base}/`), fetch(`${base}/app.js`)]);
+    assert.equal(shell.status, 200);
+    assert.equal(module.status, 200);
+    await Promise.all([shell.arrayBuffer(), module.arrayBuffer()]);
+  } finally {
+    fs.rmSync(filenamePath, { force: true });
+  }
+});
+
+test('direct forwarding headers cannot change the card or oEmbed authority', async () => {
+  const forged = {
+    'x-forwarded-host': 'attacker.example',
+    'x-forwarded-proto': 'https',
+    'x-forwarded-for': '203.0.113.99',
+  };
+  const card = await fetch(`${base}/t/${VIDEO}`, { headers: forged });
+  assert.equal(card.status, 200);
+  assert.equal(meta(await card.text(), 'og:url'), `${base}/t/${VIDEO}`);
+
+  const foreign = await fetch(`${base}/oembed.json?url=${encodeURIComponent(`https://attacker.example/t/${VIDEO}`)}`, {
+    headers: forged,
+  });
+  assert.equal(foreign.status, 400);
+  assert.equal(foreign.headers.get('cache-control'), 'no-store');
+  await foreign.arrayBuffer();
+});
+
+test('cookie-authenticated mutations reject sibling, same-site, cross-site and contradictory origins', async () => {
+  const payload = JSON.stringify({ ...TRACK, like: true });
+  const crossSite = [
+    { origin: 'https://attacker.invalid' }, // Origin alone, without Fetch Metadata.
+    { origin: 'not a valid origin', 'sec-fetch-site': 'same-origin' },
+    { origin: `${base}/not-an-origin` },
+    { origin: 'https://sibling.example.test', 'sec-fetch-site': 'same-site' },
+    { origin: 'https://attacker.invalid', 'sec-fetch-site': 'cross-site' },
+    { origin: base, 'sec-fetch-site': 'same-site' },
+    { origin: 'null', 'sec-fetch-site': 'cross-site' },
+  ];
+  for (const headers of crossSite) {
+    const res = await fetch(`${base}/api/likes`, {
+      method: 'POST',
+      headers: { ...headers, cookie, 'content-type': 'application/json' },
+      body: payload,
+    });
+    assert.equal(res.status, 403, JSON.stringify(headers));
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+    await res.arrayBuffer();
+  }
+
+  const sameOrigin = await fetch(`${base}/api/likes`, {
+    method: 'POST',
+    headers: { cookie, origin: base, 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' },
+    body: payload,
+  });
+  assert.equal(sameOrigin.status, 200);
+  await sameOrigin.arrayBuffer();
+  assert.equal((await fetch(`${base}/api/me`, { headers: { cookie } })).status, 200,
+    'rejected mutation attempts must not revoke or otherwise damage the session');
+});
+
+test('API bodies require explicit JSON, while valid empty POSTs and same-origin login still work', async () => {
+  const payload = JSON.stringify({ ...TRACK, like: true });
+  for (const type of ['text/plain', 'application/x-www-form-urlencoded', 'application/ld+json', null]) {
+    const headers = { cookie, origin: base, 'sec-fetch-site': 'same-origin' };
+    if (type !== null) headers['content-type'] = type;
+    const res = await fetch(`${base}/api/likes`, {
+      method: 'POST', headers, body: type === null ? Buffer.from(payload) : payload,
+    });
+    assert.equal(res.status, 415, `body media type must be rejected: ${type}`);
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+    await res.arrayBuffer();
+  }
+
+  const withCharset = await fetch(`${base}/api/likes`, {
+    method: 'POST',
+    headers: {
+      cookie, origin: base, 'sec-fetch-site': 'same-origin',
+      'content-type': 'application/json; charset=utf-8',
+    },
+    body: payload,
+  });
+  assert.equal(withCharset.status, 200);
+  await withCharset.arrayBuffer();
+
+  // Fetch Metadata alone is enough to reject a modern cross-site body-less form.
+  const emptyAttack = await fetch(`${base}/api/notifications/read-all`, {
+    method: 'POST', headers: { cookie, 'sec-fetch-site': 'cross-site' },
+  });
+  assert.equal(emptyAttack.status, 403);
+  await emptyAttack.arrayBuffer();
+
+  // A text/plain declaration on a zero-length POST is not a hidden request body.
+  const emptyAllowed = await fetch(`${base}/api/notifications/read-all`, {
+    method: 'POST',
+    headers: { cookie, origin: base, 'sec-fetch-site': 'same-origin', 'content-type': 'text/plain' },
+  });
+  assert.equal(emptyAllowed.status, 200);
+  await emptyAllowed.arrayBuffer();
+
+  const publicLogin = await fetch(`${base}/api/auth/login`, {
+    method: 'POST',
+    headers: {
+      origin: base, 'sec-fetch-site': 'same-origin', 'content-type': 'application/json',
+    },
+    body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+  });
+  assert.equal(publicLogin.status, 200);
+  await publicLogin.arrayBuffer();
+});
+
+test('the bounded notification cooldown still acquires and throttles a user slot', async () => {
+  const headers = { cookie, origin: base, 'sec-fetch-site': 'same-origin' };
+  const first = await fetch(`${base}/api/notifications/check`, { method: 'POST', headers });
+  assert.equal(first.status, 200);
+  const firstBody = await first.json();
+  assert.equal(firstBody.created, 0, 'this fixture follows no artists, so no upstream work is required');
+  const second = await fetch(`${base}/api/notifications/check`, { method: 'POST', headers });
+  assert.equal(second.status, 200);
+  assert.equal((await second.json()).throttled, true);
+});
+
+test('an authenticated loopback proxy supplies the canonical card and mutation origin', async () => {
+  const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sonora-share-proxy-'));
+  const port = await freePort();
+  const fixtureBase = `http://127.0.0.1:${port}`;
+  const publicOrigin = 'https://music.example.test';
+  const forwarded = {
+    'x-forwarded-host': 'music.example.test',
+    'x-forwarded-proto': 'https',
+    'x-forwarded-for': '203.0.113.10, 198.51.100.10',
+  };
+  const child = spawn(process.execPath, ['--no-warnings', 'src/server.js'], {
+    cwd: new URL('..', import.meta.url).pathname,
+    env: {
+      ...process.env,
+      PORT: String(port), HOST: '127.0.0.1',
+      SONORA_DB: path.join(fixtureDir, 'proxy.db'),
+      SONORA_AUDIO_DIR: path.join(fixtureDir, 'audio'),
+      SONORA_SECRET: 'share-proxy-secret', SONORA_PASSPHRASE: 'hunter2hunter2',
+      SONORA_LOGIN_RATE_MAX: '1000', SONORA_TRUST_PROXY: '1', SONORA_PUBLIC_URL: '',
+      SONORA_LOG_LEVEL: 'warn', SONORA_POT_PROVIDER: '', SONORA_JS_RUNTIME: '',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const fixtureLogs = [];
+  child.stdout.on('data', (d) => fixtureLogs.push(String(d)));
+  child.stderr.on('data', (d) => fixtureLogs.push(String(d)));
+  try {
+    let up = false;
+    for (let i = 0; i < 120 && !up; i++) {
+      try {
+        const health = await fetch(`${fixtureBase}/api/health`);
+        up = health.ok && (await health.json()).pid === child.pid;
+      } catch {}
+      if (!up) await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    assert.ok(up, `proxy fixture did not start:\n${fixtureLogs.join('')}`);
+
+    const login = await fetch(`${fixtureBase}/api/auth/login`, {
+      method: 'POST',
+      headers: {
+        ...forwarded, origin: publicOrigin, 'sec-fetch-site': 'same-origin',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+    });
+    assert.equal(login.status, 200, await login.text());
+    const fixtureCookie = login.headers.getSetCookie()[0].split(';')[0];
+
+    const remembered = await fetch(`${fixtureBase}/api/likes`, {
+      method: 'POST',
+      headers: {
+        ...forwarded, cookie: fixtureCookie, origin: publicOrigin,
+        'sec-fetch-site': 'same-origin', 'content-type': 'application/json',
+      },
+      body: JSON.stringify({ ...TRACK, like: true }),
+    });
+    assert.equal(remembered.status, 200, await remembered.text());
+
+    const sibling = await fetch(`${fixtureBase}/api/notifications/read-all`, {
+      method: 'POST',
+      headers: {
+        ...forwarded, cookie: fixtureCookie, origin: 'https://evil.example.test',
+        'sec-fetch-site': 'same-site',
+      },
+    });
+    assert.equal(sibling.status, 403, 'a sibling eTLD+1 is not the request origin');
+    await sibling.arrayBuffer();
+
+    const card = await fetch(`${fixtureBase}/t/${VIDEO}`, { headers: forwarded });
+    assert.equal(card.status, 200);
+    assert.equal(meta(await card.text(), 'og:url'), `${publicOrigin}/t/${VIDEO}`);
+
+    const embedded = await fetch(
+      `${fixtureBase}/oembed.json?url=${encodeURIComponent(`${publicOrigin}/t/${VIDEO}`)}`,
+      { headers: forwarded },
+    );
+    const embeddedText = await embedded.text();
+    assert.equal(embedded.status, 200, embeddedText);
+    const embedBody = JSON.parse(embeddedText);
+    assert.equal(embedBody.type, 'link');
+    assert.equal(embedBody.provider_url, publicOrigin);
+    assert.equal(embedBody.thumbnail_url, `${publicOrigin}/t/${VIDEO}/art.jpg`);
+
+    // The transport's internal origin is not a second accepted oEmbed authority.
+    const internal = await fetch(
+      `${fixtureBase}/oembed.json?url=${encodeURIComponent(`${fixtureBase}/t/${VIDEO}`)}`,
+      { headers: forwarded },
+    );
+    assert.equal(internal.status, 400);
+    assert.equal(internal.headers.get('cache-control'), 'no-store');
+    await internal.arrayBuffer();
+  } finally {
+    const exited = child.exitCode !== null || child.signalCode !== null
+      ? Promise.resolve() : new Promise((resolve) => child.once('exit', resolve));
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+    await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 5000))]);
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    try { fs.rmSync(fixtureDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
+  }
 });
 
 // ── real browser ────────────────────────────────────────────────────────

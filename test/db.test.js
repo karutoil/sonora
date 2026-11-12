@@ -175,6 +175,35 @@ test('a passkey round-trips through the store with its counter', () => {
   assert.equal(db.countPasskeys(u.id), 0);
 });
 
+test('fixed device and passkey queries reuse their prepared statements', () => {
+  const u = db.createUser('prepared-owner', 'pw');
+  const device = db.createDevice({ userId: u.id, clientDeviceId: 'prepared-client' });
+  const calls = [
+    () => db.getDevice(device.id),
+    () => db.findDeviceByClient(u.id, 'prepared-client'),
+    () => db.touchDevice(device.id),
+    () => db.touchDevice(device.id, { login: true }),
+    () => db.countPasskeys(u.id),
+  ];
+  // Warm every SQL text before spying, including touchDevice's second branch.
+  for (const call of calls) call();
+  const original = db.db.prepare;
+  const prepared = [];
+  db.db.prepare = function (sql, ...options) {
+    prepared.push(sql);
+    return original.call(this, sql, ...options);
+  };
+  try {
+    for (const call of calls) {
+      call();
+      call();
+    }
+  } finally {
+    db.db.prepare = original;
+  }
+  assert.deepEqual(prepared, [], 'two hot calls must compile no SQL after the cache is warm');
+});
+
 test('a WebAuthn challenge is single use and expires', () => {
   const u = db.createUser('challenge-owner', 'pw');
   const id = db.createChallenge({
@@ -194,4 +223,561 @@ test('a WebAuthn challenge is single use and expires', () => {
   });
   assert.equal(db.takeChallenge(rightKind, 'authenticate'), null);
   assert.equal(db.takeChallenge(rightKind, 'register').challenge, 'keep');
+});
+
+// ── schema version, indexes and integrity ───────────────────────────────
+
+test('the schema is versioned and reports itself as current', () => {
+  const status = db.schemaStatus();
+  assert.equal(status.expected, db.SCHEMA_VERSION);
+  assert.equal(status.version, db.SCHEMA_VERSION, 'a fresh database is migrated at import');
+  assert.equal(status.current, true);
+  assert.equal(db.integrityReport().schemaVersion, db.SCHEMA_VERSION);
+});
+
+test('every index the queries rely on exists', () => {
+  const names = new Set(db.db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
+    .all().map((r) => r.name));
+  for (const name of [
+    // read/lookup indexes the audit measured as missing
+    'tracks_channel', 'likes_video', 'dislikes_video', 'playlist_items_video',
+    'notifications_video', 'users_role',
+    // housekeeping over tables that only grow between restarts
+    'upstream_cache_expiry', 'refresh_tokens_expiry',
+    // the station's GROUP BY over a user's whole play history
+    'plays_user_kind_video',
+  ]) {
+    assert.ok(names.has(name), `index ${name} exists`);
+  }
+});
+
+test('grouping a user\'s plays is served by the covering index, not a scan', () => {
+  const plan = db.db.prepare(
+    'EXPLAIN QUERY PLAN SELECT video_id, MAX(created_at) FROM plays WHERE user_id = ? GROUP BY video_id',
+  ).all(1).map((r) => r.detail).join(' | ');
+  assert.match(plan, /COVERING INDEX plays_user_kind_video/,
+    `expected the covering index in the plan, got: ${plan}`);
+});
+
+/** Capture the production statement itself, rather than a copied test query. */
+function capturePlan(call, args) {
+  const original = db.db.prepare;
+  let sql;
+  db.db.prepare = function (text, ...options) {
+    if (sql === undefined) sql = text;
+    return original.call(this, text, ...options);
+  };
+  try {
+    call();
+  } finally {
+    db.db.prepare = original;
+  }
+  assert.equal(typeof sql, 'string', 'the statement was prepared, not served by an earlier capture');
+  return { sql, detail: db.db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...args).map((r) => r.detail) };
+}
+
+test('hot SQL aggregates before metadata joins and room visibility uses its three indexes', () => {
+  const recent = capturePlan(() => db.recentlyPlayed(-101, 40), [-101, 40]);
+  const candidates = capturePlan(() => db.stationCandidates(-101, 400), [-101, 400]);
+  const top = capturePlan(() => db.topArtists(-101, 18), [-101, 18]);
+  const artists = capturePlan(() => db.stationArtists(-101, 18), [-101, 18]);
+  const rooms = capturePlan(() => db.listRoomsForUser(-101, 20), [-101, -101, -101, -101, -101, 20]);
+
+  for (const [name, query] of [['recent', recent], ['candidates', candidates]]) {
+    assert.match(query.detail.join(' | '), new RegExp(`CO-ROUTINE ${name}`));
+    assert.match(query.detail.join(' | '), /COVERING INDEX plays_user_kind_video/);
+    assert.ok(query.detail.findIndex((d) => d.startsWith(`SCAN ${name === 'recent' ? 'r' : 'c'}`)) >= 0,
+      `${name}: the already-limited aggregate feeds the outer metadata join`);
+  }
+  for (const query of [top, artists]) {
+    const detail = query.detail.join(' | ');
+    assert.match(detail, /CO-ROUTINE by_track/);
+    assert.match(detail, /SEARCH p USING COVERING INDEX plays_user_kind_video/);
+    assert.match(query.sql, /CROSS JOIN tracks t/, 'stale global stats cannot reverse the join order');
+    assert.ok(!detail.includes('SEARCH t USING INDEX tracks_channel (channel>?)'),
+      `must not walk the global channel catalogue first: ${detail}`);
+  }
+  const roomPlan = rooms.detail.join(' | ');
+  assert.match(roomPlan, /CO-ROUTINE visible/);
+  assert.match(roomPlan, /UNION USING TEMP B-TREE/, 'overlapping access paths are de-duplicated');
+  for (const index of ['rooms_host', 'room_members_user', 'room_invites_user']) {
+    assert.match(roomPlan, new RegExp(`SEARCH .* USING (?:COVERING )?INDEX ${index}`),
+      `${index} serves its visibility branch: ${roomPlan}`);
+  }
+  assert.ok(!roomPlan.includes('SCAN u USING COVERING INDEX'), `no all-user host scan: ${roomPlan}`);
+});
+
+test('aggregate rewrites preserve grouped output, nulls, ties, orphan tracks and limits', () => {
+  const u = db.createUser('aggregate-equivalence', 'pw');
+  const other = db.createUser('aggregate-other', 'pw');
+  const at = (seconds) => new Date(Date.parse('2026-01-01T00:00:00.000Z') + seconds * 1000).toISOString();
+  const plain = (value) => JSON.parse(JSON.stringify(value));
+  const now = at(0);
+  const tracks = [
+    ['agg-a1', 'A one', 'Alpha', 100, 'alpha-thumb'],
+    ['agg-a2', 'A two', 'Alpha', null, null],
+    ['agg-b1', null, 'Beta', 200, 'beta-thumb'],
+    ['agg-null', null, null, null, null],
+    ['agg-empty', 'Empty channel', '', 0, null],
+    ['agg-tie', 'Tie', 'Tie', 50, 'tie-thumb'],
+    ['agg-likeonly', 'Gamma', 'Gamma', 75, 'gamma-thumb'],
+    ['agg-delta', 'Delta', 'Delta', 60, null],
+    ['agg-epsilon', 'Epsilon', 'Epsilon', 60, 'epsilon-thumb'],
+  ];
+  const addTrack = db.db.prepare(`
+    INSERT INTO tracks (video_id, title, channel, duration_s, thumb, first_seen, last_seen)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  const addPlay = db.db.prepare(`
+    INSERT INTO plays (user_id, video_id, kind, position_ms, duration_ms, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  db.transaction(() => {
+    for (const row of tracks) addTrack.run(...row, now, now);
+    const play = (videoId, kind, seconds, positionMs = null, durationMs = null, userId = u.id) => {
+      addPlay.run(userId, videoId, kind, positionMs, durationMs, at(seconds));
+    };
+    play('agg-a1', 'start', 5);
+    play('agg-a1', 'progress', 6, 25, 100);
+    play('agg-a1', 'progress', 7, 150, 100); // clamped to 1
+    play('agg-a1', 'complete', 8);
+    play('agg-a1', 'like', 9); // artists only, never the history aggregates
+    play('agg-a2', 'start', 4);
+    play('agg-a2', 'skip', 4); // exact lastPlayed tie with Beta
+    play('agg-a2', 'progress', 2, null, 100);
+    play('agg-b1', 'progress', 3, 50, 0);
+    play('agg-b1', 'complete', 4);
+    play('agg-null', 'start', 6);
+    play('agg-null', 'progress', 6, 50, 200);
+    play('agg-orphan', 'start', 7); // LEFT JOIN must retain this row
+    play('agg-orphan', 'progress', 7, 25, 100);
+    play('agg-empty', 'start', 3);
+    play('agg-tie', 'complete', 8); // exact recent tie with A one
+    play('agg-tie', 'skip', 9);
+    play('agg-likeonly', 'like', 10);
+    play('agg-delta', 'like', 11); // exact artist rank/time tie with Epsilon
+    play('agg-epsilon', 'like', 11);
+    play('agg-a1', 'complete', 12, null, null, other.id);
+  });
+
+  const recent = [
+    { videoId: 'agg-a1', at: at(8), title: 'A one', channel: 'Alpha', thumb: 'alpha-thumb', durationS: 100 },
+    { videoId: 'agg-tie', at: at(8), title: 'Tie', channel: 'Tie', thumb: 'tie-thumb', durationS: 50 },
+    { videoId: 'agg-orphan', at: at(7), title: null, channel: null, thumb: null, durationS: null },
+    { videoId: 'agg-null', at: at(6), title: null, channel: null, thumb: null, durationS: null },
+    { videoId: 'agg-a2', at: at(4), title: 'A two', channel: 'Alpha', thumb: null, durationS: null },
+    { videoId: 'agg-b1', at: at(4), title: null, channel: 'Beta', thumb: 'beta-thumb', durationS: 200 },
+    { videoId: 'agg-empty', at: at(3), title: 'Empty channel', channel: '', thumb: null, durationS: 0 },
+  ];
+  assert.deepEqual(plain(db.recentlyPlayed(u.id, 40)), recent);
+  assert.deepEqual(plain(db.recentlyPlayed(u.id, 1)), recent.slice(0, 1));
+  assert.deepEqual(plain(db.recentlyPlayed(u.id, -1)), recent, 'SQLite negative LIMIT still means unbounded');
+  assert.deepEqual(plain(db.recentlyPlayed(u.id, 0)), []);
+
+  const candidate = (
+    videoId, completes, skips, starts, deepest, lastPlayed, title, channel, thumb, durationS,
+    channelId = null,
+  ) => ({
+    videoId, completes, skips, starts, deepest, lastPlayed, title, channel,
+    channelId, thumb, durationS,
+  });
+  const candidates = [
+    candidate('agg-tie', 1, 1, 0, 0, at(9), 'Tie', 'Tie', 'tie-thumb', 50),
+    candidate('agg-a1', 1, 0, 1, 1, at(8), 'A one', 'Alpha', 'alpha-thumb', 100),
+    candidate('agg-orphan', 0, 0, 1, 0.25, at(7), null, null, null, null),
+    candidate('agg-null', 0, 0, 1, 0.25, at(6), null, null, null, null),
+    candidate('agg-a2', 0, 1, 1, 0, at(4), 'A two', 'Alpha', null, null),
+    candidate('agg-b1', 1, 0, 0, 0, at(4), null, 'Beta', 'beta-thumb', 200),
+    candidate('agg-empty', 0, 0, 1, 0, at(3), 'Empty channel', '', null, 0),
+  ];
+  const station = db.stationCandidates(u.id, 400);
+  assert.deepEqual(plain(station.plays), candidates);
+  assert.deepEqual(station.likes, []);
+  assert.deepEqual(plain(db.stationCandidates(u.id, 1).plays), candidates.slice(0, 1));
+  assert.deepEqual(plain(db.stationCandidates(u.id, 0).plays), []);
+
+  const top = [
+    { title: 'Alpha', plays: 4, lastPlayed: at(9), thumb: 'alpha-thumb' },
+    { title: 'Delta', plays: 1, lastPlayed: at(11), thumb: null },
+    { title: 'Epsilon', plays: 1, lastPlayed: at(11), thumb: 'epsilon-thumb' },
+    { title: 'Gamma', plays: 1, lastPlayed: at(10), thumb: 'gamma-thumb' },
+    { title: 'Tie', plays: 1, lastPlayed: at(8), thumb: 'tie-thumb' },
+    { title: 'Beta', plays: 1, lastPlayed: at(4), thumb: 'beta-thumb' },
+  ];
+  assert.deepEqual(plain(db.topArtists(u.id, 18)), top);
+  assert.deepEqual(plain(db.topArtists(u.id, 3)), top.slice(0, 3), 'ties at the LIMIT use the channel tiebreak');
+  assert.deepEqual(plain(db.topArtists(u.id, 0)), []);
+  const artistRanking = plain(db.stationArtists(u.id, 20));
+  assert.deepEqual(artistRanking[0], { name: 'Alpha', plays: 2 });
+  // stationArtists historically orders only by plays. Keep that contract rather
+  // than inventing a new tiebreak in a performance patch: tied groups are
+  // compared as a set, while Alpha (the unique winner) and every LIMIT are exact.
+  assert.deepEqual(artistRanking.slice(1).sort((a, b) => a.name.localeCompare(b.name)), [
+    { name: 'Beta', plays: 1 },
+    { name: 'Delta', plays: 1 },
+    { name: 'Epsilon', plays: 1 },
+    { name: 'Gamma', plays: 1 },
+    { name: 'Tie', plays: 1 },
+  ]);
+  assert.deepEqual(plain(db.stationArtists(u.id, 1)), [{ name: 'Alpha', plays: 2 }]);
+  assert.deepEqual(plain(db.stationArtists(u.id, 0)), []);
+  assert.deepEqual(db.listLikes(other.id), [], 'the other user contributes only isolation coverage');
+});
+
+test('room UNION listing preserves overlap, flags, ended filtering, ordering and bounds', () => {
+  const host = db.createUser('room-query-host', 'pw');
+  const viewer = db.createUser('room-query-viewer', 'pw');
+  const at = (seconds) => new Date(Date.parse('2026-02-01T00:00:00.000Z') + seconds * 1000).toISOString();
+  const make = (code, hostId, seconds, ended = false) => {
+    db.createRoomRow({ code, hostId, visibility: 'private', control: 'host', state: { index: 0 } });
+    db.db.prepare('UPDATE rooms SET created_at = ?, updated_at = ?, ended_at = ? WHERE code = ?')
+      .run(at(0), at(seconds), ended ? at(seconds) : null, code);
+  };
+  make('RQ-MEMBER', host.id, 4);
+  make('RQ-HOST', viewer.id, 3);
+  make('RQ-INVITE', host.id, 3);
+  make('RQ-ENDED', viewer.id, 5, true);
+  make('RQ-OTHER', host.id, 5);
+  for (const code of ['RQ-HOST', 'RQ-MEMBER', 'RQ-ENDED']) db.addRoomMember(code, viewer.id);
+  for (const code of ['RQ-HOST', 'RQ-INVITE', 'RQ-ENDED']) db.addRoomInvite(code, viewer.id, host.id);
+
+  const rows = db.listRoomsForUser(viewer.id, 20);
+  // RQ-HOST appears through all three branches and must still occur only once.
+  assert.deepEqual(rows.map((r) => r.code), ['RQ-MEMBER', 'RQ-HOST', 'RQ-INVITE']);
+  assert.deepEqual(rows.map((r) => ({
+    code: r.code, hostName: r.hostName, members: r.members, joined: r.joined, invited: r.invited,
+  })), [
+    { code: 'RQ-MEMBER', hostName: 'room-query-host', members: 1, joined: true, invited: false },
+    { code: 'RQ-HOST', hostName: 'room-query-viewer', members: 1, joined: true, invited: true },
+    { code: 'RQ-INVITE', hostName: 'room-query-host', members: 0, joined: false, invited: true },
+  ]);
+  assert.equal(rows[1].hostId, viewer.id);
+  assert.equal(rows[1].createdAt, at(0));
+  assert.equal(rows[1].updatedAt, at(3));
+  assert.deepEqual(db.listRoomsForUser(viewer.id, 2).map((r) => r.code), ['RQ-MEMBER', 'RQ-HOST']);
+  assert.deepEqual(db.listRoomsForUser(viewer.id, 0).map((r) => r.code), ['RQ-MEMBER'],
+    'the existing minimum bound of one is retained');
+  assert.deepEqual(db.listRoomsForUser(viewer.id, -20).map((r) => r.code), ['RQ-MEMBER']);
+  assert.equal(db.listRoomsForUser(host.id, 100).some((r) => r.code === 'RQ-ENDED'), false);
+});
+
+test('LIKE searches treat % and _ as characters, not wildcards', () => {
+  db.createUser('search_underscore', 'pw');
+  db.createUser('searchXunderscore', 'pw');
+  db.createUser('plain-name', 'pw');
+
+  const underscore = db.searchUsers('_').map((u) => u.name);
+  assert.ok(underscore.includes('search_underscore'), 'a literal _ matches itself');
+  assert.ok(!underscore.includes('searchXunderscore'), '_ is not "any character"');
+  assert.ok(!underscore.includes('plain-name'));
+
+  // The admin track search had the same bug: "_" returned every track.
+  db.upsertTrack({ videoId: 'lit_eral_01', title: 'a_b' });
+  db.upsertTrack({ videoId: 'wildcard001', title: 'axb' });
+  const tracks = db.listTracksForAdmin('_').map((t) => t.videoId);
+  assert.deepEqual(tracks, ['lit_eral_01']);
+});
+
+test('upsertTrack rejects unusable ids and stores only safe integer durations', () => {
+  for (const track of [
+    null, {}, { videoId: '' }, { videoId: ' \t\n ' }, { videoId: 123 },
+    { videoId: null }, { videoId: new String('boxed-id') },
+  ]) {
+    assert.throws(() => db.upsertTrack(track), { name: 'TypeError', message: /videoId/ });
+  }
+
+  const cases = [
+    ['duration-round', 12.6, 13],
+    ['duration-floor', -12, 0],
+    ['duration-large', Number.MAX_VALUE, Number.MAX_SAFE_INTEGER],
+    ['duration-inf', Infinity, null],
+    ['duration-nan', Number.NaN, null],
+    ['duration-text', '120', null],
+  ];
+  for (const [videoId, durationS, expected] of cases) {
+    db.upsertTrack({ videoId, title: videoId, durationS });
+    assert.equal(db.getTrack(videoId).durationS, expected, `${videoId} duration`);
+    if (expected !== null) {
+      assert.equal(db.db.prepare('SELECT typeof(duration_s) AS type FROM tracks WHERE video_id = ?')
+        .get(videoId).type, 'integer');
+    }
+  }
+  db.upsertTrack({ videoId: '  duration-trim  ', durationS: 20 });
+  assert.ok(db.getTrack('duration-trim'), 'significant edge whitespace is removed from the id');
+});
+
+test('station evidence carries channel ids for likes and played seeds', () => {
+  const u = db.createUser('station-channel-owner', 'pw');
+  const videoId = 'channelSeed01';
+  const channelId = 'UCstationSeed000000000001';
+  db.upsertTrack({ videoId, title: 'Station seed', channel: 'Seed Artist', channelId });
+  db.recordPlay({ userId: u.id, videoId, kind: 'complete' });
+  db.toggleLike(u.id, videoId, true);
+
+  const played = db.stationCandidates(u.id).plays.find((track) => track.videoId === videoId);
+  const liked = db.listLikes(u.id).find((track) => track.videoId === videoId);
+  assert.equal(played.channelId, channelId);
+  assert.equal(liked.channelId, channelId);
+});
+
+test('marking a huge notification id list is capped instead of failing', () => {
+  const u = db.createUser('bell-flood', 'pw');
+  for (let i = 0; i < 600; i += 1) {
+    db.addNotification({ userId: u.id, kind: 'track', title: `t${i}`, dedupe: `flood-${i}` });
+  }
+  const ids = Array.from({ length: 40_000 }, (_, i) => i + 1);
+  const marked = db.markNotificationsRead(u.id, ids);
+  assert.ok(marked <= 500, `at most the cap is marked (got ${marked})`);
+  assert.ok(marked > 0);
+  // The call must not throw "too many SQL variables", and the rest stay unread.
+  assert.ok(db.countUnread(u.id) >= 100);
+});
+
+test('deleting a track removes the bell rows that point at it', () => {
+  const u = db.createUser('bell-track', 'pw');
+  db.upsertTrack({ videoId: 'gone-track1', title: 'Gone' });
+  assert.equal(db.addNotification({
+    userId: u.id, kind: 'track', title: 'Gone', videoId: 'gone-track1', dedupe: 'gone-1',
+  }), true);
+  assert.equal(db.deleteTrack('gone-track1'), true);
+  assert.equal(db.db.prepare('SELECT COUNT(*) AS n FROM notifications WHERE video_id = ?')
+    .get('gone-track1').n, 0);
+});
+
+test('global track deletion covers cached recommendations; history clears stay scoped', () => {
+  const first = db.createUser('cache-evict-first', 'pw');
+  const second = db.createUser('cache-evict-second', 'pw');
+  const other = db.createUser('cache-evict-other', 'pw');
+  db.upsertTrack({ videoId: 'evict-track1', title: 'Evicted' });
+  db.recordPlay({ userId: first.id, videoId: 'evict-track1', kind: 'complete' });
+  db.toggleDislike(second.id, 'evict-track1', true);
+  db.recordPlay({ userId: other.id, videoId: 'other-track1', kind: 'complete' });
+  for (const u of [first, second, other]) {
+    db.cacheSet(`station:${u.id}:delete`, { owner: u.id }, 60_000);
+  }
+
+  db.deleteTrack('evict-track1');
+  assert.equal(db.cacheGet(`station:${first.id}:delete`), null, 'a deleted played track evicts its station');
+  assert.equal(db.cacheGet(`station:${second.id}:delete`), null, 'removing a dislike also changes that station');
+  assert.equal(db.cacheGet(`station:${other.id}:delete`), null,
+    'even another user’s cached recommendations cannot retain a globally deleted track');
+
+  db.cacheSet(`station:${other.id}:delete`, { owner: other.id }, 60_000);
+  db.recordPlay({ userId: first.id, videoId: 'history-evict1', kind: 'start' });
+  db.cacheSet(`station:${first.id}:history`, { stale: true }, 60_000);
+  assert.equal(db.clearUserHistory(first.id), 1);
+  assert.equal(db.cacheGet(`station:${first.id}:history`), null);
+  assert.deepEqual(db.cacheGet(`station:${other.id}:delete`), { owner: other.id });
+
+  db.toggleLike(first.id, 'taste-evict1', true);
+  db.cacheSet(`station:${first.id}:taste`, { stale: true }, 60_000);
+  assert.equal(db.clearUserTaste(first.id), 1);
+  assert.equal(db.cacheGet(`station:${first.id}:taste`), null);
+});
+
+test('deleting a user drops their cached station, so a reused id cannot inherit it', () => {
+  const u = db.createUser('station-owner', 'pw');
+  db.cacheSet(`station:${u.id}:first`, { seeds: ['private'] }, 60_000);
+  assert.deepEqual(db.cacheGet(`station:${u.id}:first`), { seeds: ['private'] });
+
+  assert.equal(db.deleteUser(u.id), true);
+  assert.equal(db.cacheGet(`station:${u.id}:first`), null);
+
+  // And integrity reporting plus the general repair also catch a blob left
+  // behind by an older build (there is no foreign key on the cache key).
+  db.cacheSet('station:999999:first', { seeds: ['stale'] }, 60_000);
+  const report = db.integrityReport();
+  assert.equal(report.orphanStationCache, 1);
+  assert.equal(report.ok, false);
+  assert.ok(report.orphans.some((o) => o.table === 'upstream_cache' && o.column === 'key'));
+  const repaired = db.pruneOrphans();
+  assert.ok(repaired.some((o) => o.table === 'upstream_cache' && o.rows === 1));
+  assert.equal(db.cacheGet('station:999999:first'), null);
+  assert.equal(db.integrityReport().orphanStationCache, 0);
+});
+
+test('orphan rows are detected and pruned without touching reachable data', () => {
+  const u = db.createUser('orphan-owner', 'pw');
+  db.upsertTrack({ videoId: 'orphan-vid1', title: 'Orphan' });
+  db.toggleLike(u.id, 'orphan-vid1', true);
+  db.recordPlay({ userId: u.id, videoId: 'orphan-vid1', kind: 'start' });
+  const keep = db.createUser('keep-owner', 'pw');
+  db.toggleLike(keep.id, 'orphan-vid1', true);
+
+  // Simulate a row written while foreign keys were off (a sqlite3 session, a
+  // hand edit, a build that forgot the pragma).
+  db.db.exec('PRAGMA foreign_keys = OFF');
+  try {
+    db.db.prepare('DELETE FROM users WHERE id = ?').run(u.id);
+  } finally {
+    db.db.exec('PRAGMA foreign_keys = ON');
+  }
+
+  const found = db.findOrphans();
+  assert.ok(found.some((o) => o.table === 'likes'), `likes orphan reported: ${JSON.stringify(found)}`);
+  assert.ok(found.some((o) => o.table === 'plays'));
+  assert.equal(db.integrityReport().ok, false);
+
+  const removed = db.pruneOrphans();
+  assert.ok(removed.reduce((n, r) => n + r.rows, 0) >= 2);
+  assert.deepEqual(db.findOrphans(), []);
+  assert.equal(db.listLikes(keep.id).length, 1, 'reachable likes survive');
+  assert.equal(db.integrityReport().ok, true);
+});
+
+test('a dangling inviter is nulled without deleting the room invitation', () => {
+  const host = db.createUser('invite-host', 'pw');
+  const invited = db.createUser('invite-guest', 'pw');
+  const inviter = db.createUser('invite-old-host', 'pw');
+  db.createRoomRow({ code: 'INVITE1', hostId: host.id, state: {} });
+  db.addRoomInvite('INVITE1', invited.id, inviter.id);
+
+  db.db.exec('PRAGMA foreign_keys = OFF');
+  try {
+    db.db.prepare('DELETE FROM users WHERE id = ?').run(inviter.id);
+  } finally {
+    db.db.exec('PRAGMA foreign_keys = ON');
+  }
+  assert.ok(db.findOrphans().some((o) => o.table === 'room_invites' && o.column === 'invited_by'));
+  assert.equal(db.integrityReport().ok, false);
+
+  const repaired = db.pruneOrphans();
+  assert.ok(repaired.some((o) => o.table === 'room_invites' && o.column === 'invited_by'));
+  const invite = db.getRoomInvite('INVITE1', invited.id);
+  assert.ok(invite, 'the invitation itself survives');
+  assert.equal(invite.invited_by, null);
+  assert.equal(db.db.prepare('PRAGMA foreign_key_check').all().length, 0);
+  assert.equal(db.integrityReport().ok, true);
+});
+
+test('a room command commits against the revision it was computed from', () => {
+  const u = db.createUser('cas-host', 'pw');
+  db.createRoomRow({ code: 'CAS001', hostId: u.id, state: { index: 0, positionMs: 0 } });
+
+  assert.equal(db.updateRoomStateCas('CAS001', {
+    state: { index: 1, positionMs: 0 }, rev: 2, expectedRev: 1,
+  }), true);
+  // A second command that still thinks it is on rev 1 must not move the
+  // playhead back — that is what used to make two people jump backwards.
+  assert.equal(db.updateRoomStateCas('CAS001', {
+    state: { index: 2, positionMs: 0 }, rev: 2, expectedRev: 1,
+  }), false);
+  assert.equal(db.getRoomRow('CAS001').rev, 2);
+  assert.deepEqual(JSON.parse(db.getRoomRow('CAS001').state), { index: 1, positionMs: 0 });
+});
+
+test('users.last_seen_at is refreshed, and never regressed', () => {
+  const u = db.createUser('seen-owner', 'pw');
+  const before = db.getUser(u.id).last_seen_at;
+  assert.equal(before, null);
+
+  assert.equal(db.touchUserSeen(u.id), true);
+  const seen = db.getUser(u.id).last_seen_at;
+  assert.ok(seen, 'a device touching the account records when it was last seen');
+
+  // Called again inside the throttle window it is a no-op, so a second device
+  // cannot move the value backwards.
+  assert.equal(db.touchUserSeen(u.id), false);
+  assert.equal(db.getUser(u.id).last_seen_at, seen);
+});
+
+test('expired cache rows are swept by expiry, not left for their next read', () => {
+  db.cacheSet('sweep:dead', { x: 1 }, -1);
+  db.cacheSet('sweep:live', { x: 2 }, 60_000);
+  assert.ok(db.pruneExpiredCache() >= 1);
+  assert.equal(db.cacheGet('sweep:dead'), null);
+  assert.deepEqual(db.cacheGet('sweep:live'), { x: 2 });
+});
+
+test('a follow attempt stamps the attempt, counts failures and clears them on success', () => {
+  const u = db.createUser('follow-attempt', 'pw');
+  db.followArtist(u.id, { artistId: 'UCattempt0001', name: 'Attempt' });
+  const row = () => db.db.prepare(`
+    SELECT last_checked_at, last_attempt_at, fail_count
+    FROM artist_follows WHERE user_id = ? AND artist_id = ?
+  `).get(u.id, 'UCattempt0001');
+
+  assert.deepEqual({ ...row() }, { last_checked_at: null, last_attempt_at: null, fail_count: 0 });
+
+  assert.equal(db.markFollowAttempt(u.id, 'UCattempt0001', { ok: false, at: '2026-01-01T00:00:00.000Z' }), true);
+  let r = row();
+  assert.equal(r.fail_count, 1);
+  assert.equal(r.last_attempt_at, '2026-01-01T00:00:00.000Z');
+  // A failure is an attempt, not a check: the artist is still owed a real look.
+  assert.equal(r.last_checked_at, null);
+
+  db.markFollowAttempt(u.id, 'UCattempt0001', { ok: false, at: '2026-01-01T01:00:00.000Z' });
+  assert.equal(row().fail_count, 2);
+
+  assert.equal(db.markFollowAttempt(u.id, 'UCattempt0001', { ok: true, at: '2026-01-01T02:00:00.000Z' }), true);
+  r = row();
+  assert.equal(r.fail_count, 0, 'a success resets the backoff');
+  assert.equal(r.last_checked_at, '2026-01-01T02:00:00.000Z');
+  assert.equal(r.last_attempt_at, '2026-01-01T02:00:00.000Z');
+
+  // An artist this user does not follow is not silently created or updated.
+  assert.equal(db.markFollowAttempt(u.id, 'UCnotfollowed', { ok: false }), false);
+  assert.equal(db.db.prepare('SELECT COUNT(*) AS n FROM artist_follows WHERE artist_id = ?')
+    .get('UCnotfollowed').n, 0);
+});
+
+test('the follow sweep serves healthy artists first and backs off the failing ones', () => {
+  const u = db.createUser('follow-sweep', 'pw');
+  const other = db.createUser('follow-sweep-other', 'pw');
+  const t0 = '2026-01-01T00:00:00.000Z';
+  const at = (ms) => new Date(Date.parse(t0) + ms).toISOString();
+
+  for (const id of ['UCfailing01', 'UCfailing02', 'UCfailing03', 'UChealthy01']) {
+    db.followArtist(u.id, { artistId: id, name: id });
+  }
+  db.followArtist(other.id, { artistId: 'UConlyother', name: 'onlyother' });
+  // Three artists fail at t0; one has never been tried.
+  for (const id of ['UCfailing01', 'UCfailing02', 'UCfailing03']) {
+    db.markFollowAttempt(u.id, id, { ok: false, at: t0 });
+  }
+
+  // Inside the first hour of backoff, only the healthy artist is due — and it
+  // is first, which is the whole point: failing artists cannot hog the sweep.
+  const soon = db.followSweepDue(u.id, 10, at(30 * 60_000));
+  assert.deepEqual(soon.map((a) => a.artistId), ['UChealthy01']);
+
+  // Past the 1 h backoff the failures are due again, still behind the healthy one.
+  const later = db.followSweepDue(u.id, 10, at(61 * 60_000));
+  assert.deepEqual(later.map((a) => a.artistId),
+    ['UChealthy01', 'UCfailing01', 'UCfailing02', 'UCfailing03']);
+  assert.equal(later[0].failCount, 0);
+
+  // Someone else's follows never leak into this user's sweep.
+  assert.ok(!later.some((a) => a.artistId === 'UConlyother'));
+  assert.deepEqual(db.followSweepDue(other.id, 10, at(30 * 60_000)).map((a) => a.artistId), ['UConlyother']);
+
+  // A second failure puts that artist on the 2 h rung, behind its peers.
+  db.markFollowAttempt(u.id, 'UCfailing01', { ok: false, at: at(2 * 60 * 60_000) });
+  const mid = db.followSweepDue(u.id, 10, at(2.5 * 60 * 60_000));
+  assert.deepEqual(mid.map((a) => a.artistId),
+    ['UChealthy01', 'UCfailing02', 'UCfailing03']);
+
+  // ...and the ladder is capped at a day: 5 fails is 16 h, 6+ is 24 h.
+  db.followArtist(u.id, { artistId: 'UCladder0001', name: 'ladder' });
+  for (let i = 0; i < 6; i += 1) db.markFollowAttempt(u.id, 'UCladder0001', { ok: false, at: t0 });
+  const ids = (now) => db.followSweepDue(u.id, 50, now).map((a) => a.artistId);
+  assert.ok(!ids(at(23 * 60 * 60_000)).includes('UCladder0001'), 'not due before 24 h');
+  assert.ok(ids(at(24 * 60 * 60_000 + 60_000)).includes('UCladder0001'), 'due after 24 h');
+
+  // The limit is honoured, and the ordering is stable across calls.
+  assert.equal(db.followSweepDue(u.id, 2, at(25 * 60 * 60_000)).length, 2);
+  assert.deepEqual(ids(at(25 * 60 * 60_000)), ids(at(25 * 60 * 60_000)));
+});
+
+test('a nested transaction joins the outer one instead of rolling it back', () => {
+  const u = db.createUser('nested-tx', 'pw');
+  db.transaction(() => {
+    db.recordPlay({ userId: u.id, videoId: 'nested00001', kind: 'start' });
+    // deleteTrack/deleteUser/recordReleases must be safe inside this.
+    db.deleteTrack('nested00001');
+    db.recordReleases('UCnested', [{ releaseId: 'r1', title: 'One' }]);
+  });
+  assert.equal(db.db.prepare('SELECT COUNT(*) AS n FROM plays WHERE user_id = ?').get(u.id).n, 0);
+  assert.equal(db.knownReleases('UCnested').length, 1);
 });

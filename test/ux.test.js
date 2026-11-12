@@ -1051,7 +1051,7 @@ test('K: a saved session resumes at the saved playhead and can take over from an
   await withPage(browser, BASE, { viewport: VIEW.mobile390, page: 'home' }, async () => {
     const ui = await browser.eval(`(() => ({
       title: document.querySelector('#player .player-song-meta strong')?.textContent,
-      meta: document.querySelector('#player .player-song-meta span')?.textContent,
+      meta: document.querySelector('#player .player-song-meta > span')?.textContent,
       hero: document.querySelector('.hero-content')?.innerText.replace(/\\s+/g, ' '),
       button: document.querySelector('[data-action="play-featured"]')?.textContent.trim(),
     }))()`);
@@ -1122,7 +1122,7 @@ test('K: a saved session resumes at the saved playhead and can take over from an
 
     const handoff = await browser.eval(`({
       title: document.querySelector('#player .player-song-meta strong')?.textContent,
-      meta: document.querySelector('#player .player-song-meta span')?.textContent,
+      meta: document.querySelector('#player .player-song-meta > span')?.textContent,
       hero: document.querySelector('.hero-content')?.innerText.replace(/\\s+/g, ' '),
       toast: document.getElementById('toast-text')?.textContent,
     })`);
@@ -1131,4 +1131,519 @@ test('K: a saved session resumes at the saved playhead and can take over from an
     assert.match(handoff.hero, /FROM YOUR MAC/i, 'the hero names the new owner');
     assert.equal(handoff.toast, 'Picked up on your Mac', 'the hand-off is announced, not silent');
   });
+});
+
+// ── app-shell defects (see .audit/frontend-ux.md) ────────────────────────
+//
+// Each of these pins a bug that was visible in a real browser: a double boot,
+// a skeleton that never clears, a stale response painting the wrong page, lost
+// focus/scroll, a silent failure. The instrumentation is installed as an init
+// script per test and disposed before the next navigation.
+
+const UX_TRACKS = [
+  { videoId: 'uxt00000001', title: 'UX Order One', channel: 'UX Channel', durationS: 200, thumb: null },
+  { videoId: 'uxt00000002', title: 'UX Order Two', channel: 'UX Channel', durationS: 201, thumb: null },
+  { videoId: 'uxt00000003', title: 'UX Order Three', channel: 'UX Channel', durationS: 202, thumb: null },
+];
+
+/** Create a playlist with real tracks through the API the app itself uses. */
+async function makePlaylist(title, tracks) {
+  return browser.eval(`(async () => {
+    const create = await fetch('/api/playlists', { method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: ${JSON.stringify(title)} }) }).then((r) => r.json());
+    for (const t of ${JSON.stringify(tracks)}) {
+      await fetch('/api/playlists/' + create.playlist.id + '/tracks', { method: 'POST',
+        headers: { 'content-type': 'application/json' }, body: JSON.stringify(t) });
+    }
+    return create.playlist.id;
+  })()`);
+}
+
+const titleOf = () => browser.eval(`document.querySelector('#player .player-song-meta strong')?.textContent`);
+const playingUI = () => browser.waitFor(
+  `document.querySelector('#player .main-toggle')?.getAttribute('aria-label') === 'Pause'`, 5000);
+
+test('L: boot runs once per load — no duplicated requests, renders or restores', async (t) => {
+  if (!needBrowser(t)) return;
+  const dispose = await browser.addInitScript(`(() => {
+    const counts = {};
+    window.__bootCounts = counts;
+    const prev = window.fetch;
+    window.fetch = (input, init) => {
+      const raw = typeof input === 'string' ? input : (input?.url ?? String(input));
+      try { const u = new URL(raw, location.href); if (u.pathname.startsWith('/api/')) counts[u.pathname] = (counts[u.pathname] || 0) + 1; } catch {}
+      return prev(input, init);
+    };
+  })()`);
+  try {
+    await withPage(browser, BASE, { viewport: VIEW.mobile390 }, async () => {
+      // boot's tail (station, status, room) is fire-and-forget; let it land.
+      await new Promise((r) => setTimeout(r, 1500));
+      const counts = await browser.eval(`window.__bootCounts`);
+      // /api/me is also read by the notifications module, so it is not a boot
+      // fingerprint; these five are only ever fetched by boot.
+      for (const path of ['/api/likes', '/api/dislikes', '/api/playlists', '/api/recent', '/api/now']) {
+        assert.equal(counts[path] ?? 0, 1,
+          `${path} was requested ${counts[path] ?? 0} times during one boot; boot() must run once`);
+      }
+    });
+  } finally {
+    await dispose();
+  }
+});
+
+test('M: one failing boot request still paints the app instead of a frozen skeleton', async (t) => {
+  if (!needBrowser(t)) return;
+  const dispose = await browser.addInitScript(`(() => {
+    const prev = window.fetch;
+    let failed = false;
+    window.fetch = (input, init) => {
+      const raw = typeof input === 'string' ? input : (input?.url ?? String(input));
+      let u; try { u = new URL(raw, location.href); } catch { return prev(input, init); }
+      if (u.pathname === '/api/likes' && !failed) {
+        failed = true;
+        return Promise.resolve(new Response(JSON.stringify({ error: 'likes are down' }),
+          { status: 500, headers: { 'content-type': 'application/json' } }));
+      }
+      return prev(input, init);
+    };
+  })()`);
+  try {
+    await withPage(browser, BASE, { viewport: VIEW.mobile390 }, async () => {
+      await browser.waitFor(`!!document.querySelector('#page-root .page-title')`, 6000).catch(() => {});
+      assert.ok(await browser.eval(`!!document.querySelector('#page-root .page-title')`),
+        'a 500 on /api/likes aborted boot and left the index.html skeleton on screen');
+      assert.equal(await browser.eval(`document.querySelectorAll('#page-root .sk').length`), 0,
+        'the boot skeleton is still painted after the failing request');
+      assert.ok(await browser.eval(`!!document.querySelector('#mobile-nav [data-page="library"]')`),
+        'the shell is not navigable after a partial boot');
+    });
+  } finally {
+    await dispose();
+  }
+});
+
+test('N: a slow collection answer cannot paint over the page opened after it', async (t) => {
+  if (!needBrowser(t)) return;
+  const a = await makePlaylist(`Slow Collection ${Date.now().toString(36)}`, [UX_TRACKS[0]]);
+  const b = await makePlaylist(`Fast Collection ${Date.now().toString(36)}`, [UX_TRACKS[1]]);
+  const aTitle = await browser.eval(`fetch('/api/playlists/${a}').then((r) => r.json()).then((x) => x.playlist.title)`);
+  const bTitle = await browser.eval(`fetch('/api/playlists/${b}').then((r) => r.json()).then((x) => x.playlist.title)`);
+
+  // Delay the *first* playlist read only, so A lands after B.
+  const dispose = await browser.addInitScript(`(() => {
+    const prev = window.fetch;
+    let delayed = false;
+    window.fetch = async (input, init) => {
+      const raw = typeof input === 'string' ? input : (input?.url ?? String(input));
+      let u; try { u = new URL(raw, location.href); } catch { return prev(input, init); }
+      if (!delayed && /^\\/api\\/playlists\\/\\d+$/.test(u.pathname)
+        && String(init?.method || 'GET').toUpperCase() === 'GET') {
+        delayed = true;
+        await new Promise((r) => setTimeout(r, 1200));
+      }
+      return prev(input, init);
+    };
+  })()`);
+  try {
+    await withPage(browser, BASE, { viewport: VIEW.desktop, page: 'library' }, async () => {
+      // Open A (slow), then B from the sidebar while A is still in flight.
+      await browser.eval(`document.querySelector('#page-root [data-collection="p${a}"]').click()`);
+      await browser.waitFor(`!!document.querySelector('#side-playlists [data-collection="p${b}"]')`, 4000);
+      await browser.eval(`document.querySelector('#side-playlists [data-collection="p${b}"]').click()`);
+      await browser.waitFor(`document.querySelector('#page-root .collection-hero h1')?.textContent === ${JSON.stringify(bTitle)}`, 6000);
+
+      // Let A's late answer land, then force a repaint from state (the queue
+      // menu renders the page again — the corruption used to show up there).
+      await new Promise((r) => setTimeout(r, 1500));
+      await browser.eval(`(() => {
+        const row = document.querySelector('#page-root .track-row[data-track="${UX_TRACKS[1].videoId}"]');
+        const r = row.getBoundingClientRect();
+        row.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: r.left + 40, clientY: r.top + 20 }));
+        return true;
+      })()`);
+      await browser.waitFor(`!document.getElementById('context-menu').hidden`, 4000);
+      await browser.eval(`document.querySelector('#context-menu [data-menu-action="next"]').click()`);
+      await new Promise((r) => setTimeout(r, 250));
+
+      const page = await browser.eval(`({
+        hero: document.querySelector('#page-root .collection-hero h1')?.textContent,
+        rows: [...document.querySelectorAll('#page-root .track-row[data-track]')].map((r) => r.dataset.track),
+        title: document.title,
+        hash: location.hash,
+      })`);
+      assert.equal(page.hero, bTitle,
+        `a slow playlist answer overwrote the newer page (hero is "${page.hero}", expected "${bTitle}" after A="${aTitle}")`);
+      assert.deepEqual(page.rows, [UX_TRACKS[1].videoId],
+        'the repainted page shows the wrong collection\'s tracks');
+      assert.match(page.title, new RegExp(bTitle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+      assert.equal(page.hash, `#/c/p${b}`);
+    });
+  } finally {
+    await dispose();
+  }
+});
+
+test('O: a slow search failure cannot wipe the newer query\'s results', async (t) => {
+  if (!needBrowser(t)) return;
+  const dispose = await browser.addInitScript(`(() => {
+    const prev = window.fetch;
+    window.fetch = async (input, init) => {
+      const raw = typeof input === 'string' ? input : (input?.url ?? String(input));
+      let u; try { u = new URL(raw, location.href); } catch { return prev(input, init); }
+      if (u.pathname === '/api/search' && u.searchParams.get('q') === 'slow query') {
+        await new Promise((r) => setTimeout(r, 900));
+        return new Response(JSON.stringify({ error: 'Search is unavailable.' }),
+          { status: 500, headers: { 'content-type': 'application/json' } });
+      }
+      return prev(input, init);
+    };
+  })()`);
+  try {
+    await withPage(browser, BASE, { viewport: VIEW.desktop, page: 'search' }, async () => {
+      const type = (q) => browser.eval(`(() => {
+        const input = document.getElementById('primary-search');
+        input.value = ${JSON.stringify(q)};
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+      })()`);
+      await type('slow query');
+      // The debounce fires at 380 ms; make sure the slow request is in flight
+      // before typing over it.
+      await new Promise((r) => setTimeout(r, 500));
+      await type('fixture album');
+      await browser.waitFor(`document.querySelectorAll('#page-root .track-row[data-track]').length >= 1`, 6000);
+
+      // Let the first query's delayed 500 land.
+      await new Promise((r) => setTimeout(r, 1300));
+      const after = await browser.eval(`({
+        rows: [...document.querySelectorAll('#page-root .track-row[data-track]')].map((r) => r.dataset.track),
+        text: document.getElementById('page-root').innerText,
+        toast: document.getElementById('toast-text')?.textContent || '',
+      })`);
+      assert.deepEqual(after.rows, [SEED_TRACK.videoId],
+        'the newer query\'s result was cleared by the older query\'s failure');
+      assert.doesNotMatch(after.text, /No match for/i,
+        'the newer query was labelled "No match" because an older one failed');
+      assert.doesNotMatch(after.toast, /unavailable/i,
+        'a stale search failure raised an error toast for the query that succeeded');
+    });
+  } finally {
+    await dispose();
+  }
+});
+
+test('P: a repaint keeps keyboard focus on the control that caused it', async (t) => {
+  if (!needBrowser(t)) return;
+  await withPage(browser, BASE, { viewport: VIEW.desktop, page: 'library' }, async () => {
+    // A library tab re-renders the whole page.
+    const activated = await browser.eval(`(() => {
+      const tab = document.querySelector('#page-root [data-library-tab="Albums"]');
+      if (!tab) return false;
+      tab.focus({ focusVisible: true });
+      tab.click();
+      return true;
+    })()`);
+    assert.ok(activated, 'the library rendered no Albums tab');
+    await browser.waitFor(`document.querySelector('#page-root [data-library-tab="Albums"]')?.getAttribute('aria-selected') === 'true'`, 4000);
+    assert.equal(await browser.eval(`document.activeElement?.getAttribute?.('data-library-tab')`), 'Albums',
+      're-rendering the library dropped focus to <body> (Tab restarts at the top)');
+
+    // The player bar is rebuilt on every playback change; start a real track
+    // from its collection first.
+    await nav(browser, 'playlist', { playlistId: PLAYLIST.id });
+    await startTrack(browser);
+    await browser.eval(`(() => {
+      const next = document.querySelector('#player [data-action="next"]');
+      next.focus({ focusVisible: true });
+      next.click();
+      return true;
+    })()`);
+    await browser.waitFor(`document.getElementById('player').classList.contains('is-playing')`, 3000).catch(() => {});
+    const after = await browser.eval(`(() => {
+      const a = document.activeElement;
+      return { action: a?.getAttribute?.('data-action'), inPlayer: !!a?.closest?.('#player') };
+    })()`);
+    assert.equal(after.action, 'next', 'pressing next moved focus to <body> during the repaint');
+    assert.equal(after.inPlayer, true, 'focus was restored outside the player bar');
+  });
+});
+
+test('Q: Back restores the scroll position of the page being returned to', async (t) => {
+  if (!needBrowser(t)) return;
+  await withPage(browser, BASE, { viewport: VIEW.desktop }, async () => {
+    const set = await browser.eval(`(() => {
+      const main = document.getElementById('main-scroll');
+      main.scrollTop = 420;
+      return main.scrollTop;
+    })()`);
+    assert.ok(set >= 300, `the home page is not tall enough to scroll (scrollTop ${set})`);
+    await nav(browser, 'library');
+    assert.equal(await browser.eval(`document.getElementById('main-scroll').scrollTop`), 0,
+      'a fresh navigation must start at the top');
+    await browser.eval(`history.back()`);
+    await browser.waitFor(`!!document.querySelector('#page-root .page-title')`, 5000);
+    await new Promise((r) => setTimeout(r, 350));
+    const restored = await browser.eval(`document.getElementById('main-scroll').scrollTop`);
+    assert.ok(restored >= 300, `Back returned to the top of the page (scrollTop ${restored}, expected ~${set})`);
+  });
+});
+
+test('R: activating the page you are already on does not push a duplicate history entry', async (t) => {
+  if (!needBrowser(t)) return;
+  await withPage(browser, BASE, { viewport: VIEW.desktop, page: 'library' }, async () => {
+    const before = await browser.eval(`history.length`);
+    await browser.eval(`document.querySelector('#desktop-nav [data-page="library"]').click()`);
+    await new Promise((r) => setTimeout(r, 250));
+    assert.equal(await browser.eval(`history.length`), before,
+      'clicking the current nav item pushed a duplicate entry (in-app Back then looks dead once)');
+  });
+});
+
+test('S: a failing action reports instead of doing nothing', async (t) => {
+  if (!needBrowser(t)) return;
+  await withPage(browser, BASE, { viewport: VIEW.desktop, page: 'playlist', playlistId: PLAYLIST.id }, async () => {
+    // The collection page's own read succeeded above; fail the next one, which
+    // is what "Play all" does before it can start anything.
+    await browser.eval(`(() => {
+      const orig = window.fetch;
+      let fail = true;
+      window.fetch = (input, init) => {
+        const raw = typeof input === 'string' ? input : (input?.url ?? String(input));
+        let u; try { u = new URL(raw, location.href); } catch { return orig(input, init); }
+        if (fail && /^\\/api\\/playlists\\/\\d+$/.test(u.pathname)) {
+          fail = false;
+          return Promise.resolve(new Response(JSON.stringify({ error: 'Playlist is unreadable.' }),
+            { status: 500, headers: { 'content-type': 'application/json' } }));
+        }
+        return orig(input, init);
+      };
+      window.__ux.errors.length = 0;
+      return true;
+    })()`);
+    await browser.waitFor(`!!document.querySelector('#page-root [data-action="play-collection"]')`, 8000);
+    await browser.eval(`document.querySelector('#page-root [data-action="play-collection"]').click()`);
+    await browser.waitFor(`/unreadable/i.test(document.getElementById('toast-text')?.textContent || '')`, 5000)
+      .catch(() => {});
+    assert.match(await browser.eval(`document.getElementById('toast-text')?.textContent || ''`), /unreadable/i,
+      'a rejected action was silent: no toast, no feedback, only an unhandled rejection');
+  });
+});
+
+test('T: tapping the sheet scrim closes through the normal path (focus returns)', async (t) => {
+  if (!needBrowser(t)) return;
+  await withPage(browser, BASE, { viewport: VIEW.desktop }, async () => {
+    await startTrack(browser);
+    await openNowPlaying(browser);
+    const trigger = await browser.eval(`(() => { window.__scrim = window.__uxTrigger; return !!window.__scrim; })()`);
+    assert.equal(trigger, true);
+    await browser.eval(`document.getElementById('now-overlay').click()`);
+    await browser.waitFor(`document.getElementById('now-overlay').hidden === true`, 2000);
+    assert.equal(await browser.eval(`document.activeElement === window.__scrim`), true,
+      'dismissing the sheet by tapping the scrim lost focus instead of returning it to the trigger');
+  });
+});
+
+test('U: the hero caption never cuts an HTML entity in half', async (t) => {
+  if (!needBrowser(t)) return;
+  const title = 'Rock & Roll Highway Star Party & More Stuff';
+  await seedPlayerState(BASE, {
+    queue: [{ videoId: 'uxt00000009', title, channel: 'UX Channel', thumb: null, durationS: 200 }],
+    index: 0, positionMs: 0, source: 'home', deviceId: 'hero-entity-device', playing: false,
+  });
+  await withPage(browser, BASE, { viewport: VIEW.desktop, page: 'home' }, async () => {
+    const meta = await browser.eval(`document.querySelector('.hero-meta')?.textContent || ''`);
+    assert.ok(meta.length > 0, 'the hero rendered no caption');
+    assert.doesNotMatch(meta, /&(amp|lt|gt|quot|#\d+);?/, `the caption shows a broken entity: "${meta}"`);
+    assert.ok(meta.length <= title.length && !/&am$/.test(meta), `the caption is malformed: "${meta}"`);
+  });
+});
+
+test('V: an unexpected API shape degrades instead of blanking every render', async (t) => {
+  if (!needBrowser(t)) return;
+  const dispose = await browser.addInitScript(`(() => {
+    const prev = window.fetch;
+    window.fetch = (input, init) => {
+      const raw = typeof input === 'string' ? input : (input?.url ?? String(input));
+      let u; try { u = new URL(raw, location.href); } catch { return prev(input, init); }
+      const nullShape = (body) => Promise.resolve(new Response(JSON.stringify(body),
+        { status: 200, headers: { 'content-type': 'application/json' } }));
+      if (u.pathname === '/api/likes') return nullShape({ tracks: null });
+      if (u.pathname === '/api/dislikes') return nullShape({ tracks: null });
+      if (u.pathname === '/api/playlists') return nullShape({ playlists: null });
+      if (u.pathname === '/api/now') return nullShape({ state: null, updatedAt: null });
+      return prev(input, init);
+    };
+  })()`);
+  try {
+    await withPage(browser, BASE, { viewport: VIEW.desktop }, async () => {
+      await browser.waitFor(`!!document.querySelector('#page-root .page-title')`, 6000).catch(() => {});
+      assert.ok(await browser.eval(`!!document.querySelector('#page-root .page-title')`),
+        'null lists from the API left the page blank (render threw on .map of undefined)');
+      // And the shell is still usable: opening the library renders.
+      await nav(browser, 'library');
+      await browser.waitFor(`!!document.querySelector('#page-root [data-library-tab]')`, 5000);
+      assert.ok(await browser.eval(`!!document.querySelector('#page-root [data-library-tab]')`),
+        'the library page cannot render after a null playlists answer');
+    });
+  } finally {
+    await dispose();
+  }
+});
+
+test('W: leaving Search cancels the pending debounced query', async (t) => {
+  if (!needBrowser(t)) return;
+  const dispose = await browser.addInitScript(`(() => {
+    window.__searchCalls = [];
+    const prev = window.fetch;
+    window.fetch = (input, init) => {
+      const raw = typeof input === 'string' ? input : (input?.url ?? String(input));
+      try { const u = new URL(raw, location.href); if (u.pathname === '/api/search') window.__searchCalls.push(u.searchParams.get('q')); } catch {}
+      return prev(input, init);
+    };
+  })()`);
+  try {
+    await withPage(browser, BASE, { viewport: VIEW.desktop, page: 'search' }, async () => {
+      await browser.eval(`(() => {
+        const input = document.getElementById('primary-search');
+        input.value = 'typed then abandoned';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+      })()`);
+      // Navigate away inside the 380 ms debounce window.
+      await nav(browser, 'library');
+      await new Promise((r) => setTimeout(r, 900));
+      assert.deepEqual(await browser.eval(`window.__searchCalls`), [],
+        'a debounced search fired after the page was left (its failure would toast on the new page)');
+    });
+  } finally {
+    await dispose();
+  }
+});
+
+test('X: dragging the volume slider persists once, not on every input event', async (t) => {
+  if (!needBrowser(t)) return;
+  const dispose = await browser.addInitScript(`(() => {
+    const orig = Storage.prototype.setItem;
+    window.__storageWrites = [];
+    Storage.prototype.setItem = function (key, value) {
+      window.__storageWrites.push(key);
+      return orig.call(this, key, value);
+    };
+  })()`);
+  try {
+    await withPage(browser, BASE, { viewport: VIEW.desktop }, async () => {
+      await browser.waitFor(`!!document.querySelector('#player input[data-slider="volume"]')`, 5000);
+      await browser.eval(`(() => {
+        const input = document.querySelector('#player input[data-slider="volume"]');
+        window.__storageWrites.length = 0;
+        for (let v = 10; v <= 60; v += 5) {
+          input.value = String(v);
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        return true;
+      })()`);
+      await new Promise((r) => setTimeout(r, 350));
+      const writes = await browser.eval(`window.__storageWrites.filter((k) => k === 'sonora.volume').length`);
+      assert.ok(writes <= 2, `a volume drag wrote localStorage ${writes} times in 11 input events`);
+      assert.equal(await browser.eval(`localStorage.getItem('sonora.volume')`), '0.6',
+        'the settled volume was not persisted');
+    });
+  } finally {
+    await dispose();
+  }
+});
+
+test('Y: an automatic track change is announced to screen readers', async (t) => {
+  if (!needBrowser(t)) return;
+  const list = await makePlaylist(`Announce List ${Date.now().toString(36)}`, UX_TRACKS);
+  await withPage(browser, BASE, { viewport: VIEW.desktop, page: 'playlist', playlistId: list }, async () => {
+    await browser.waitFor(`document.querySelectorAll('#page-root .track-row[data-track]').length >= 3`, 8000);
+    await browser.eval(`document.querySelectorAll('#page-root .track-row[data-track]')[0].click()`);
+    await playingUI();
+    await browser.waitFor(`document.getElementById('np-announcer')?.textContent.includes('UX Order One')`, 4000)
+      .catch(() => {});
+    const first = await browser.eval(`(() => {
+      const el = document.getElementById('np-announcer');
+      return el && { live: el.getAttribute('aria-live'), atomic: el.getAttribute('aria-atomic'), text: el.textContent };
+    })()`);
+    assert.ok(first, 'no now-playing live region exists');
+    assert.equal(first.live, 'polite');
+    assert.equal(first.atomic, 'true');
+    assert.match(first.text, /UX Order One/);
+
+    await browser.eval(`document.querySelector('#player [data-action="next"]').click()`);
+    await browser.waitFor(`document.getElementById('np-announcer')?.textContent.includes('UX Order Two')`, 4000)
+      .catch(() => {});
+    assert.match(await browser.eval(`document.getElementById('np-announcer')?.textContent || ''`), /UX Order Two/,
+      'advancing the queue was silent for screen readers');
+  });
+});
+
+test('Z: the track menu behaves like the menu it claims to be (arrow keys)', async (t) => {
+  if (!needBrowser(t)) return;
+  const list = await makePlaylist(`Menu List ${Date.now().toString(36)}`, UX_TRACKS);
+  await withPage(browser, BASE, { viewport: VIEW.desktop, page: 'playlist', playlistId: list }, async () => {
+    await browser.waitFor(`!!document.querySelector('#page-root .track-row[data-track="${UX_TRACKS[0].videoId}"]')`, 8000);
+    await browser.eval(`(() => {
+      const row = document.querySelector('#page-root .track-row[data-track="${UX_TRACKS[0].videoId}"]');
+      const r = row.getBoundingClientRect();
+      row.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: r.left + 40, clientY: r.top + 20 }));
+      return true;
+    })()`);
+    await browser.waitFor(`!document.getElementById('context-menu').hidden`, 4000);
+    const move = (key) => browser.eval(`(() => {
+      document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: ${JSON.stringify(key)}, bubbles: true, cancelable: true }));
+      const items = [...document.querySelectorAll('#context-menu [role="menuitem"]')];
+      return items.indexOf(document.activeElement);
+    })()`);
+    assert.equal(await move('ArrowDown'), 1, 'ArrowDown in the track menu did not move to the next item');
+    assert.equal(await move('End'), await browser.eval(`document.querySelectorAll('#context-menu [role="menuitem"]').length - 1`),
+      'End did not move to the last menu item');
+    assert.equal(await move('ArrowDown'), 0, 'ArrowDown on the last item did not wrap to the first');
+    assert.equal(await move('ArrowUp'), await browser.eval(`document.querySelectorAll('#context-menu [role="menuitem"]').length - 1`),
+      'ArrowUp on the first item did not wrap to the last');
+  });
+});
+
+test('AA: a late lyrics failure cannot mark the new track as lyric-less', async (t) => {
+  if (!needBrowser(t)) return;
+  const list = await makePlaylist(`Lyrics List ${Date.now().toString(36)}`, UX_TRACKS);
+  const dispose = await browser.addInitScript(`(() => {
+    const prev = window.fetch;
+    window.fetch = async (input, init) => {
+      const raw = typeof input === 'string' ? input : (input?.url ?? String(input));
+      let u; try { u = new URL(raw, location.href); } catch { return prev(input, init); }
+      if (u.pathname === '/api/lyrics/${UX_TRACKS[0].videoId}') {
+        await new Promise((r) => setTimeout(r, 800));
+        return new Response(JSON.stringify({ error: 'lyrics are down' }),
+          { status: 500, headers: { 'content-type': 'application/json' } });
+      }
+      if (u.pathname === '/api/lyrics/${UX_TRACKS[1].videoId}') {
+        return new Response(JSON.stringify({ text: 'LA LA LA' }),
+          { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return prev(input, init);
+    };
+  })()`);
+  try {
+    await withPage(browser, BASE, { viewport: VIEW.desktop, page: 'playlist', playlistId: list }, async () => {
+      await browser.waitFor(`document.querySelectorAll('#page-root .track-row[data-track]').length >= 2`, 8000);
+      await browser.eval(`document.querySelectorAll('#page-root .track-row[data-track]')[0].click()`);
+      await playingUI();
+      await browser.eval(`document.querySelector('#player [data-action="lyrics"]').click()`);
+      await browser.waitFor(`!document.getElementById('now-overlay').hidden`, 4000);
+      // Switch to the next track while the first track's lyrics are in flight.
+      await browser.eval(`document.querySelector('#player [data-action="next"]').click()`);
+      await browser.waitFor(`/LA LA LA/.test(document.getElementById('now-content')?.innerText || '')`, 5000);
+      // Now let the previous track's failure land.
+      await new Promise((r) => setTimeout(r, 1100));
+      const pane = await browser.eval(`document.getElementById('now-content')?.innerText || ''`);
+      assert.match(pane, /LA LA LA/, 'a late failure for the previous track wiped the new track\'s lyrics');
+      assert.doesNotMatch(pane, /No lyrics for this track/i);
+    });
+  } finally {
+    await dispose();
+  }
 });

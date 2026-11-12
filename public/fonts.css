@@ -1,6 +1,7 @@
 /* Self-hosted Inter (variable). Keeps typography identical on iOS, Android and
    desktop, and removes a third-party font request from the critical path.
-   Only the latin subsets are shipped; the app has no UI outside them. */
+   Both the latin and latin-ext subsets are shipped: latin-ext is what covers
+   the non-ASCII that real titles contain (Motley Crüe, Polish, Czech). */
 @font-face {
   font-family: 'Inter';
   font-style: normal;

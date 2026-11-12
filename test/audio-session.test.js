@@ -104,6 +104,75 @@ test('a session that refuses the assignment cannot break playback', () => {
   assert.equal(audioSession.repair(), false);
 });
 
+// ── the interruption that ends in the background ────────────────────────
+
+/** A stand-in for the AudioSession state machine (state + statechange). */
+function fakeStateSession(initial = 'active') {
+  const listeners = new Set();
+  let state = initial;
+  return {
+    get type() { return PLAYBACK; },
+    set type(_v) {},
+    get state() { return state; },
+    addEventListener(name, fn) { if (name === 'statechange') listeners.add(fn); },
+    removeEventListener(name, fn) { if (name === 'statechange') listeners.delete(fn); },
+    set(next) { state = next; for (const fn of listeners) fn(new Event('statechange')); },
+  };
+}
+
+test('an interruption ending while the app is backgrounded is reported', () => {
+  // The reported failure: the phone is in another app when the call ends (or
+  // Maps finishes talking), so nothing the page observes fires — no
+  // visibilitychange, no resume. The session's own state is the only witness.
+  const session = fakeStateSession('active');
+  const audioSession = createAudioSession({ session, defer: () => {} });
+  let resumed = 0;
+  assert.equal(audioSession.onResume(() => { resumed += 1; }), true);
+  session.set('interrupted');
+  assert.equal(resumed, 0, 'the interruption itself must not resume playback');
+  session.set('active');
+  assert.equal(resumed, 1, 'ending the interruption has to resume the track');
+});
+
+test('only the interrupted→active edge counts as a resume', () => {
+  // `statechange` also fires for 'inactive' between two sources. Resuming on
+  // every transition would call play() on a finished track and fight the
+  // handoff that is already running.
+  const session = fakeStateSession('active');
+  const audioSession = createAudioSession({ session, defer: () => {} });
+  let resumed = 0;
+  audioSession.onResume(() => { resumed += 1; });
+  session.set('inactive');
+  session.set('active');
+  assert.equal(resumed, 0, 'an idle session becoming active is not an interruption');
+  // And the edge must fire again on a second interruption, not only the first.
+  session.set('interrupted');
+  session.set('active');
+  assert.equal(resumed, 1);
+  session.set('interrupted');
+  session.set('active');
+  assert.equal(resumed, 2, 'every interruption must be recoverable, not just the first');
+});
+
+test('a page that is interrupted when it loads still recovers once', () => {
+  const session = fakeStateSession('interrupted');
+  const audioSession = createAudioSession({ session, defer: () => {} });
+  let resumed = 0;
+  audioSession.onResume(() => { resumed += 1; });
+  session.set('active');
+  assert.equal(resumed, 1);
+});
+
+test('no interruption hook on a browser without the API', () => {
+  // Chromium and Firefox land here. The module must stay a no-op rather than
+  // throwing into the player's setup.
+  const audioSession = createAudioSession({ session: null });
+  assert.equal(audioSession.onResume(() => {}), false);
+  const noEvents = createAudioSession({ session: fakeSession() });
+  assert.equal(noEvents.onResume(() => {}), false, 'a session with no addEventListener is a no-op');
+  assert.equal(noEvents.onResume(null), false, 'a non-function callback is ignored');
+});
+
 // ── the wiring (static) ─────────────────────────────────────────────────
 
 test('the player delegates the audio session to the tested module', () => {
@@ -131,18 +200,22 @@ test('every moment the category can be lost re-sends it', () => {
   assert.match(near(APP, "addEventListener('pageshow'", 200), /repairAudioSession\(/);
   assert.match(near(APP, "addEventListener('resume'", 200), /repairAudioSession\(\{ force: true \}\)/);
   // A track that starts while the screen is off: no gesture, no visibility
-  // change, no other event at all.
-  assert.match(near(APP, "addEventListener('playing'", 2000), /repairAudioSession\(\)/,
+  // change, no other event at all. (The window covers the whole handler, which
+  // also converges a hidden page onto the queue stream.)
+  assert.match(near(APP, "addEventListener('playing'", 2800), /repairAudioSession\(\)/,
     'a lock-screen skip must not be the one silent case');
 });
 
 test('an interrupted session is resumed, not just re-claimed', () => {
   // iOS pauses the element without telling the page; a transport that shows
   // "playing" over silence is worse than an honest pause.
-  const resume = near(APP, 'function resumeAfterInterruption', 500);
+  const resume = near(APP, 'function resumeAfterInterruption', 1400);
   assert.match(resume, /claimAudioSession\(\)/);
   assert.match(resume, /audio\.play\(\)/);
   assert.match(resume, /state\.playing = false/, 'a refused resume must not lie');
+  // A bounded retry count: the watchdog below re-arms the intent on every
+  // refusal, so an interruption that never ends must not retry forever.
+  assert.match(resume, /state\.resumeAttempts/, 'an endless resume loop');
 
   // A pause that arrives while the screen is off was iOS (a call, Siri), not
   // the user — unless the user pressed pause on the lock screen itself, which
@@ -154,8 +227,40 @@ test('an interrupted session is resumed, not just re-claimed', () => {
   assert.match(near(APP, '// This is a person pressing pause on the lock screen', 300),
     /state\.userPause = true/);
   // Coming back to the page picks the track up rather than demanding a tap.
-  assert.match(near(APP, "document.addEventListener('visibilitychange', () => {\n  // Locking the phone", 2200),
-    /resumeAfterInterruption\(\)/);
+  // The decision now lives in one place (shared with the audio-session hook
+  // below), so the assertion follows it instead of the inlined call. The window
+  // covers the whole handler, which also hands the queue stream back to the
+  // per-track player on the way in (public/queue-stream.js).
+  assert.match(near(APP, "document.addEventListener('visibilitychange', () => {\n  // Locking the phone", 3000),
+    /resumeIfInterrupted\(\)/);
+  assert.match(near(APP, 'function resumeIfInterrupted', 600), /resumeAfterInterruption\(\)/);
+});
+
+test('an interruption that ends in the background resumes too', () => {
+  // The reported failure: the app is open, the phone is in another app, the
+  // interruption (a call, Maps) ends and the listener never comes back to us.
+  // No visibilitychange fires, so the session's own statechange is the only
+  // witness — without it the player stayed paused until the app was opened, and
+  // a paused background tab never auto-advances to the next track.
+  assert.match(near(APP, 'audioSession.onResume(', 400), /resumeIfInterrupted\(\)/);
+  // The statechange net only fires if WebKit classified the takeover as an
+  // interruption. Another app grabbing the output (Discord, a game) does not
+  // always qualify, and the listener never comes back to fire a
+  // `visibilitychange`, so the page has to notice on its own: a periodic check
+  // while hidden is the last-resort witness.
+  assert.match(near(APP, 'The last-resort net: notice on our own', 2200),
+    /setInterval\(\(\) => \{[\s\S]{0,300}resumeIfInterrupted\(\);/);
+  // And the intent must survive a refused play(): that is the state the app
+  // switch actually produced (pause mid-swap, then a rejected play), where
+  // `state.playing` is deliberately false so the transport does not lie.
+  assert.match(near(APP, 'function resumeIfInterrupted', 700), /state\.resumeWanted/);
+  assert.match(near(APP, "audio.play().catch((err) => {\n    // A superseded source", 900),
+    /state\.resumeWanted = true/);
+  assert.doesNotMatch(APP, /navigator\.audioSession/,
+    'the statechange wiring belongs in public/audio-session.js with the rest of the API');
+  // A room's playhead is the server's own corrector; a local resume there would
+  // fight it, so the shared decision point has to keep the room out.
+  assert.match(near(APP, 'function resumeIfInterrupted', 400), /if \(rooms\.active\) return/);
 });
 
 test('the guest room page claims the category too', () => {
@@ -163,8 +268,12 @@ test('the guest room page claims the category too', () => {
   // ambient, which the Ring/Silent switch silences.
   assert.match(LISTEN, /import \{ createAudioSession \} from '\.\/audio-session\.js'/);
   // The claim has to be inside the start handler: that tap is the guest's one
-  // gesture, and a category set outside it is ignored.
-  assert.match(LISTEN, /\$\('listen-start'\)\??\.addEventListener\('click'[\s\S]{0,800}audioSession\.claim\(\)/);
+  // gesture, and a category set outside it is ignored. The handler is a named
+  // function (`startPlayback`) because both views share it — the player's
+  // overlay and the venue's own gate — so the assertion follows the wiring from
+  // the button to that function and then to the claim.
+  assert.match(LISTEN, /\$\('listen-start'\)\??\.addEventListener\('click', startPlayback\)/);
+  assert.match(LISTEN, /async function startPlayback\(\) \{[\s\S]{0,600}audioSession\.claim\(\)/);
   assert.match(near(LISTEN, "document.addEventListener('visibilitychange'", 400), /audioSession\.repair\(\)/);
 });
 
@@ -238,3 +347,4 @@ test('the page sends playback at load, and re-sends it after a lock', async (t) 
   await browser.eval(`document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))`);
   assert.equal(await browser.eval('window.__as.type'), PLAYBACK);
 });
+

@@ -10,6 +10,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { monitorProcess, stopServerProcess } from './process.js';
+import { isUpstreamBotGate } from './upstream-gate.js';
 
 export const ROOT = new URL('../..', import.meta.url).pathname;
 export const SHOTS = path.join(ROOT, '.tmp/ux');
@@ -38,7 +40,7 @@ export const SEED_TRACK = {
 
 // ── server ───────────────────────────────────────────────────────────────
 
-export async function startServer() {
+export async function startServer({ env: extraEnv = {} } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sonora-ux-'));
   const port = await freePort();
   const base = `http://127.0.0.1:${port}`;
@@ -56,29 +58,41 @@ export async function startServer() {
       // Keep every YouTube subprocess out of the test's critical path.
       SONORA_POT_PROVIDER: '',
       SONORA_JS_RUNTIME: '',
+      // Extra settings for one suite (a short queue-stream cover, so a stream
+      // test does not have to wait for a night of audio).
+      ...extraEnv,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  const monitor = monitorProcess(proc);
   proc.stdout.on('data', (d) => logs.push(String(d)));
   proc.stderr.on('data', (d) => logs.push(String(d)));
 
   let up = false;
-  for (let i = 0; i < 120 && !up; i++) {
-    try { up = (await fetch(`${base}/api/health`)).ok; } catch {}
-    if (!up) await new Promise((r) => setTimeout(r, 250));
+  for (let i = 0; i < 120 && !up && !monitor.settled; i++) {
+    try { up = (await fetch(`${base}/api/health`, { signal: AbortSignal.timeout(1000) })).ok; } catch {}
+    if (!up && !monitor.settled) await new Promise((r) => setTimeout(r, 250));
   }
   if (!up) {
-    proc.kill('SIGKILL');
-    throw new Error(`ux test server did not start:\n${logs.join('')}`);
+    const failure = new Error(`ux test server did not start:\n${logs.join('')}`);
+    try {
+      await stopServerProcess(proc, monitor, {
+        dir, logs, label: 'ux test server', signal: 'SIGKILL',
+      });
+    } catch (cleanupError) {
+      throw new AggregateError([failure, cleanupError], 'ux server startup and cleanup both failed');
+    }
+    throw failure;
   }
 
   return {
     base,
     dir,
     logs,
-    async stop() {
-      proc.kill('SIGTERM');
-      try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
+    stop() {
+      // The server must finish closing SQLite before its directory disappears.
+      // Abnormal exits, spawn failures and failed removals remain test failures.
+      return stopServerProcess(proc, monitor, { dir, logs, label: 'ux test server' });
     },
   };
 }
@@ -98,7 +112,7 @@ async function freePort() {
 // ── seeding (through the real HTTP API, no UI guessing) ──────────────────
 
 /** Log in over plain fetch and return the session cookie header. */
-async function loginCookie(base) {
+export async function loginCookie(base) {
   const res = await fetch(`${base}/api/auth/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -479,7 +493,7 @@ export async function skipIfUpstreamBlocked(t, base, videoId = PROBE_VIDEO) {
     const res = await fetch(`${base}/api/stream/${videoId}`, { headers });
     if (res.status === 503) {
       const body = await res.json().catch(() => ({}));
-      return body?.code === 'BOT_GATED' ? body.error : null;
+      return isUpstreamBotGate(res.status, body) ? body.error : null;
     }
     return null;
   })().catch(() => null);

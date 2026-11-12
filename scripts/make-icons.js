@@ -30,6 +30,14 @@ const TARGETS = [
   { src: 'icon-maskable.svg', out: 'icon-180.png', size: 180 },
   // Bare coral bars on transparency, for dark surfaces / social cards.
   { src: 'icon-transparent.svg', out: 'icon-512-transparent.png', size: 512 },
+  // Launcher shortcut marks: one glyph each, on the same coral plate and at the
+  // same 96px the manifest asks for. They live in a subdirectory so the shell
+  // precache (which enumerates public/icons/*.png as launcher-critical) does
+  // not grow by four files that only the install UI ever fetches.
+  { src: 'shortcuts/wave.svg', out: 'shortcuts/wave.png', size: 96 },
+  { src: 'shortcuts/search.svg', out: 'shortcuts/search.png', size: 96 },
+  { src: 'shortcuts/heart.svg', out: 'shortcuts/heart.png', size: 96 },
+  { src: 'shortcuts/radio.svg', out: 'shortcuts/radio.png', size: 96 },
 ];
 
 /** PNG header: width/height live in the IHDR chunk at byte 16/20. */
@@ -62,7 +70,7 @@ function check() {
       console.log(`✓ ${out}: ${width}×${height} ${bytes}B colorType=${colorType}`);
     }
   }
-  for (const svg of ['icon.svg', 'icon-maskable.svg', 'icon-transparent.svg']) {
+  for (const svg of [...new Set(TARGETS.map(({ src }) => src))]) {
     if (!fs.existsSync(path.join(ICONS, svg))) { console.error(`✗ ${svg}: missing`); bad++; }
   }
   if (bad) {
@@ -131,6 +139,7 @@ try {
     })()`);
 
     const file = path.join(ICONS, out);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, Buffer.from(result.png, 'base64'));
     const { width, height, bytes, colorType } = pngInfo(file);
     if (width !== size || height !== size) throw new Error(`${out}: wrote ${width}×${height}`);

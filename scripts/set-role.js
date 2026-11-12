@@ -15,7 +15,8 @@
 //   sqlite3 data/sonora.db "UPDATE users SET role='admin' WHERE name='alice';"
 
 import {
-  db, findUser, setUserRole, setUserDisabled, countAdmins, listUsersWithStats,
+  db, findUser, getUser, setUserRole, setUserDisabled, countAdmins, listUsersWithStats,
+  bumpSessionVersion, revokeAllRefreshTokens, deleteAllDevices, recordAudit, transaction,
 } from '../src/db.js';
 
 const [command, name] = process.argv.slice(2);
@@ -32,25 +33,39 @@ function usage() {
 Database: ${process.env.SONORA_DB ?? 'data/sonora.db (default)'}`);
 }
 
-function requireUser(name) {
-  if (!name) {
-    console.error('Missing a user name. Run without arguments for usage.');
-    process.exit(2);
-  }
-  const user = findUser(name);
-  if (!user) {
-    console.error(`No user named "${name}".`);
-    process.exit(1);
-  }
+function commandError(message, status = 1) {
+  return Object.assign(new Error(message), { status });
+}
+
+function requireUser(userName) {
+  if (!userName) throw commandError('Missing a user name. Run without arguments for usage.', 2);
+  const user = findUser(userName);
+  if (!user) throw commandError(`No user named "${userName}".`);
   return user;
 }
 
+/** Runs inside BEGIN IMMEDIATE; never trust a count read before the write lock. */
 function guardLastAdmin(user, verb) {
-  if (user.role === 'admin' && countAdmins() <= 1) {
-    console.error(`Refusing to ${verb} "${user.name}": they are the only active admin.`);
-    console.error('Promote another account first, then try again.');
-    process.exit(1);
+  if (user.role === 'admin' && !user.disabled && countAdmins() <= 1) {
+    throw commandError(`Refusing to ${verb} "${user.name}": they are the only active admin.\n`
+      + 'Promote another account first, then try again.');
   }
+}
+
+/** Re-read, mutate and audit in one transaction shared with the HTTP admin path. */
+function auditedMutation(user, change) {
+  return transaction(() => {
+    const current = getUser(user.id);
+    if (!current) throw commandError(`No user named "${user.name}".`);
+    const detail = change(current);
+    // A no-op is not a security change, and needs neither a write nor an audit.
+    if (detail === null) return { current, changed: false };
+    recordAudit({
+      actorId: null, actorName: 'cli', action: 'user.update',
+      target: current.name, detail,
+    });
+    return { current, changed: true };
+  });
 }
 
 try {
@@ -71,43 +86,62 @@ try {
 
     case 'promote': {
       const user = requireUser(name);
-      if (user.role === 'admin') {
-        console.log(`"${user.name}" is already an admin.`);
-        break;
-      }
-      setUserRole(user.id, 'admin');
-      console.log(`"${user.name}" is now an admin.`);
+      const { changed } = auditedMutation(user, (current) => {
+        if (current.role === 'admin') return null;
+        setUserRole(current.id, 'admin');
+        return 'role=admin';
+      });
+      console.log(changed ? `"${user.name}" is now an admin.` : `"${user.name}" is already an admin.`);
       break;
     }
 
     case 'demote': {
       const user = requireUser(name);
-      guardLastAdmin(user, 'demote');
-      setUserRole(user.id, 'user');
-      console.log(`"${user.name}" is now a regular user.`);
+      const { changed } = auditedMutation(user, (current) => {
+        if (current.role !== 'admin') return null;
+        guardLastAdmin(current, 'demote');
+        setUserRole(current.id, 'user');
+        return 'role=user';
+      });
+      console.log(changed ? `"${user.name}" is now a regular user.` : `"${user.name}" is already a regular user.`);
       break;
     }
 
     case 'disable': {
       const user = requireUser(name);
-      guardLastAdmin(user, 'disable');
-      setUserDisabled(user.id, true);
-      db.prepare('UPDATE users SET session_version = session_version + 1 WHERE id = ?').run(user.id);
-      console.log(`"${user.name}" is disabled and their sessions were revoked.`);
+      const { changed } = auditedMutation(user, (current) => {
+        if (current.disabled) return null;
+        guardLastAdmin(current, 'disable');
+        setUserDisabled(current.id, true);
+        bumpSessionVersion(current.id);
+        const tokens = revokeAllRefreshTokens(current.id);
+        const devices = deleteAllDevices(current.id);
+        return `disabled; refresh tokens revoked=${tokens}; devices removed=${devices}`;
+      });
+      console.log(changed
+        ? `"${user.name}" is disabled and their sessions and remembered devices were revoked.`
+        : `"${user.name}" is already disabled; no credentials were reissued.`);
       break;
     }
 
     case 'enable': {
       const user = requireUser(name);
-      setUserDisabled(user.id, false);
-      console.log(`"${user.name}" can sign in again.`);
+      const { changed } = auditedMutation(user, (current) => {
+        if (!current.disabled) return null;
+        setUserDisabled(current.id, false);
+        return 'enabled';
+      });
+      console.log(changed ? `"${user.name}" can sign in again.` : `"${user.name}" is already enabled.`);
       break;
     }
 
     default:
       usage();
-      process.exit(command ? 2 : 0);
+      process.exitCode = command ? 2 : 0;
   }
+} catch (err) {
+  console.error(err?.message ?? err);
+  process.exitCode = err?.status ?? 1;
 } finally {
   db.close();
 }

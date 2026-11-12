@@ -29,7 +29,15 @@ const OFFLINE = read('public/offline.html');
 const INDEX = read('public/index.html');
 
 const SHELL = ['/app.css', '/rooms.css', '/fonts.css', '/app.js', '/rooms.js', '/media-session.js', '/playback.js',
-  '/pwa.css', '/pwa.js', '/manifest.webmanifest', '/offline.html', '/fonts/inter-latin.woff2'];
+  '/audio-session.js',
+  '/pwa.css', '/pwa.js', '/manifest.webmanifest', '/offline.html',
+  '/fonts/inter-latin.woff2', '/fonts/inter-latin-ext.woff2'];
+// Must match pwa.js's STORM_KEY: the test arms the guard the page reads, so a
+// rename in the product renames the test (and vice versa) through this line.
+const STORM_KEY = (PWA.match(/const STORM_KEY = '([^']+)'/) || [])[1];
+// Must match pwa.js's RELEASE_AT_KEY: the cross-tab marker a releasing tab
+// writes and every other tab reads before deciding it may reload itself.
+const RELEASE_KEY = (PWA.match(/const RELEASE_AT_KEY = '([^']+)'/) || [])[1];
 
 /** PNG header: width/height live in the IHDR chunk, at bytes 16 and 20. */
 function pngInfo(file) {
@@ -102,8 +110,19 @@ test('manifest icons cover Android, iOS and maskable at their real sizes', () =>
 });
 
 test('screenshots are only listed when the files actually exist', () => {
-  for (const shot of manifest.screenshots ?? []) {
-    assert.ok(fs.existsSync(path.join(PUB, shot.src)), `manifest lists a missing screenshot: ${shot.src}`);
+  // A richer install UI (Chrome's app menu) can only show screenshots that are
+  // really there, at the size the manifest claims.
+  assert.equal(manifest.screenshots?.length, 2, 'the manifest lists no screenshots');
+  const forms = manifest.screenshots.map((shot) => shot.form_factor).sort();
+  assert.deepEqual(forms, ['narrow', 'wide']);
+  for (const shot of manifest.screenshots) {
+    assert.equal(shot.type, 'image/png');
+    assert.ok(shot.label, `${shot.src} needs a label for the install UI`);
+    const file = shot.src.replace(/^\//, '');
+    assert.ok(fs.existsSync(path.join(PUB, file)), `manifest lists a missing screenshot: ${shot.src}`);
+    const [w, h] = shot.sizes.split('x').map(Number);
+    const real = pngInfo(file);
+    assert.deepEqual({ w: real.width, h: real.height }, { w, h }, `${shot.src} is not ${shot.sizes}`);
   }
 });
 
@@ -119,6 +138,29 @@ test('manifest shortcuts land on real in-app destinations', () => {
   }
 });
 
+test('each shortcut has its own 96px launcher icon', () => {
+  // Every shortcut used to carry /icons/icon-96.png, so a launcher menu showed
+  // the same brand mark four times and said nothing about where each one goes.
+  const sources = new Set();
+  for (const shortcut of manifest.shortcuts) {
+    const icon = shortcut.icons?.[0];
+    assert.ok(icon, `${shortcut.name} has no launcher icon`);
+    assert.equal(icon.sizes, '96x96');
+    assert.equal(icon.type, 'image/png');
+    assert.ok(!sources.has(icon.src), `${shortcut.name} reuses ${icon.src}`);
+    sources.add(icon.src);
+    const real = pngInfo(icon.src.replace(/^\//, ''));
+    assert.deepEqual([real.width, real.height], [96, 96], `${icon.src} is not 96x96`);
+    assert.ok(real.bytes > 512, `${icon.src} is a stub, not a render`);
+  }
+  assert.equal(sources.size, 4, 'the shortcuts do not have four distinct icons');
+  // And the generator can rebuild them; a hand-dropped PNG would rot silently.
+  const generator = read('scripts/make-icons.js');
+  for (const name of ['wave', 'search', 'heart', 'radio']) {
+    assert.match(generator, new RegExp(`shortcuts/${name}\\.svg`), `make-icons.js does not render ${name}`);
+  }
+});
+
 // ── service worker ────────────────────────────────────────────────────────
 
 test('service worker precaches the whole shell', () => {
@@ -129,8 +171,11 @@ test('service worker precaches the whole shell', () => {
   // Every published bitmap is part of the shell: a shortcut or an install
   // prompt must not be the first thing to discover a missing icon. The *.svg
   // files are design sources; only icon.svg is referenced at runtime.
+  // icon-512-transparent.png is the one exception: it is kept on disk as a
+  // design asset but referenced by nothing (manifest, HTML or CSS), so
+  // precaching it would only spend install time and storage on a dead file.
   const published = fs.readdirSync(path.join(PUB, 'icons'))
-    .filter((file) => file.endsWith('.png') || file === 'icon.svg');
+    .filter((file) => (file.endsWith('.png') && file !== 'icon-512-transparent.png') || file === 'icon.svg');
   for (const file of published) {
     assert.ok(list.includes(`/icons/${file}`), `PRECACHE is missing /icons/${file}`);
   }
@@ -142,6 +187,88 @@ test('service worker precaches the whole shell', () => {
   // The html document must be cached as '/' — that is what offline navigations
   // match against.
   assert.ok(list.includes('/'));
+});
+
+test('every module app.js imports is precached, or the offline shell is dead', () => {
+  // The shell boots from cache, so a static import that is not in PRECACHE
+  // fails *inside* the module graph: index.html and app.js are served from
+  // cache, the import 404s, and the app never runs. This is the one class of
+  // precache bug that a "does it paint" test cannot see.
+  const list = precacheList();
+  const app = read('public/app.js');
+  const imports = [...app.matchAll(/^import\s[^'"]*['"](\.\/[^'"]+)['"]/gm)].map((m) => m[1]);
+  assert.ok(imports.length >= 3, 'app.js lost its static imports');
+  for (const specifier of imports) {
+    const url = `/${specifier.replace(/^\.\//, '')}`;
+    assert.ok(list.includes(url), `PRECACHE is missing ${url}, which app.js imports`);
+  }
+});
+
+const requiredList = () => {
+  const block = SW.match(/const REQUIRED_SHELL = \[([\s\S]*?)\];/);
+  assert.ok(block, 'sw.js does not declare which shell entries are required');
+  return [...block[1].matchAll(/'([^']+)'/g)].map((m) => m[1]);
+};
+
+test('install refuses a shell with a hole in the boot set', () => {
+  // Only ['/', '/app.js', '/app.css'] used to be required. app.js imports four
+  // modules and index.html loads four stylesheets, so one flaky 500 during
+  // install produced an "installed" PWA that was a blank shell offline, until
+  // a new VERSION shipped. The whole boot set is now mandatory.
+  const required = requiredList();
+  for (const url of ['/', '/offline.html', '/app.js', '/app.css', '/fonts.css', '/pwa.css', '/pwa.js']) {
+    assert.ok(required.includes(url), `REQUIRED_SHELL is missing ${url}`);
+  }
+  for (const specifier of read('public/app.js').matchAll(/^import\s[^'"]*['"](\.\/[^'"]+)['"]/gm)) {
+    const url = `/${specifier[1].replace(/^\.\//, '')}`;
+    assert.ok(required.includes(url), `REQUIRED_SHELL is missing the imported module ${url}`);
+  }
+  for (const href of INDEX.matchAll(/<link rel="stylesheet" href="(\/[^"]+)"/g)) {
+    // notifications.css is deliberately best-effort in sw.js: it is cosmetic,
+    // and one eviction of it must not turn every navigation into /offline.html.
+    // Every stylesheet the app cannot paint without is still required.
+    if (href[1] === '/notifications.css') continue;
+    assert.ok(required.includes(href[1]), `REQUIRED_SHELL is missing the stylesheet ${href[1]}`);
+  }
+  assert.match(SW, /if \(missing\.length\)[\s\S]*?throw new Error/, 'install must fail, not accept, a missing boot file');
+  // A failed install must clean up only what *it* created. Installing into the
+  // live shell cache meant one flaky 500 during a deploy deleted the running
+  // worker's whole offline app; install now stages into its own cache and
+  // activate promotes a complete one over the shell.
+  assert.match(SW, /const STAGING_CACHE = `\$\{SHELL_CACHE\}-next`/, 'install must stage into its own cache');
+  assert.match(SW, /caches\.delete\(STAGING_CACHE\)/, 'a failed install must clean up its staging cache');
+  assert.match(SW, /requiredComplete\(\)/, 'activate must drop a shell that is missing boot files');
+});
+
+test('a gateway 5xx is treated as a network failure, never as the app', () => {
+  // A down tunnel answers with Cloudflare's 502 page. The offline fallback only
+  // ran when fetch() *rejected*, so that HTML was served as the document (and
+  // handed to the JS/CSS parsers) while a complete shell sat in the cache.
+  assert.match(SW, /const failedServer = \(response\) => !response \|\| response\.status >= 500/);
+  const networkFirst = SW.slice(SW.indexOf('async function networkFirst'), SW.indexOf('/**\n * Serve what we have'));
+  assert.match(networkFirst, /failedServer\(response\)/, 'networkFirst returns a 5xx as success');
+  assert.ok(networkFirst.indexOf('failedServer') < networkFirst.indexOf('catch'), 'the 5xx check must be inside the try');
+  const navigation = SW.slice(SW.indexOf('async function navigationResponse'), SW.indexOf('// ── routing'));
+  assert.match(navigation, /failedServer\(response\)/, 'navigationResponse returns a 5xx as the document');
+  assert.doesNotMatch(SW, /if \(response\) return response/, 'the old unconditional pass-through is back');
+});
+
+test('an /index.html navigation is the app root, not a dead deep link', () => {
+  assert.match(SW, /pathname === '\/' \|\| pathname === '\/index\.html'/);
+});
+
+test('a cache write failure cannot turn a good response into a 503', () => {
+  // SE-03: `update` used to resolve *through* cache.put(), so a quota error
+  // discarded the freshly fetched response and answered 503 Offline.
+  const swr = SW.slice(SW.indexOf('function staleWhileRevalidate'), SW.indexOf('// Which fallback document'));
+  assert.match(swr, /response\.clone\(\)/, 'the cached copy must be cloned, not the response itself');
+  assert.match(swr, /catch[\s\S]*caches\.delete\(RUNTIME_CACHE\)/, 'quota pressure must drop the runtime cache');
+  // The read is runtime-first; otherwise caches.match() always finds the shell
+  // copy and a revalidated font/icon can never win.
+  assert.match(swr, /caches\.open\(RUNTIME_CACHE\)[\s\S]*?cache\.match\(request\)/);
+  assert.match(swr, /shellMatch\(request\)/, 'the shell fallback for a cold offline load is missing');
+  // And shell-owned entries are not duplicated into the runtime cache.
+  assert.match(swr, /if \(!\(await shellMatch\(request\)\)\)/);
 });
 
 test('service worker is versioned and cleans up old caches', () => {
@@ -204,6 +331,62 @@ test('the install offer snoozes for 14 days, not forever', () => {
   assert.match(PWA, /sonora\.pwa\.install-snoozed-until/);
   assert.match(PWA, /14 \* 24 \* 60 \* 60 \* 1000/);
   assert.match(PWA, /localStorage\.setItem\(SNOOZE_KEY/);
+});
+
+test('a declined update is remembered for that build, not for every launch', () => {
+  // The update pill used to reappear on every cold launch until it was tapped
+  // (the × was per-session). The worker reports its build; "not now" is stored
+  // against that build, and the declined build is applied while backgrounded so
+  // the next launch is quietly the new version.
+  //
+  // The identity is the worker's real build (a hash of sw.js), not the
+  // hand-maintained VERSION: editing sw.js without bumping VERSION used to look
+  // like "the same build" and the update shipped invisibly to anyone who had
+  // once dismissed it.
+  assert.match(PWA, /const UPDATE_SNOOZE_KEY = 'sonora\.pwa\.update-snoozed-build'/);
+  assert.match(PWA, /const buildIdentity = \(\{ build, version \}\) => build \|\| version \|\| UNKNOWN_BUILD/);
+  assert.match(PWA, /declineUpdate\(build\)/);
+  assert.match(PWA, /activateWhenHidden\(registration\.waiting\)/);
+  assert.match(PWA, /type: 'GET_VERSION'/);
+  assert.match(SW, /GET_VERSION[\s\S]*?version: VERSION, build:/, 'the worker must answer with both version and build');
+  assert.match(SW, /event\.ports\[0\]\.postMessage/, 'the worker cannot answer the version request');
+  // A genuinely different build still gets its own offer.
+  assert.match(PWA, /build === declinedUpdate\(\)/);
+  // And a handshake that times out must still remember the dismissal, or the
+  // pill nags on every cold launch — the exact bug the key exists to stop.
+  assert.match(PWA, /declineUpdate\(build \|\| UNKNOWN_BUILD\)|UNKNOWN_BUILD/, 'a timed-out handshake must still snooze');
+});
+
+test('iPadOS is detected as iOS Safari, and the explainer is an answer', () => {
+  // iPadOS reports a desktop "Macintosh" UA, so offerIosInstall() never ran.
+  assert.match(PWA, /navigator\.platform === 'MacIntel' && \(navigator\.maxTouchPoints \?\? 0\) > 1/);
+  assert.match(PWA, /isIpadOs\(\) \|\| \/iP\(hone\|ad\|od\)\//);
+  // Closing the "How" sheet with "Got it" used to show the card again next launch.
+  const done = PWA.slice(PWA.indexOf("querySelector('.pwa-sheet-done')"));
+  assert.match(done.slice(0, 260), /snooze\(\)/, 'Got it does not snooze the install offer');
+});
+
+test('the offline pill also reacts to an unreachable origin, not just navigator.onLine', () => {
+  // Wi-Fi up + tunnel down is this project's own deployment: onLine is true and
+  // the only signal is failed traffic. Two consecutive failures are required so
+  // one aborted cover cannot raise a false offline state.
+  //
+  // There used to be a second signalling path — modules dispatching
+  // `sonora:reachable` / `sonora:unreachable` — that nothing ever dispatched. It
+  // is gone; reachability is decided here, from real traffic.
+  assert.doesNotMatch(PWA, /sonora:(?:un)?reachable/, 'the dead event contract must be gone, not half-wired');
+  assert.match(PWA, /markUnreachable/);
+  assert.match(PWA, /reachFailures < 2/);
+  assert.match(PWA, /PerformanceObserver/);
+  assert.match(PWA, /entry\.responseStatus/);
+  assert.match(PWA, /if \(status >= 500\) markUnreachable\(\)/);
+  assert.match(PWA, /media\.error\?\.code === 2/);
+});
+
+test('the shell cache is protected with a persistence grant', () => {
+  // The shell cache *is* the app; eviction under storage pressure leaves an
+  // installed app with nothing to boot from and no way to fix it from inside.
+  assert.match(PWA, /navigator\.storage\?\.persist\?\.\(\)/);
 });
 
 /** The body of the first @media block whose prelude contains `query`. */
@@ -290,6 +473,65 @@ test('offline page is self-contained, branded and recoverable', () => {
   assert.doesNotMatch(OFFLINE, /serviceWorker/);
 });
 
+test('the offline page distinguishes an unreachable server from an offline device', () => {
+  // The page is served by the worker whenever the origin does not answer — which
+  // includes "the phone is online and sonora is down". Telling that user to
+  // "check your network" sends them looking in the wrong place.
+  assert.match(OFFLINE, /server isn't answering/);
+  assert.doesNotMatch(OFFLINE, /Check your network/);
+  // Heading still names the non-connection (test/android-pwa.test.js pins it).
+  assert.match(OFFLINE, /<h1>No connection/i);
+});
+
+test('the offline page says it is retrying instead of reloading silently', () => {
+  assert.match(OFFLINE, /retry\.disabled = true/);
+  assert.match(OFFLINE, /Retrying…/);
+  assert.match(OFFLINE, /location\.reload\(\)/);
+});
+
+test('install copy promises the shell, never offline playback', () => {
+  // The shell opens with no network; nothing plays until the origin can reach
+  // YouTube (docs/pwa-device-audit.md §3.2). "works offline" claimed otherwise.
+  assert.ok(!PWA.includes('one tap away, works offline'), 'the iOS offer promises offline playback');
+  assert.ok(!PWA.includes('full screen, works offline'), 'the desktop notice promises offline playback');
+  assert.match(PWA, /offline app shell/);
+});
+
+test('the conventional favicon.ico is served, not a 404', async () => {
+  // Pages without a <link rel="icon"> (offline.html) make browsers request
+  // /favicon.ico by convention; a missing one is a 404 in every log.
+  const file = path.join(PUB, 'favicon.ico');
+  assert.ok(fs.existsSync(file), 'no public/favicon.ico: /favicon.ico is a 404 by convention');
+  const real = pngInfo('favicon.ico'); // PNG bytes in an .ico are accepted by browsers
+  assert.deepEqual([real.width, real.height], [192, 192]);
+  const response = await fetch(`${BASE}/favicon.ico`);
+  assert.equal(response.status, 200);
+  assert.equal((await response.arrayBuffer()).byteLength, real.bytes);
+});
+
+test('a shortcut tapped while the app runs focuses it instead of reloading', () => {
+  // navigate-existing reloads the document — which stops the music — for a tap
+  // that only meant "show me Search". focus-existing focuses the live window,
+  // and pwa.js re-reads a query string that arrives without a page load.
+  assert.equal(manifest.launch_handler?.client_mode, 'focus-existing');
+  assert.match(PWA, /function honourShortcutAgain/);
+  assert.match(PWA, /addEventListener\('focus', honourShortcutAgain\)/);
+  assert.match(PWA, /addEventListener\('pageshow', honourShortcutAgain\)/);
+});
+
+test('an update released by another tab may not auto-reload this one', () => {
+  // Cross-tab consent: sessionStorage is per tab, so the storm guard cannot see
+  // a sibling's Refresh. The release marker is shared and time-limited.
+  assert.equal(RELEASE_KEY, 'sonora-update-release-at');
+  assert.match(PWA, /function releasedElsewhere/);
+  assert.match(PWA, /localStorage\.setItem\(RELEASE_AT_KEY/);
+  assert.match(PWA, /autoReloadBlocked = true/);
+  assert.match(PWA, /stormBooted \|\| autoReloadBlocked/);
+  // One binding of the stale reload, however many takeovers arrive.
+  assert.match(PWA, /if \(!staleWired\)/);
+  assert.match(PWA, /staleController = false;/, 'reloadOnce does not clear the stale flag');
+});
+
 // ── real browser ──────────────────────────────────────────────────────────
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'sonora-'));
@@ -298,6 +540,7 @@ let browser;
 let iosBrowser;
 let desktopBrowser;
 let updateBrowser;
+let gatewayBrowser;
 let PORT;
 let BASE;
 let DEBUG_PORT;
@@ -403,7 +646,16 @@ async function rawSession(port, match) {
 function updateProxy(upstream) {
   const target = new URL(upstream);
   let version = 'v1';
+  // A down tunnel does not refuse the connection: it answers with its own HTML
+  // and a 502. That is the case the worker used to hand straight to the page.
+  let gatewayDown = false;
   const server = http.createServer((req, res) => {
+    if (gatewayDown && req.url.split('?')[0] !== '/sw.js') {
+      res.writeHead(502, { 'content-type': 'text/html; charset=utf-8' });
+      res.end('<!doctype html><title>502 Bad gateway</title>'
+        + '<h1>Error 502</h1><p>cloudflared can not reach the origin</p>');
+      return;
+    }
     const proxyReq = http.request({
       hostname: target.hostname,
       port: target.port,
@@ -437,6 +689,7 @@ function updateProxy(upstream) {
   return {
     listen: (port) => new Promise((resolve) => server.listen(port, '127.0.0.1', resolve)),
     setVersion: (next) => { version = next; },
+    setGatewayDown: (next) => { gatewayDown = next; },
     close: () => server.close(),
   };
 }
@@ -479,6 +732,7 @@ after(() => {
   iosBrowser?.close();
   desktopBrowser?.close();
   updateBrowser?.close();
+  gatewayBrowser?.close();
   cdp?.close();
   server?.kill('SIGTERM');
   try { fs.rmSync(TMP, { recursive: true, force: true }); } catch {}
@@ -526,8 +780,16 @@ test('the worker registers, activates and precaches the shell', async (t) => {
 
 test('an offline reload paints the shell, not a browser error', async (t) => {
   if (!browser) return t.skip('no chromium available; set CHROME_BIN to enable');
+  // Navigate before creating the session: rawSession polls for a page target
+  // at BASE, which only exists once some page has been there (an isolated
+  // --test-name-pattern run starts on about:blank).
+  await browser.goto(`${BASE}/`);
   const session = cdp ?? await rawSession(DEBUG_PORT, (target) => target.type === 'page' && target.url.startsWith(BASE));
   cdp = session;
+  // The premise is an installed worker with a complete cached shell; in an
+  // isolated run nothing installed one yet.
+  await browser.waitFor(`navigator.serviceWorker.ready.then(() => true)`, 20000);
+  await browser.waitFor(`${shellPaths}.then((paths) => !!paths && paths.includes('/') && paths.includes('/app.js'))`, 30000);
 
   const workerOffline = await session.offline(true);
   assert.ok(workerOffline, 'no service_worker target found — cannot emulate a real offline device');
@@ -564,6 +826,23 @@ test('an offline reload paints the shell, not a browser error', async (t) => {
   assert.ok(state.pillRect.top >= 0 && state.pillRect.left >= 0 && state.pillRect.right <= state.vw,
     'offline pill is clipped by the viewport');
 
+  // The shell is not the document alone: app.js is an ES module graph, and a
+  // static import that is not in PRECACHE fails *after* the page paints — the
+  // app then never boots while every "does it render" check still passes. A
+  // dynamic import is the honest witness: it resolves for a module the worker
+  // served from the cache and rejects for one it had to answer with its 503.
+  // (Resource Timing cannot tell the two apart: a 503 is still an entry.)
+  const graph = await browser.eval(`(async () => {
+    const out = {};
+    for (const url of ['/app.js', '/audio-session.js', '/media-session.js', '/playback.js', '/rooms.js']) {
+      out[url] = await import(url).then(() => true).catch(() => false);
+    }
+    return out;
+  })()`);
+  for (const [url, ok] of Object.entries(graph)) {
+    assert.equal(ok, true, `${url} did not load offline: the app.js module graph is broken`);
+  }
+
   // Coming back online recovers by itself.
   await session.offline(false);
   await browser.eval(`window.dispatchEvent(new Event('online'))`);
@@ -572,7 +851,16 @@ test('an offline reload paints the shell, not a browser error', async (t) => {
 
 test('with no cached shell the worker serves the branded offline page', async (t) => {
   if (!browser) return t.skip('no chromium available; set CHROME_BIN to enable');
-  const session = cdp;
+  // Navigate first: rawSession polls for a page target at BASE (isolated runs
+  // start on about:blank). This test's premise is an installed worker whose
+  // shell already cached '/'; wait for it rather than depending on a previous
+  // test's side effects.
+  await browser.goto(`${BASE}/`);
+  const session = cdp ?? await rawSession(DEBUG_PORT, (target) => target.type === 'page' && target.url.startsWith(BASE));
+  cdp = session;
+  await browser.waitFor(`navigator.serviceWorker.ready.then(() => true)`, 20000);
+  await browser.waitFor(`navigator.serviceWorker.controller !== null`, 20000);
+  await browser.waitFor(`${shellPaths}.then((paths) => !!paths && paths.includes('/') && paths.includes('/offline.html'))`, 30000);
 
   // Simulate a shell that never finished installing (or was evicted).
   await browser.eval(`(async () => {
@@ -596,6 +884,132 @@ test('with no cached shell the worker serves the branded offline page', async (t
   assert.match(state.title, /offline/);
 
   await session.offline(false);
+
+  // The test above deleted '/' from the shell cache to simulate a missing
+  // shell; put it back (we are online again) so the navigation test below
+  // exercises the worker's fallback *routing*, not an empty cache.
+  await browser.eval(`(async () => {
+    const shell = (await caches.keys()).find((name) => name.startsWith('sonora-shell'));
+    if (shell && !(await (await caches.open(shell)).match('/'))) {
+      await (await caches.open(shell)).add('/');
+    }
+    return true;
+  })()`);
+});
+
+test('offline deep links get the offline page, the app root gets the shell', async (t) => {
+  if (!browser) return t.skip('no chromium available; set CHROME_BIN to enable');
+  // Navigate before creating the session (isolated runs start on about:blank),
+  // so rawSession always finds a page target at BASE.
+  await browser.goto(`${BASE}/`);
+  const session = cdp ?? await rawSession(DEBUG_PORT, (target) => target.type === 'page' && target.url.startsWith(BASE));
+  cdp = session;
+
+  // This test's premise is an *installed* worker with a cached shell; in an
+  // isolated name-pattern run nothing has installed one yet. Wait for it here
+  // rather than depending on a previous test's side effects.
+  await browser.waitFor(`navigator.serviceWorker.ready.then(() => true)`, 20000);
+  await browser.waitFor(`${shellPaths}.then((paths) => !!paths && paths.includes('/') && paths.includes('/offline.html'))`, 30000);
+
+  await session.offline(true);
+
+  // /l/<code> is a real server route (Listen Together guest page), not an app
+  // hash route. The cached shell cannot render it, so the worker must answer
+  // with the self-explanatory offline page rather than the signed-in app.
+  await browser.goto(`${BASE}/l/xyz`);
+  const link = await browser.eval(`({
+    retry: !!document.getElementById('retry'),
+    app: !!document.querySelector('.app'),
+    title: document.title,
+  })`);
+  assert.equal(link.app, false, 'an offline /l/<code> deep link was served the app shell');
+  assert.equal(link.retry, true, 'an offline /l/<code> deep link did not get the offline page');
+  assert.match(link.title, /offline/);
+
+  // The app root is the offline app itself: the cached shell (plus the offline
+  // pill pwa.js raises) is still the right answer there.
+  await browser.goto(`${BASE}/`);
+  const root = await browser.eval(`({
+    app: !!document.querySelector('.app'),
+    title: document.title,
+  })`);
+  assert.equal(root.app, true, 'an offline / was not served the cached shell');
+  assert.match(root.title, /sonora/);
+
+  // /index.html is the same document as '/', not a deep link: a bookmark or a
+  // QR code that spells it out must still get the app offline.
+  await browser.goto(`${BASE}/index.html`);
+  const spelled = await browser.eval(`({
+    app: !!document.querySelector('.app'),
+    retry: !!document.getElementById('retry'),
+    title: document.title,
+  })`);
+  assert.equal(spelled.app, true, 'an offline /index.html got the offline page instead of the app');
+  assert.equal(spelled.retry, false, 'an offline /index.html was treated as a deep link');
+
+  await session.offline(false);
+});
+
+test('a gateway 502 falls back to the cached shell, not Cloudflare', async (t) => {
+  if (!browser) return t.skip('no chromium available; set CHROME_BIN to enable');
+
+  const proxyPort = await freePort();
+  const proxy = updateProxy(BASE);
+  await proxy.listen(proxyPort);
+  const origin = `http://127.0.0.1:${proxyPort}`;
+
+  // A separate profile: its cache/origin must not disturb the offline tests.
+  gatewayBrowser = await launch(await freePort());
+  try {
+    await gatewayBrowser.goto(`${origin}/`);
+    await gatewayBrowser.waitFor(`navigator.serviceWorker.ready.then(() => true)`, 20000);
+    await gatewayBrowser.waitFor(`navigator.serviceWorker.controller !== null`, 20000);
+    await gatewayBrowser.waitFor(`${shellPaths}.then((paths) => !!paths
+      && paths.includes('/app.js') && paths.includes('/rooms.js') && paths.includes('/offline.html'))`, 30000);
+
+    // The tunnel is down: it answers, it does not refuse the connection.
+    proxy.setGatewayDown(true);
+
+    await gatewayBrowser.goto(`${origin}/`);
+    const state = await gatewayBrowser.eval(`(() => ({
+      title: document.title,
+      app: !!document.querySelector('.app'),
+      chromeError: /can not reach the origin|502 Bad gateway/i.test(document.body.innerText || ''),
+      offlinePage: !!document.getElementById('retry'),
+    }))()`);
+    assert.equal(state.app, true, 'the 502 page was served instead of the cached shell');
+    assert.equal(state.chromeError, false, "Cloudflare's error page reached the listener");
+    assert.match(state.title, /sonora/);
+    assert.equal(state.offlinePage, false, 'the app root got offline.html instead of the app');
+
+    // A 502 must not be handed to the module graph either: script requests are
+    // network-first, and a `text/html` 502 to the module loader is fatal.
+    const graph = await gatewayBrowser.eval(`(async () => {
+      const out = {};
+      for (const url of ['/app.js', '/rooms.js', '/media-session.js', '/audio-session.js', '/playback.js']) {
+        out[url] = await import(url).then(() => true).catch(() => false);
+      }
+      return out;
+    })()`);
+    for (const [url, ok] of Object.entries(graph)) {
+      assert.equal(ok, true, `${url} was served the gateway's 502 body`);
+    }
+
+    // Deep links cannot be rendered by the cached shell, so the honest answer
+    // there is the offline page (not the signed-in app pretending to be a room).
+    await gatewayBrowser.goto(`${origin}/l/xyz`);
+    const deep = await gatewayBrowser.eval(`({
+      retry: !!document.getElementById('retry'),
+      app: !!document.querySelector('.app'),
+      title: document.title,
+    })`);
+    assert.equal(deep.retry, true, 'an offline deep link did not get the offline page');
+    assert.equal(deep.app, false, 'an offline deep link was served the app shell');
+    assert.match(deep.title, /offline/);
+  } finally {
+    proxy.setGatewayDown(false);
+    proxy.close();
+  }
 });
 
 test('the worker caches no API responses or media', async (t) => {
@@ -619,9 +1033,10 @@ test('the worker caches no API responses or media', async (t) => {
 
 test('the install banner appears, stays clear of the player, and snoozes', async (t) => {
   if (!browser) return t.skip('no chromium available; set CHROME_BIN to enable');
-  const session = cdp;
-
   await browser.goto(`${BASE}/`);
+  const session = cdp ?? await rawSession(DEBUG_PORT, (target) => target.type === 'page' && target.url.startsWith(BASE));
+  cdp = session;
+
   await session.viewport({ width: 390, height: 844, top: 59, bottom: 34 });
   await new Promise((r) => setTimeout(r, 120));
 
@@ -824,14 +1239,43 @@ test('a manifest shortcut lands on the page it names', async (t) => {
   }).then((response) => response.ok)`);
 
   await browser.goto(`${BASE}/?page=search`);
-  await browser.waitFor(`(() => {
-    const button = document.querySelector('[data-page="search"]');
-    return !!button && (button.matches('.active, [aria-current="page"]') || button.getAttribute('aria-current') === 'page');
-  })()`, 15000);
-  assert.equal(await browser.eval(`location.pathname`), '/');
+  // Judge the *settled* app, not the first frame: the shortcut is consumed
+  // while app.js is still booting, and it used to replace the URL with the bare
+  // pathname — which discarded the `#/search` route the click had just pushed,
+  // so boot's own route read found nothing and landed on Home a beat later.
+  // Waiting only for a transient `.active` passed straight through that bug.
+  await browser.waitFor(`!!document.getElementById('primary-search')`, 15_000);
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  const landed = await browser.eval(`({
+    path: location.pathname, search: location.search, hash: location.hash,
+    input: !!document.getElementById('primary-search'), title: document.title,
+  })`);
+  assert.equal(landed.input, true, `the shortcut did not open Search (at ${landed.hash}: ${landed.title})`);
+  assert.equal(landed.hash, '#/search', 'the shortcut discarded the route it produced');
+  assert.match(landed.title, /^Search/);
+  assert.equal(landed.path, '/');
+  assert.equal(landed.search, '', 'the shortcut left its query string on the URL');
 });
 
-test('a waiting worker offers Refresh, and the tap reloads into the new build', async (t) => {
+test('a collection shortcut lands on the collection it names', async (t) => {
+  if (!browser) return t.skip('no chromium available; set CHROME_BIN to enable');
+  await browser.eval(`fetch('/api/auth/login', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+  }).then((response) => response.ok)`);
+
+  await browser.goto(`${BASE}/?collection=liked`);
+  await browser.waitFor(`location.hash === '#/c/liked'`, 15_000);
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  const landed = await browser.eval(`({ hash: location.hash, search: location.search,
+    title: document.title, home: !!document.querySelector('.mobile-nav button[data-page="home"].active') })`);
+  assert.equal(landed.hash, '#/c/liked', 'the collection shortcut opened the wrong page');
+  assert.match(landed.title, /liked/i);
+  assert.equal(landed.home, false);
+  assert.equal(landed.search, '');
+});
+
+test('an idle page takes a waiting update itself; a playing one is asked', async (t) => {
   if (!browser) return t.skip('no chromium available; set CHROME_BIN to enable');
 
   const proxyPort = await freePort();
@@ -848,10 +1292,34 @@ test('a waiting worker offers Refresh, and the tap reloads into the new build', 
     await updateBrowser.waitFor(`navigator.serviceWorker.controller !== null`, 20000);
     await updateBrowser.waitFor(`${shellPaths}.then((paths) => !!paths && paths.includes('/'))`, 30000);
 
-    // Ship a new build.
-    proxy.setVersion('v7');
+    // Ship a new build. The page is idle (visible, nothing playing), so it must
+    // accept the update by itself and reload — no pill, no tap. Three rounds of
+    // device reports arrived from phones still running replaced builds because
+    // the pill waited for a tap that never came.
+    proxy.setVersion('v9');
+    await updateBrowser.eval(`window.__beforeUpdate = true`);
     await updateBrowser.eval(`navigator.serviceWorker.getRegistration().then((registration) => registration.update())`);
+    await updateBrowser.waitFor(`window.__beforeUpdate === undefined`, 30000);
 
+    const after = await updateBrowser.eval(`(async () => ({
+      caches: await caches.keys(),
+      controlled: !!navigator.serviceWorker.controller,
+      pill: !!document.querySelector('.pwa-pill[data-kind="update"]'),
+    }))()`);
+    assert.ok(after.caches.includes('sonora-shell-v9'), `new worker not active: ${after.caches.join(', ')}`);
+    assert.ok(!after.caches.includes('sonora-shell-v1'), 'the old shell cache was not cleaned up');
+    assert.equal(after.controlled, true);
+    assert.equal(after.pill, false, 'the update pill survived the reload');
+
+    // While music is playing the page must NOT reload under the listener: the
+    // pill appears instead, and the tap stays the listener's decision.
+    await updateBrowser.eval(`(() => {
+      const a = document.getElementById('audio');
+      Object.defineProperty(a, 'paused', { configurable: true, get: () => false });
+      return true;
+    })()`);
+    proxy.setVersion('v10');
+    await updateBrowser.eval(`navigator.serviceWorker.getRegistration().then((registration) => registration.update())`);
     await updateBrowser.waitFor(`!!document.querySelector('.pwa-pill[data-kind="update"]')`, 20000);
     const pill = await updateBrowser.eval(`(() => {
       const el = document.querySelector('.pwa-pill[data-kind="update"]');
@@ -864,24 +1332,135 @@ test('a waiting worker offers Refresh, and the tap reloads into the new build', 
     assert.match(pill.text, /New version available/);
     assert.equal(pill.action, 'Refresh');
     assert.equal(pill.role, 'status', 'the update notice is not announced');
-
-    // Tap Refresh. The worker is released, the page reloads once, and the new
-    // cache version proves the new build actually took over.
-    await updateBrowser.eval(`window.__beforeUpdate = true`);
+    await updateBrowser.eval(`window.__beforeUpdate2 = true`);
     await updateBrowser.eval(`document.querySelector('.pwa-pill[data-kind="update"] .pwa-pill-action').click()`);
-    await updateBrowser.waitFor(`window.__beforeUpdate === undefined`, 20000);
-
-    const after = await updateBrowser.eval(`(async () => ({
-      caches: await caches.keys(),
-      controlled: !!navigator.serviceWorker.controller,
-      pill: !!document.querySelector('.pwa-pill[data-kind="update"]'),
-    }))()`);
-    assert.ok(after.caches.includes('sonora-shell-v7'), `new worker not active: ${after.caches.join(', ')}`);
-    assert.ok(!after.caches.includes('sonora-shell-v1'), 'the old shell cache was not cleaned up');
-    assert.equal(after.controlled, true);
-    assert.equal(after.pill, false, 'the update pill survived the reload');
+    await updateBrowser.waitFor(`window.__beforeUpdate2 === undefined`, 20000);
+    const after2 = await updateBrowser.eval(`(async () => ({ caches: await caches.keys() }))()`);
+    assert.ok(after2.caches.includes('sonora-shell-v10'), `tap did not reach v10: ${after2.caches.join(', ')}`);
   } finally {
+    await updateBrowser?.close(); updateBrowser = null;
     proxy.close();
+  }
+});
+
+test('a transient pause while playing does not reload the page under the song', async (t) => {
+  if (!browser) return t.skip('no chromium available; set CHROME_BIN to enable');
+
+  // The device failure this pins: iOS emits pause/play blips during the audio
+  // session resume handshake, and an auto-accept that acted on the blip
+  // reloaded the page under a song that was audibly playing — the Now Playing
+  // widget cycling and the app coming up blank. A play() inside the idle
+  // window must cancel the pending acceptance.
+  const proxyPort = await freePort();
+  const proxy = updateProxy(BASE);
+  await proxy.listen(proxyPort);
+  const origin = `http://127.0.0.1:${proxyPort}`;
+
+  updateBrowser = await launch(await freePort());
+  try {
+    await updateBrowser.goto(`${origin}/`);
+    await updateBrowser.waitFor(`navigator.serviceWorker.ready.then(() => true)`, 20000);
+    await updateBrowser.waitFor(`navigator.serviceWorker.controller !== null`, 20000);
+    await updateBrowser.waitFor(`${shellPaths}.then((paths) => !!paths && paths.includes('/'))`, 30000);
+
+    // Playing, then a pause blip, then playing again — all before the settled
+    // idle window can elapse.
+    await updateBrowser.eval(`(() => {
+      const a = document.getElementById('audio');
+      let paused = false;
+      Object.defineProperty(a, 'paused', { configurable: true, get: () => paused });
+      window.__setPaused = (v) => { paused = v; a.dispatchEvent(new Event(v ? 'pause' : 'play')); };
+      window.__stillHere = true;
+      return true;
+    })()`);
+    proxy.setVersion('v11');
+    await updateBrowser.eval(`navigator.serviceWorker.getRegistration().then((registration) => registration.update())`);
+    await new Promise((r) => setTimeout(r, 1500));
+    await updateBrowser.eval(`window.__setPaused(true)`);   // the blip
+    await new Promise((r) => setTimeout(r, 1200));
+    await updateBrowser.eval(`window.__setPaused(false)`);  // resume before 5 s settle
+    await new Promise((r) => setTimeout(r, 6000));          // longer than the idle window
+    const alive = await updateBrowser.eval(`window.__stillHere === true`);
+    assert.equal(alive, true, 'the page reloaded during a transient pause');
+  } finally {
+    await updateBrowser?.close(); updateBrowser = null;
+    proxy.close();
+  }
+});
+
+test('a page that booted from an update reload never auto-reloads again', async (t) => {
+  if (!browser) return t.skip('no chromium available; set CHROME_BIN to enable');
+
+  // The other half of the storm: if SKIP_WAITING/claim races leave a waiting
+  // worker visible to the freshly reloaded page, accepting again would bounce
+  // the listener through load after load. One automatic reload per storm is
+  // the ceiling; after that only the pill (a human tap) can reload.
+  const proxyPort = await freePort();
+  const proxy = updateProxy(BASE);
+  await proxy.listen(proxyPort);
+  const origin = `http://127.0.0.1:${proxyPort}`;
+
+  updateBrowser = await launch(await freePort());
+  try {
+    await updateBrowser.goto(`${origin}/`);
+    await updateBrowser.waitFor(`navigator.serviceWorker.ready.then(() => true)`, 20000);
+    await updateBrowser.waitFor(`navigator.serviceWorker.controller !== null`, 20000);
+    await updateBrowser.waitFor(`${shellPaths}.then((paths) => !!paths && paths.includes('/'))`, 30000);
+    // Mark this page as the product of an update reload that happened seconds
+    // ago — exactly the state of a page inside a reload chain.
+    await updateBrowser.eval(`sessionStorage.setItem('${STORM_KEY}', String(Date.now()))`);
+    await updateBrowser.goto(`${origin}/?storm=1`);
+    await updateBrowser.waitFor(`navigator.serviceWorker.controller !== null`, 20000);
+    await updateBrowser.eval(`window.__stillHere2 = true`);
+    proxy.setVersion('v12');
+    await updateBrowser.eval(`navigator.serviceWorker.getRegistration().then((registration) => registration.update())`);
+    await new Promise((r) => setTimeout(r, 9000)); // well past any idle window
+    const alive = await updateBrowser.eval(`window.__stillHere2 === true`);
+    assert.equal(alive, true, 'a storm-booted page auto-reloaded again');
+  } finally {
+    await updateBrowser?.close(); updateBrowser = null;
+    proxy.close();
+  }
+});
+
+test('a takeover another tab released offers the pill but reloads nothing', async (t) => {
+  if (!browser) return t.skip('no chromium available; set CHROME_BIN to enable');
+
+  // The multi-tab bug: tab B taps Refresh, its SKIP_WAITING activates the worker
+  // and the browser claims tab A too. A's controllerchange carries
+  // acceptingUpdate === false, and the storm guard is sessionStorage — per tab —
+  // so A used to decide it was stale and auto-reload itself, stopping music it
+  // never asked to stop. The release marker is the shared signal that this
+  // takeover belongs to someone else. This test dispatches the same
+  // controllerchange the browser would, with the marker a releasing sibling
+  // leaves behind, and watches the real idle window.
+  await browser.goto(`${BASE}/`);
+  await browser.waitFor(`navigator.serviceWorker.controller !== null`, 20000);
+  assert.ok(RELEASE_KEY, 'pwa.js has no cross-tab release key');
+  try {
+    // Give wireUpdates time to attach its listener after the worker registers.
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    await browser.eval(`(() => {
+      localStorage.setItem('${RELEASE_KEY}', String(Date.now()));
+      sessionStorage.removeItem('${STORM_KEY}');
+      window.__aliveAcrossRelease = true;
+      navigator.serviceWorker.dispatchEvent(new Event('controllerchange'));
+      return true;
+    })()`);
+    // The stale document is still offered the fix...
+    await browser.waitFor(`!!document.querySelector('.pwa-pill[data-kind="reload"]')`, 5000);
+    // ...but must not take it itself: STABLE_IDLE_MS plus slack.
+    await new Promise((resolve) => setTimeout(resolve, 7000));
+    const state = await browser.eval(`({
+      alive: window.__aliveAcrossRelease === true,
+      pill: !!document.querySelector('.pwa-pill[data-kind="reload"]'),
+    })`);
+    assert.equal(state.alive, true, 'a takeover another tab released auto-reloaded this page');
+    assert.equal(state.pill, true, 'the page kept stale code and stopped offering the reload');
+  } finally {
+    await browser.eval(`localStorage.removeItem('${RELEASE_KEY}')`).catch(() => {});
+    // Leave a clean document for the tests after this one.
+    await browser.goto(`${BASE}/`).catch(() => {});
   }
 });
 
@@ -975,6 +1554,91 @@ test('icons are real bitmaps and the maskable mark stays in the safe zone', asyn
   assert.equal(zone.outside, 0, `${zone.outside} mark pixels sit outside the r=${zone.safe} safe zone`);
   assert.equal(zone.transparent, 0, 'the maskable background is not opaque');
   assert.ok(zone.inkInside > 20, 'the maskable icon has no visible mark');
+
+  // Four shortcuts, four different glyphs: the launcher menu must say where each
+  // one goes, not repeat the same brand mark four times.
+  const glyphs = await browser.eval(`(async () => {
+    const files = ['/icons/shortcuts/wave.png', '/icons/shortcuts/search.png',
+      '/icons/shortcuts/heart.png', '/icons/shortcuts/radio.png'];
+    const out = {};
+    for (const file of files) {
+      const img = new Image();
+      img.src = file;
+      await img.decode();
+      const n = img.naturalWidth;
+      const canvas = document.createElement('canvas');
+      canvas.width = n;
+      canvas.height = n;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0);
+      const { data } = ctx.getImageData(0, 0, n, n);
+      let ink = 0;
+      let signature = '';
+      for (let y = 0; y < n; y += 4) {
+        for (let x = 0; x < n; x += 4) {
+          const i = (y * n + x) * 4;
+          const luma = 0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2];
+          if (luma < 110) { ink++; signature += '1'; } else signature += '0';
+        }
+      }
+      out[file] = { ink, signature };
+    }
+    return out;
+  })()`);
+  const signatures = new Set();
+  for (const [file, glyph] of Object.entries(glyphs)) {
+    assert.ok(glyph.ink > 20, `${file} has no visible glyph`);
+    signatures.add(glyph.signature);
+  }
+  assert.equal(signatures.size, 4, 'the shortcut icons draw the same glyph');
+});
+
+test('a shortcut query handed to the running window is honoured without a reload', async (t) => {
+  if (!browser) return t.skip('no chromium available; set CHROME_BIN to enable');
+
+  // launch_handler: focus-existing focuses the live window instead of loading a
+  // document, so pwa.js's init-time read of location.search cannot be the only
+  // one. The listener here is the fallback for a query that lands by focus.
+  await browser.eval(`fetch('/api/auth/login', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+  }).then((response) => response.ok)`);
+  await browser.goto(`${BASE}/`);
+  await browser.waitFor(`!!document.querySelector('[data-page="search"]')`, 15_000);
+  await browser.eval(`(() => {
+    window.__focusAlive = true;
+    history.replaceState(null, '', '/?page=search');
+    window.dispatchEvent(new Event('focus'));
+    return true;
+  })()`);
+  await browser.waitFor(`location.hash === '#/search'`, 15_000);
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  const landed = await browser.eval(`({
+    alive: window.__focusAlive === true,
+    hash: location.hash,
+    search: location.search,
+    input: !!document.getElementById('primary-search'),
+  })`);
+  assert.equal(landed.alive, true, 'a focus-launched shortcut reloaded the document (and stopped the music)');
+  assert.equal(landed.hash, '#/search');
+  assert.equal(landed.search, '', 'the focus-launched shortcut left its query string behind');
+  assert.equal(landed.input, true, 'the focus-launched shortcut did not open Search');
+});
+
+test('the offline page retry button says it is retrying', async (t) => {
+  if (!browser) return t.skip('no chromium available; set CHROME_BIN to enable');
+
+  await browser.goto(`${BASE}/offline.html`);
+  const state = await browser.eval(`(() => {
+    window.__retryProbe = true;
+    const button = document.getElementById('retry');
+    button.click();
+    return { disabled: button.disabled, label: button.textContent };
+  })()`);
+  assert.equal(state.disabled, true, 'the retry button stays enabled while the reload is in flight');
+  assert.match(state.label, /Retrying/);
+  // It really reloads: the probe is gone once the fresh document is up.
+  await browser.waitFor(`window.__retryProbe === undefined`, 5000);
 });
 
 // The iOS hint is a separate browser because it needs an iPhone user agent
@@ -1042,4 +1706,21 @@ test('iOS Safari offers a Home Screen sheet that is keyboard operable', async (t
   await iosBrowser.waitFor(`!document.querySelector('.pwa-banner')`, 3000);
   const until = await iosBrowser.eval(`Number(localStorage.getItem('sonora.pwa.install-snoozed-until'))`);
   assert.ok(until > Date.now() + 13 * 86_400_000);
+});
+
+// The browser lane above must actually run on a machine that claims to be a
+// browser-capable test host. A Chrome-less box silently skips 15+ tests while
+// reporting the file green — this is the machine-level assertion that keeps
+// that from lying: found-but-not-launched is a failure, not a skip, and an
+// explicit CHROME_BIN likewise means "this host promised a browser".
+test('the browser lane really ran (or the host said so honestly)', () => {
+  if (browser) return;
+  if (CHROME) {
+    throw new Error(`CHROME was found (${CHROME}) but the browser did not launch — the browser lane above skipped silently`);
+  }
+  t: {
+    // No browser anywhere: only acceptable when the host never promised one.
+    if (!process.env.CI && !process.env.CHROME_BIN) return;
+    throw new Error('CI/CHROME_BIN declared a browser-capable host but no Chromium was found or launched');
+  }
 });

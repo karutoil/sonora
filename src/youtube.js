@@ -1,74 +1,465 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { Innertube } from 'youtubei.js';
 import { config } from './config.js';
 import { activeCookieHeader } from './cookies.js';
 import {
   rankTracks, rankPlaylists, parsePlaylistStats, parsePlaylistByline, parseReleaseByline,
-  parseVideoTitle, isOfficialChannel, cleanChannelName, toCount, songKey,
+  parseVideoTitle, isOfficialChannel, cleanChannelName, toCount, songKey, trackVersion,
 } from './search-rank.js';
 
-const IOS_UA = 'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)';
-
 let ytPromise = null;
+// Every resolved value, cached answer and backoff belongs to one identity. A
+// reset advances this even while old work is still finishing; stale completions
+// can answer their own callers, but must never mutate the replacement identity.
+let identityGeneration = 0;
+// Set by tests (or a future client swap) so the parsers can be driven with the
+// shapes YouTube really returns when a renderer changes. Null means "use the
+// real session".
+let sessionOverride = null;
+
+/**
+ * Replace the session every public function talks to. `null` restores the real,
+ * lazily-created one. A function is treated as a session factory, which is how
+ * a test observes a rebuild (see SESSION_FAILURE_LIMIT). This is the seam a
+ * test uses to feed the parsers a malformed payload without mocking the module
+ * system.
+ */
+export function setSessionOverride(session) {
+  sessionOverride = session ?? null;
+  resetYT();
+}
+
+/**
+ * A hard, transport-level deadline on every YouTube HTTP request.
+ *
+ * youtubei.js has no per-call AbortSignal to pass, so cancellation lands in the
+ * constructed fetch through the initiating async context. This independent
+ * deadline is deliberately longer than `resolveTimeoutMs`: the caller's error
+ * normally wins, and this still reaps direct getYT() requests outside that
+ * wrapper (for example the admin diagnostic).
+ */
+const upstreamRequestContext = new AsyncLocalStorage();
+
+async function boundedFetch(input, init) {
+  const deadline = AbortSignal.timeout(config.resolveTimeoutMs + 5_000);
+  // youtubei.js does not accept a signal on getBasicInfo/search/etc. The custom
+  // fetch is still inside the initiating async context, so this links the real
+  // transport to the caller's total-operation deadline as well as the backstop.
+  const context = upstreamRequestContext.getStore();
+  if (context?.policyError) throw context.policyError;
+  const operationSignal = context?.signal;
+  const signals = [deadline, init?.signal, operationSignal].filter(Boolean);
+  const signal = signals.length > 1 ? AbortSignal.any(signals) : signals[0];
+  const response = await fetch(input, { ...(init ?? {}), signal });
+  if (response.status === 429) {
+    // youtubei.js otherwise turns this into an InnertubeError containing only a
+    // text body, losing Retry-After before our policy handler can see it.
+    const err = new Error(`YouTube request failed with status code 429: ${response.url || 'unknown URL'}`);
+    err.status = 429;
+    err.response = response;
+    if (context) context.policyError ??= err;
+    throw err;
+  }
+  return response;
+}
+
+/** Is there an Innertube session already (created, or being created)? */
+export function hasYT() {
+  return ytPromise != null;
+}
 
 /** One shared Innertube session; creating one per request burns memory. */
 export function getYT() {
-  ytPromise ??= (async () => {
-    // Prefer an imported jar so a signed-in session also helps Innertube (it is
-    // the same identity that unblocks yt-dlp).
-    const cookie = activeCookieHeader();
-    return Innertube.create({ retrieve_player: false, ...(cookie ? { cookie } : {}) });
-  })().catch((err) => {
-    ytPromise = null;
-    throw err;
-  });
+  const wait = blockedForMs();
+  if (wait > 0) {
+    // A 429/policy answer (see withTimeout) is process-wide: asking again from
+    // the same IP is exactly what turns one block into a storm. Nothing has been
+    // sent yet — every public operation awaits this before it builds a request.
+    return Promise.reject(blockedError(wait));
+  }
+  if (!ytPromise) {
+    // Capture both values: resetting an override while its factory is pending
+    // must not make that factory read (or clear) the replacement session.
+    const generation = identityGeneration;
+    const override = sessionOverride;
+    // A fresh session starts with a clean failure count: the counter measures
+    // how badly *this* session is doing, not how unlucky the process has been.
+    upstreamFailures = 0;
+    const creating = override
+      ? Promise.resolve().then(() => (typeof override === 'function' ? override() : override))
+      : (async () => {
+        // Prefer an imported jar so a signed-in session also helps Innertube (it is
+        // the same identity that unblocks yt-dlp).
+        const cookie = activeCookieHeader();
+        return Innertube.create({
+          retrieve_player: false,
+          fetch: boundedFetch,
+          ...(cookie ? { cookie } : {}),
+        });
+      })();
+    let pending;
+    pending = creating.catch((err) => {
+      // An old init can reject after resetYT() has installed a new init. Only
+      // the exact promise that failed may clear itself.
+      if (identityGeneration === generation && ytPromise === pending) ytPromise = null;
+      throw err;
+    });
+    ytPromise = pending;
+  }
   return ytPromise;
 }
 
-/** Drop the cached session so a freshly imported cookie jar takes effect. */
+/** Drop the session and every answer/backoff tied to that cookie identity. */
 export function resetYT() {
+  identityGeneration += 1;
   ytPromise = null;
+  upstreamFailures = 0;
+  blockedUntil = 0;
+  blockStreak = 0;
+  genreTilesPromise = null;
+  liveCache.clear();
+  liveInFlight.clear();
+  albumOfCache.clear();
+  albumInFlight.clear();
+  playlistStatsCache.clear();
+  playlistStatsInFlight.clear();
 }
 
-/** True when YouTube is refusing playback until we prove we are not a bot. */
-export function isBotGated(info) {
-  const reason = String(info?.playability_status?.reason ?? '');
-  return info?.playability_status?.status === 'LOGIN_REQUIRED'
-    && /not a bot|sign in/i.test(reason);
-}
-
+/**
+ * A string out of a `Text`/`Run` node, a plain string, or nothing.
+ *
+ * Only ever returns a string: a shelf that answers `{ title: {…} }` used to leak
+ * the object into a `.test()`/`join()` and then into JSON, where the renderer
+ * showed `[object Object]` and the regex checks silently stopped matching.
+ */
 function text(v) {
   if (v == null) return null;
   if (typeof v === 'string') return v;
-  return v.text ?? v.toString?.() ?? null;
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  const inner = v.text ?? v.simpleText;
+  if (typeof inner === 'string') return inner;
+  if (typeof v.toString === 'function' && v.toString !== Object.prototype.toString) {
+    const s = v.toString();
+    if (typeof s === 'string') return s;
+  }
+  return null;
+}
+
+/** A non-empty string id, or null. Ids are the only safe join key upstream. */
+const str = (v) => (typeof v === 'string' && v ? v : null);
+
+/**
+ * An array shelf, or an empty list.
+ *
+ * Every upstream shelf is an array or absent. One object/string/null answer
+ * used to make `.map` throw a TypeError out of a public function, which the
+ * route then reported as a 500 for the whole screen.
+ */
+const list = (v) => (Array.isArray(v) ? v : []);
+
+/** A finite number from upstream, or null. `''`/`null`/booleans are not 0. */
+const num = (v) => {
+  if (v == null || v === '' || typeof v === 'boolean') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+};
+
+/**
+ * Array#slice throws on BigInt/Symbol limits and treats negatives as offsets
+ * from the end; rankTracks can even return one row for a negative limit. Every
+ * public list goes through this whole, finite, bounded value instead.
+ */
+const PUBLIC_LIMIT_MAX = 100;
+function publicLimit(value, fallback, max = PUBLIC_LIMIT_MAX) {
+  let n;
+  try {
+    n = Number(value ?? fallback);
+  } catch {
+    n = fallback;
+  }
+  if (Number.isNaN(n)) n = fallback;
+  if (n === Infinity) n = max;
+  if (n === -Infinity) n = 0;
+  if (!Number.isFinite(n)) n = fallback;
+  return Math.max(0, Math.min(max, Math.trunc(n)));
+}
+
+/** "3:05" / "1:04:05" as seconds; null when the segment is not a duration. */
+function durationOfSegment(segment) {
+  const m = /^(?:(\d{1,2}):)?([0-5]?\d):([0-5]\d)$/.exec(String(segment ?? '').trim());
+  if (!m) return null;
+  return Number(m[1] ?? 0) * 3600 + Number(m[2]) * 60 + Number(m[3]);
+}
+
+/**
+ * A duration that only exists as ":"-text in a byline.
+ *
+ * Artist shelves and video rows have no `duration` object at all; the length is
+ * a segment of the subtitle ("Artist • 4:05"). Without this every song opened
+ * from an artist page showed 0:00 until the player resolved it.
+ */
+function durationFromParts(parts) {
+  for (const part of parts) {
+    const seconds = durationOfSegment(part);
+    if (seconds != null) return seconds;
+  }
+  return null;
 }
 
 function toTrack(v) {
+  if (!v || typeof v !== 'object') return null;
   const id = v.video_id ?? v.id;
   if (typeof id !== 'string' || id.length !== 11) return null;
   // `author` is a plain string on a PlaylistPanelVideo (the up-next panel) and
   // an object elsewhere; reading only `.name` silently dropped every artist
   // from radio and the personal station.
   const author = v.author;
-  const artists = (v.artists ?? []).map((a) => a?.name).filter(Boolean);
+  const artists = list(v.artists).map((a) => text(a?.name)).filter(Boolean);
+  // Up-next panel rows badge the explicit edit exactly like catalogue rows.
+  const version = versionOf(v);
   return {
     videoId: id,
     title: text(v.title) ?? text(v.name),
     channel: artists.join(', ') || text(author?.name ?? author) || text(v.channel?.name ?? v.channel) || null,
-    channelId: v.author?.id ?? v.channel?.id ?? v.artists?.[0]?.channel_id ?? null,
-    durationS: v.duration?.seconds ?? null,
-    thumb: v.thumbnails?.[0]?.url ?? v.thumbnail?.[0]?.url ?? null,
+    channelId: str(v.author?.id) ?? str(v.channel?.id) ?? str(v.artists?.[0]?.channel_id),
+    durationS: num(v.duration?.seconds),
+    thumb: str(v.thumbnails?.[0]?.url ?? v.thumbnail?.[0]?.url),
     album: text(v.album?.name ?? v.album) || null,
+    ...(version ? { version } : {}),
   };
 }
 
-const withTimeout = (p, ms, label) => {
-  let t;
-  const timeout = new Promise((_, rej) => {
-    t = setTimeout(() => rej(new Error(`${label} timed out`)), ms);
-    t.unref?.();
+// How many upstream calls may fail in a row before the shared Innertube session
+// is thrown away. A session that has gone bad (rotated visitor data, an
+// invalidated jar, a client version YouTube stopped accepting) otherwise keeps
+// failing every metadata call until the process restarts.
+const SESSION_FAILURE_LIMIT = 3;
+let upstreamFailures = 0;
+
+// 429 / policy backoff. A rebuild *is* a retry, so answering a rate limit by
+// throwing the session away asks the same IP again a fraction of a second later
+// from a station page that issues ~20 upstream calls. Instead the whole process
+// waits, honoring Retry-After and doubling when no delay was supplied, up to a
+// minute of local backoff. The numeric delay also reaches the HTTP classifier.
+const BACKOFF_BASE_MS = 2_000;
+const BACKOFF_MAX_MS = 60_000;
+let blockedUntil = 0;
+let blockStreak = 0;
+
+/** Milliseconds until upstream calls may be attempted again. */
+const blockedForMs = () => Math.max(0, blockedUntil - Date.now());
+
+function blockedError(ms) {
+  const err = new Error(`YouTube is rate-limiting this IP; retry in ${Math.ceil(ms / 1000)}s.`);
+  err.code = 'YT_BLOCKED';
+  err.retryAfterMs = ms;
+  err.retryAfter = Math.ceil(ms / 1000);
+  return err;
+}
+
+/**
+ * Does this failure say something about the *session*, or only about the one
+ * video/playlist that was asked for?
+ *
+ * Three legitimate misses in a row used to throw the shared session away: a
+ * private video, a region block and a deleted playlist row are all normal on a
+ * station built from somebody's library, and a single station page issues ~20
+ * calls in parallel — so one page of dead tracks could cost several
+ * `Innertube.create()` calls plus cookie-jar reads, each of which then competes
+ * with the work that was actually wanted.
+ */
+function isSessionFailure(err) {
+  if (err?.code === 'YT_BLOCKED') return false;
+  const netCode = String(err?.code ?? '');
+  if (['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT'].includes(netCode)) return true;
+  // AbortSignal.timeout (boundedFetch) and our own race both surface as these.
+  if (err?.name === 'TimeoutError' || err?.name === 'AbortError') return true;
+  const status = Number(err?.response?.status ?? err?.status ?? err?.statusCode);
+  if (Number.isFinite(status) && (status === 429 || status >= 500)) return true;
+  const msg = String(err?.message ?? '');
+  if (/timed out/i.test(msg)) return true;
+  // InnertubeError carries "Request to … failed with status code 429" / "503".
+  if (/failed with status code (?:429|5\d\d)\b/i.test(msg)) return true;
+  // LOGIN_REQUIRED / the bot gate, and the context errors a stale build causes.
+  if (/LOGIN_REQUIRED|sign in to confirm|not a bot|INNERTUBE_INVALID_ARGUMENT|invalid argument/i.test(msg)) return true;
+  return false;
+}
+
+/** A 429 or a policy answer, as opposed to a broken session. */
+function isPolicyBlock(err) {
+  if (err?.code === 'YT_BLOCKED') return false;
+  const status = Number(err?.response?.status ?? err?.status ?? err?.statusCode);
+  if (status === 429) return true;
+  const msg = String(err?.message ?? '');
+  return /\b429\b/.test(msg) || /too many requests/i.test(msg) || /not a bot|sign in to confirm/i.test(msg);
+}
+
+// The existing-process backoff error must short-circuit fallbacks too, but is
+// deliberately not passed back to armPolicyBlock and counted as a second 429.
+const isPolicyFailure = (err) => err?.code === 'YT_BLOCKED' || isPolicyBlock(err);
+
+function responseHeader(err, name) {
+  for (const headers of [err?.response?.headers, err?.headers]) {
+    if (typeof headers?.get === 'function') {
+      const value = headers.get(name);
+      if (value != null) return String(value);
+    }
+    if (headers && typeof headers === 'object') {
+      const value = headers[name] ?? headers[name.toLowerCase()] ?? headers[name.toUpperCase()];
+      if (value != null) return String(value);
+    }
+  }
+  return null;
+}
+
+/** Retry-After is delta seconds or an HTTP date; keep it as a numeric field. */
+function retryAfterFrom(err) {
+  const directMs = Number(err?.retryAfterMs);
+  if (Number.isFinite(directMs) && directMs >= 0) return Math.ceil(directMs);
+  const direct = Number(err?.retryAfter);
+  if (Number.isFinite(direct) && direct >= 0) return Math.ceil(direct * 1000);
+  const raw = responseHeader(err, 'retry-after')?.trim();
+  if (!raw) return null;
+  if (/^\d+$/.test(raw)) {
+    const seconds = Number(raw);
+    if (Number.isSafeInteger(seconds)) return seconds * 1000;
+  }
+  const date = Date.parse(raw);
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : null;
+}
+
+function armPolicyBlock(err, generation) {
+  const requested = retryAfterFrom(err);
+  let wait = requested ?? BACKOFF_BASE_MS;
+  if (generation === identityGeneration) {
+    blockStreak += 1;
+    const backoff = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** (blockStreak - 1));
+    wait = Math.max(backoff, requested ?? 0);
+    blockedUntil = Date.now() + wait;
+    // Deliberately not a rebuild: a fresh session from the same IP is blocked
+    // too, so rebuilding only adds a retry to the storm.
+    upstreamFailures = 0;
+  }
+  if (err && (typeof err === 'object' || typeof err === 'function')) {
+    err.retryAfterMs = wait;
+    err.retryAfter = Math.ceil(wait / 1000);
+    err.code ??= 'YT_RATE_LIMIT';
+  }
+  return err;
+}
+
+// A process-wide limiter, not one limiter per search/station/follows caller:
+// their Promise.all fan-out shares this queue, so combined screens cannot open
+// an unbounded number of YouTube sockets. The queue also has a ceiling to turn
+// extreme overload into an error rather than an ever-growing array of closures.
+const UPSTREAM_CONCURRENCY = 4;
+const UPSTREAM_QUEUE_MAX = 256;
+let upstreamActive = 0;
+const upstreamQueue = [];
+
+function pumpUpstream() {
+  while (upstreamActive < UPSTREAM_CONCURRENCY && upstreamQueue.length) {
+    const task = upstreamQueue.shift();
+    if (task.signal.aborted) {
+      task.reject(task.signal.reason);
+      continue;
+    }
+    upstreamActive += 1;
+    let rejectAbort;
+    const aborted = new Promise((_, reject) => { rejectAbort = reject; });
+    const onAbort = () => rejectAbort(task.signal.reason);
+    task.signal.addEventListener('abort', onAbort, { once: true });
+    const running = Promise.resolve().then(() => (
+      upstreamRequestContext.run({ signal: task.signal, policyError: null }, task.work)
+    ));
+    // The operation can outlive the race only for non-cooperative mocks or an
+    // MP4 parse after fetch; real transports are aborted through boundedFetch.
+    running.catch(() => {});
+    Promise.race([running, aborted]).then(task.resolve, task.reject).finally(() => {
+      task.signal.removeEventListener('abort', onAbort);
+      upstreamActive -= 1;
+      pumpUpstream();
+    });
+  }
+}
+
+function scheduleUpstream(work, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(signal.reason);
+    if (upstreamQueue.length >= UPSTREAM_QUEUE_MAX) {
+      const err = new Error('Too many YouTube operations are already queued.');
+      err.code = 'YT_OVERLOADED';
+      return reject(err);
+    }
+    upstreamQueue.push({ work, signal, resolve, reject });
+    pumpUpstream();
   });
-  p.catch(() => {});
-  return Promise.race([p, timeout]).finally(() => clearTimeout(t));
+}
+
+/**
+ * Run getYT() and one upstream method inside one scheduler slot and one total
+ * deadline. Queueing and session creation therefore count against the caller's
+ * timeout instead of hanging before the old promise-only race even began.
+ */
+const withTimeout = (work, ms, label) => {
+  const generation = identityGeneration;
+  const controller = new AbortController();
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(`${label} timed out`);
+      err.name = 'TimeoutError';
+      err.code = 'YT_TIMEOUT';
+      controller.abort(err);
+      reject(err);
+    }, ms);
+    timer.unref?.();
+  });
+  const operation = scheduleUpstream(async () => {
+    const yt = await getYT();
+    if (controller.signal.aborted) throw controller.signal.reason;
+    const context = upstreamRequestContext.getStore();
+    // Innertube.create may recover from a failed session-data request locally.
+    // That is reasonable for a timeout, but a policy answer must not silently
+    // turn into an immediate request from the locally-created fallback session.
+    if (context?.policyError) throw context.policyError;
+    const value = await work(yt);
+    if (context?.policyError) throw context.policyError;
+    return value;
+  }, controller.signal);
+  operation.catch(() => {});
+  return Promise.race([operation, timeout])
+    .finally(() => clearTimeout(timer))
+    .then((value) => {
+      if (generation === identityGeneration) {
+        upstreamFailures = 0;
+        blockStreak = 0;
+      }
+      return value;
+    }, (err) => {
+      if (generation !== identityGeneration) {
+        // Still expose a server's delay to the old caller, but never let an old
+        // request block or rebuild the replacement identity.
+        if (isPolicyBlock(err)) armPolicyBlock(err, generation);
+        throw err;
+      }
+      if (isPolicyBlock(err)) throw armPolicyBlock(err, generation);
+      if (isSessionFailure(err)) {
+        upstreamFailures += 1;
+        if (upstreamFailures >= SESSION_FAILURE_LIMIT) {
+          upstreamFailures = 0;
+          // Drop the cached session so the next call builds a fresh one. The
+          // failure is still reported to the caller: a rebuild is a retry path,
+          // not a reason to pretend the call succeeded.
+          resetYT();
+        }
+      } else {
+        // The session answered — it just had nothing for this id. That is
+        // evidence the session is fine, so it clears the count.
+        upstreamFailures = 0;
+      }
+      throw err;
+    });
 };
 
 /**
@@ -76,25 +467,26 @@ const withTimeout = (p, ms, label) => {
  * the credited artist and album, which is what makes de-duplication possible.
  */
 function toMusicTrack(v) {
+  if (!v || typeof v !== 'object') return null;
   const id = v.id ?? v.video_id;
   if (typeof id !== 'string' || id.length !== 11) return null;
   const title = typeof v.title === 'string' ? v.title : text(v.title);
   if (!title) return null;
-  const artists = (v.artists ?? v.authors ?? []).map((a) => a?.name).filter(Boolean);
+  const artists = list(v.artists ?? v.authors).map((a) => text(a?.name)).filter(Boolean);
   // Album track rows have no credits at all and YouTube fills the gap with the
   // literal string "N/A", which then leaks into the artist column and blocks
   // the album header's own artist from being used as a fallback.
   const credit = (s) => (s && !/^N\/?A$/i.test(s) ? s : null);
   // Some catalogue rows have an empty artists array; their second flex column
   // is "Artist • Album • 3:05", which is enough to credit the song properly.
-  const byline = String(text(v.flex_columns?.[1]?.title) ?? '').split('\u2022').map((s) => s.trim());
-  const artist = credit(artists[0]) ?? credit(v.author?.name) ?? credit(byline[0]) ?? null;
+  const byline = String(text(list(v.flex_columns)[1]?.title) ?? '').split('\u2022').map((s) => s.trim());
+  const artist = credit(artists[0]) ?? credit(text(v.author?.name)) ?? credit(byline[0]) ?? null;
 
   // An artist's top-songs shelf splits the same information across separate
   // columns — "Creep" | "Radiohead" | "2.3B plays" | "Pablo Honey" — and
   // carries no `album` object and no duration at all. Without reading those
   // columns, every popular song of an artist would show an empty album.
-  const flex = (v.flex_columns ?? []).map((c) => text(c.title)).filter(Boolean).slice(1);
+  const flex = list(v.flex_columns).map((c) => text(c?.title)).filter(Boolean).slice(1);
   const parts = flex.flatMap((s) => String(s).split('\u2022').map((x) => x.trim())).filter(Boolean);
   const plays = parts.find((p) => /\b(?:plays|views)\b/i.test(p)) ?? null;
   const albumFromColumns = [...parts].reverse().find((p) => (
@@ -103,26 +495,53 @@ function toMusicTrack(v) {
     && !/\b(?:plays|views)\b/i.test(p)
     && !/^\d+:\d\d$/.test(p)
   )) ?? null;
+  // The byline's second segment is the album on a playlist/album row — but on
+  // an artist's top-songs shelf it is the play count, which used to leak into
+  // the album column as "2.3B plays".
+  const bylineAlbum = credit(byline.length > 1 ? byline[1] : null);
+  const albumCredit = bylineAlbum && !/\b(?:plays|views)\b/i.test(bylineAlbum) ? bylineAlbum : null;
+
+  // Which edit of the song this row is, from the row's own badges and title
+  // ("(Clean)", "E" badge). Absent on most rows; null stays absent so the
+  // JSON the client sees is unchanged for unmarked songs.
+  const version = versionOf(v);
 
   return {
     videoId: id,
     title,
     artist,
     channel: artists.join(', ') || artist,
-    channelId: v.artists?.[0]?.channel_id ?? v.author?.channel_id ?? null,
-    durationS: v.duration?.seconds ?? null,
+    channelId: str(v.artists?.[0]?.channel_id) ?? str(v.author?.channel_id),
+    // The catalogue row usually carries a duration object, but an artist's
+    // top-songs shelf only has it in the byline ("… • 3:05").
+    durationS: num(v.duration?.seconds) ?? durationFromParts(parts),
     // The catalogue thumbnail is the artist avatar; the video thumbnail is the
     // artwork every other screen already proxies by id, so prefer that.
     thumb: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
-    album: v.album?.name ?? credit(byline.length > 1 ? byline[1] : null) ?? albumFromColumns,
+    album: text(v.album?.name) ?? albumCredit ?? albumFromColumns,
     // The album's browse id (MPR…) is what "Open album" needs. Catalogue rows
     // carry it; up-next rows do not, which is why albumForVideo() exists.
-    albumId: v.album?.id ?? null,
+    albumId: str(v.album?.id),
     // Present on artist shelves ("2.3B plays"), absent elsewhere.
     ...(plays ? { views: toCount(plays) } : {}),
+    ...(version ? { version } : {}),
     itemType: 'song',
     official: true,
   };
+}
+
+/**
+ * Which edit of a song a raw row carries, from its badges and title markers.
+ *
+ * Parsed rows (MusicResponsiveListItem, PlaylistPanelVideo) keep `badges` as
+ * parsed objects; raw fixtures use the same shapes. The explicit badge is
+ * either an icon_type of EXPLICIT or a plain label "E" — both are the
+ * *release's* claim, which outranks whatever the title says.
+ */
+function versionOf(v) {
+  const badges = Array.isArray(v?.badges) ? v.badges : null;
+  const track = badges ? { title: text(v.title), badges } : { title: text(v.title) };
+  return trackVersion(track);
 }
 
 /**
@@ -151,24 +570,50 @@ function toVideoTrack(v) {
  * so an obscure query still finds something.
  */
 export async function searchTracks(query, limit = 20) {
-  const yt = await getYT();
+  const capped = publicLimit(limit, 20);
+  if (capped === 0) return [];
 
   let songs = [];
+  let musicFailure = null;
   try {
-    const res = await withTimeout(yt.music.search(query, { type: 'song' }), config.resolveTimeoutMs, 'search');
-    songs = (res?.songs?.contents ?? []).map(toMusicTrack).filter(Boolean);
-  } catch {
+    const res = await withTimeout(
+      (yt) => yt.music.search(query, { type: 'song' }),
+      config.resolveTimeoutMs,
+      'search',
+    );
+    songs = list(res?.songs?.contents).map(toMusicTrack).filter(Boolean);
+  } catch (err) {
+    // Retrying a policy answer through another client is still an immediate
+    // retry from the same IP. Do not turn one 429 into a second request.
+    if (isPolicyFailure(err)) throw err;
+    musicFailure = err;
     // The Music client is a separate endpoint and can fail on its own (client
     // version, gating). Plain video search is the historical path; use it.
   }
 
   let videos = [];
-  if (songs.length < limit) {
-    const res = await withTimeout(yt.search(query, { type: 'video' }), config.resolveTimeoutMs, 'search');
-    videos = (res.videos ?? []).map(toVideoTrack).filter(Boolean);
+  if (songs.length < capped) {
+    // The fallback is guarded on its own: a failed video search must not throw
+    // away catalogue songs that already succeeded.
+    try {
+      const res = await withTimeout(
+        (yt) => yt.search(query, { type: 'video' }),
+        config.resolveTimeoutMs,
+        'search',
+      );
+      videos = list(res?.videos ?? res?.results).map(toVideoTrack).filter(Boolean);
+    } catch (err) {
+      if (isPolicyFailure(err) && (musicFailure || songs.length === 0)) throw err;
+      if (musicFailure) {
+        // Two outages are not an honest empty search. AggregateError retains
+        // both causes for logs while routes can still classify the failure.
+        throw new AggregateError([musicFailure, err], 'YouTube Music and video search both failed.');
+      }
+      // Keep whatever the catalogue gave us rather than nothing at all.
+    }
   }
 
-  return rankTracks([...songs, ...videos], { query, limit });
+  return rankTracks([...songs, ...videos], { query, limit: capped });
 }
 
 /**
@@ -179,24 +624,25 @@ export async function searchTracks(query, limit = 20) {
  * Every playlist caller goes through here so that rule is stated once.
  */
 async function playlistHits(query) {
-  const yt = await getYT();
   const res = await withTimeout(
-    yt.music.search(query, { type: 'playlist' }),
+    (yt) => yt.music.search(query, { type: 'playlist' }),
     config.resolveTimeoutMs,
     'playlist search',
   );
-  return (res?.playlists?.contents ?? [])
+  return list(res?.playlists?.contents)
     .map((p) => {
-      if (!p?.id || !/^(?:VL)?PL/.test(p.id)) return null;
+      if (!p || typeof p !== 'object') return null;
+      const id = str(p.id);
+      if (!id || !/^(?:VL)?PL/.test(id)) return null;
       const title = typeof p.title === 'string' ? p.title : text(p.title);
       if (!title) return null;
       // The row's own byline is "Author • 299K views"; the node carries neither
       // field, so both have to be read out of that line.
-      const byline = text(p.flex_columns?.[1]?.title);
+      const byline = text(list(p.flex_columns)[1]?.title);
       return {
-        id: p.id,
+        id,
         title,
-        author: p.author?.name ?? parsePlaylistByline(byline).author,
+        author: text(p.author?.name) ?? parsePlaylistByline(byline).author,
         thumb: thumbFrom(p),
         ...parsePlaylistStats(byline),
       };
@@ -205,7 +651,77 @@ async function playlistHits(query) {
 }
 
 /**
- * Community playlists that are really lists of songs, most-viewed first.
+ * Track counts (and views) read from a playlist's own header, cached by id.
+ *
+ * `playlistResults` used to fetch a whole playlist page per candidate just to
+ * read `header.second_subtitle` — a cold mood search was one search plus up to
+ * ten full playlist fetches, which is precisely the traffic pattern that gets an
+ * IP gated (and this header changes about as often as the playlist does).
+ *
+ * Failures are cached too, on a much shorter TTL: one dead playlist id must not
+ * be re-fetched on every search, but a transient failure (a timeout, a flip of
+ * the bot gate) has to heal on its own.
+ */
+const PLAYLIST_STATS_TTL_MS = 6 * 60 * 60_000;
+const PLAYLIST_STATS_FAIL_TTL_MS = 10 * 60_000;
+const PLAYLIST_STATS_MAX = 500;
+/** id -> { at, ttl, stats }. Insertion order is eviction order (FIFO). */
+const playlistStatsCache = new Map();
+const playlistStatsInFlight = new Map();
+
+function cachedPlaylistStats(id) {
+  const hit = playlistStatsCache.get(id);
+  if (!hit) return null;
+  if (Date.now() - hit.at > hit.ttl) {
+    playlistStatsCache.delete(id);
+    return null;
+  }
+  return hit.stats;
+}
+
+function rememberPlaylistStats(id, stats, ttl = PLAYLIST_STATS_TTL_MS) {
+  playlistStatsCache.set(id, { at: Date.now(), ttl, stats });
+  // Bounded, not LRU: an unbounded map of playlist ids is a slow leak on an
+  // instance that stays up for weeks.
+  for (const key of playlistStatsCache.keys()) {
+    if (playlistStatsCache.size <= PLAYLIST_STATS_MAX) break;
+    playlistStatsCache.delete(key);
+  }
+}
+
+function loadPlaylistStats(id) {
+  const pending = playlistStatsInFlight.get(id);
+  if (pending) return pending;
+  const generation = identityGeneration;
+  let work;
+  work = (async () => {
+    try {
+      const pl = await withTimeout(
+        (yt) => yt.music.getPlaylist(id),
+        config.resolveTimeoutMs,
+        'playlist',
+      );
+      const stats = parsePlaylistStats(text(pl?.header?.second_subtitle));
+      if (generation === identityGeneration) rememberPlaylistStats(id, stats);
+      return stats;
+    } catch {
+      // Unknown length: keep the search row rather than hide a working playlist.
+      // Cache this lookup briefly, including a miss, but never across a reset.
+      const stats = {};
+      if (generation === identityGeneration) rememberPlaylistStats(id, stats, PLAYLIST_STATS_FAIL_TTL_MS);
+      return stats;
+    } finally {
+      if (generation === identityGeneration && playlistStatsInFlight.get(id) === work) {
+        playlistStatsInFlight.delete(id);
+      }
+    }
+  })();
+  playlistStatsInFlight.set(id, work);
+  return work;
+}
+
+/**
+ * Community playlists that are really lists of songs, by relevance then views.
  *
  * The search row only carries views, so the length of the shortlist is
  * confirmed from each playlist's own header: a "playlist" holding one 4-hour
@@ -213,19 +729,24 @@ async function playlistHits(query) {
  * combined search tab wants fast, a mood screen wants thorough.
  */
 async function playlistResults(query, { limit = 12, verify = 10, minTracks = 8 } = {}) {
-  const shortlist = rankPlaylists(await playlistHits(query), { limit: verify, minTracks: 0 });
-  const yt = await getYT();
-  const checked = await Promise.all(shortlist.map(async (p) => {
+  const hits = await playlistHits(query);
+  // Query relevance decides which expensive headers are worth reading. Ranking
+  // without it used to spend the whole shortlist on popular but unrelated hits.
+  const ranked = rankPlaylists(hits, { query, limit: hits.length, minTracks: 0 });
+  // Only this shortlist pays for a header request, even if a public caller asks
+  // for 100 rows. The unverified tail stays eligible below: rankPlaylists keeps
+  // unknown track counts, so a verification cap cannot under-fill the result or
+  // turn a large limit into a hundred extra requests.
+  const candidates = ranked.slice(0, verify);
+  const checked = await Promise.all(candidates.map(async (p) => {
     if (p.trackCount != null) return p;
-    try {
-      const pl = await withTimeout(yt.music.getPlaylist(p.id), config.resolveTimeoutMs, 'playlist');
-      return { ...p, ...parsePlaylistStats(text(pl?.header?.second_subtitle)) };
-    } catch {
-      return p; // unknown length: keep it rather than hide a working playlist
-    }
+    const known = cachedPlaylistStats(p.id);
+    if (known) return { ...p, ...known };
+    const stats = await loadPlaylistStats(p.id);
+    return { ...p, ...stats };
   }));
 
-  return rankPlaylists(checked, { limit, minTracks });
+  return rankPlaylists([...checked, ...ranked.slice(candidates.length)], { query, limit, minTracks });
 }
 
 /**
@@ -237,7 +758,9 @@ async function playlistResults(query, { limit = 12, verify = 10, minTracks = 8 }
  * list is one.
  */
 export async function searchMoodPlaylists(query, limit = 12) {
-  return playlistResults(query, { limit, verify: 10 });
+  const capped = publicLimit(limit, 12);
+  if (capped === 0) return [];
+  return playlistResults(query, { limit: capped, verify: 10 });
 }
 
 /**
@@ -248,7 +771,9 @@ export async function searchMoodPlaylists(query, limit = 12) {
  * albums and artists and must not hold them up.
  */
 export async function searchPlaylists(query, limit = 12) {
-  return playlistResults(query, { limit, verify: 8 });
+  const capped = publicLimit(limit, 12);
+  if (capped === 0) return [];
+  return playlistResults(query, { limit: capped, verify: 8 });
 }
 
 /**
@@ -256,10 +781,24 @@ export async function searchPlaylists(query, limit = 12) {
  * single user: 50 related tracks with ids, no model required.
  */
 export async function upNext(videoId, limit = 25) {
-  const yt = await getYT();
-  const res = await withTimeout(yt.music.getUpNext(videoId, true), config.resolveTimeoutMs, 'upNext');
-  const items = res?.contents ?? res?.items ?? [];
-  return items.map(toTrack).filter((t) => t && t.videoId !== videoId).slice(0, limit);
+  const capped = publicLimit(limit, 25);
+  if (capped === 0) return [];
+  const res = await withTimeout(
+    (yt) => yt.music.getUpNext(videoId, true),
+    config.resolveTimeoutMs,
+    'upNext',
+  );
+  const tracks = list(res?.contents ?? res?.items)
+    .map(toTrack)
+    .filter((t) => t && t.videoId !== videoId);
+  // A clean edit is offered only when the neighbourhood has nothing else: the
+  // censored upload of a song and its real edit are the same song key, and the
+  // recommender hands back both. Partitioning (not filtering) keeps the clean
+  // rows reachable — an all-clean neighbourhood still fills the page — while
+  // making sure a non-clean edit is always ahead of them.
+  const notClean = tracks.filter((t) => t.version !== 'clean');
+  const clean = tracks.filter((t) => t.version === 'clean');
+  return [...notClean, ...clean].slice(0, capped);
 }
 
 /**
@@ -273,9 +812,12 @@ export async function upNext(videoId, limit = 25) {
 export async function artistIdFor(name) {
   const q = String(name ?? '').trim();
   if (!q) return null;
-  const yt = await getYT();
-  const res = await withTimeout(yt.music.search(q, { type: 'artist' }), config.resolveTimeoutMs, 'artist search');
-  const hit = res?.artists?.contents?.[0];
+  const res = await withTimeout(
+    (yt) => yt.music.search(q, { type: 'artist' }),
+    config.resolveTimeoutMs,
+    'artist search',
+  );
+  const hit = list(res?.artists?.contents)[0];
   const id = hit?.id ?? hit?.channel_id ?? null;
   return typeof id === 'string' && /^UC[\w-]{20,}$/.test(id) ? id : null;
 }
@@ -298,7 +840,8 @@ export async function artistIdFor(name) {
  * and is the only place the distinction appears.
  */
 function toAlbumItem(v) {
-  const id = v?.id;
+  if (!v || typeof v !== 'object') return null;
+  const id = v.id;
   if (typeof id !== 'string' || !/^MPR[\w-]+$/.test(id)) return null;
   const title = text(v.title);
   if (!title) return null;
@@ -306,7 +849,10 @@ function toAlbumItem(v) {
   return {
     id,
     title,
-    year: v.year ?? /(\d{4})/.exec(subtitle)?.[1] ?? null,
+    // `year` is a number upstream and a string in older payloads; a 4-digit
+    // match in the subtitle is the fallback for both.
+    year: /(\d{4})/.exec(subtitle)?.[1]
+      ?? (/^\d{4}$/.test(String(v.year ?? '')) ? String(v.year) : null),
     type: /single|\bep\b/i.test(subtitle) ? 'Single' : 'Album',
     thumb: thumbFrom(v),
   };
@@ -319,19 +865,21 @@ function toAlbumItem(v) {
  * the byline is "Artist • 1.5B views". The thumbnail is the video's own still.
  */
 function toShelfVideo(v) {
-  const id = v?.id;
+  if (!v || typeof v !== 'object') return null;
+  const id = v.id;
   if (typeof id !== 'string' || id.length !== 11) return null;
   const title = text(v.title);
   if (!title) return null;
-  const by = text(v.subtitle) ?? '';
-  const channel = by.split('\u2022')[0].trim() || null;
+  const parts = (text(v.subtitle) ?? '').split('\u2022').map((s) => s.trim()).filter(Boolean);
+  const channel = parts[0] || null;
   return {
     videoId: id,
     title,
     artist: channel,
     channel,
     channelId: null,
-    durationS: null,
+    // "Artist • 4:05": the length is in the byline or nowhere.
+    durationS: durationFromParts(parts),
     thumb: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
     album: null,
     itemType: 'video',
@@ -349,29 +897,32 @@ function toShelfVideo(v) {
  * this working when YouTube adds or drops a shelf.
  */
 export async function artistPage(artistId) {
-  const yt = await getYT();
-  const page = await withTimeout(yt.music.getArtist(artistId), config.resolveTimeoutMs, 'artist');
-  const sections = page?.sections ?? [];
+  const page = await withTimeout(
+    (yt) => yt.music.getArtist(artistId),
+    config.resolveTimeoutMs,
+    'artist',
+  );
+  const sections = list(page?.sections);
   const heading = (s) => text(s?.header?.title) ?? '';
-  const contents = (re) => sections.find((s) => re.test(heading(s)))?.contents ?? [];
+  const contents = (re) => list(sections.find((s) => re.test(heading(s)))?.contents);
   const header = page?.header;
 
-  const songs = (sections.find((s) => !heading(s))?.contents ?? [])
+  const songs = list(sections.find((s) => !heading(s))?.contents)
     .map(toMusicTrack).filter(Boolean);
   const adjacent = contents(/might also like/i)
-    .map((c) => ({
+    .map((c) => (c && typeof c === 'object' ? {
       name: text(c.title) ?? text(c.name),
-      id: c.id ?? null,
+      id: str(c.id),
       thumb: thumbFrom(c),
-    }))
-    .filter((c) => c.name && /^UC[\w-]{20,}$/.test(c.id ?? ''));
+    } : null))
+    .filter((c) => c?.name && /^UC[\w-]{20,}$/.test(c.id ?? ''));
 
   return {
     id: artistId,
     name: text(header?.title) ?? null,
     // MusicImmersiveHeader keeps the avatar on `.thumbnail.contents`; other
     // header variants expose a plain array. Accept both.
-    thumb: header?.thumbnail?.contents?.[0]?.url ?? header?.thumbnail?.[0]?.url ?? null,
+    thumb: str(header?.thumbnail?.contents?.[0]?.url ?? header?.thumbnail?.[0]?.url),
     description: text(header?.description) ?? null,
     songs,
     albums: contents(/^albums$/i).map(toAlbumItem).filter(Boolean),
@@ -399,18 +950,21 @@ export async function artistProfile(artistId) {
  * artist that made the page findable in the first place.
  */
 export async function albumPage(albumId) {
-  const yt = await getYT();
-  const page = await withTimeout(yt.music.getAlbum(albumId), config.resolveTimeoutMs, 'album');
+  const page = await withTimeout(
+    (yt) => yt.music.getAlbum(albumId),
+    config.resolveTimeoutMs,
+    'album',
+  );
   const header = page?.header;
   const title = text(header?.title) ?? null;
   const subtitle = text(header?.subtitle) ?? '';
   const artist = text(header?.strapline_text_one) ?? text(header?.strapline) ?? null;
   // The strapline's run carries the artist's channel, which is the canonical
   // way back to their page (a name would have to be re-resolved by search).
-  const artistId = header?.strapline_text_one?.runs
-    ?.map((r) => r.endpoint?.payload?.browseId)
-    ?.find((id) => /^UC[\w-]{20,}$/.test(id ?? '')) ?? null;
-  const tracks = (page?.contents ?? [])
+  const artistId = list(header?.strapline_text_one?.runs)
+    .map((r) => str(r?.endpoint?.payload?.browseId))
+    .find((id) => /^UC[\w-]{20,}$/.test(id ?? '')) ?? null;
+  const tracks = list(page?.contents)
     .map(toMusicTrack)
     .filter(Boolean)
     .map((t) => ({
@@ -430,14 +984,32 @@ export async function albumPage(albumId) {
     authorId: artistId,
     type: /single|\bep\b/i.test(subtitle) ? 'Single' : 'Album',
     year: /(\d{4})/.exec(subtitle)?.[1] ?? null,
-    thumb: header?.thumbnail?.contents?.[0]?.url ?? null,
+    thumb: str(header?.thumbnail?.contents?.[0]?.url),
     tracks,
   };
 }
 
-// videoId -> { albumId, title, author } | null. "Which release is this upload
-// from" never changes, so a miss is cached too (as null).
+// videoId -> { value, expiresAt }. Neither a hit nor a miss is permanent: a
+// title can be re-released on an album, and a lookup that ran on stale metadata
+// must not disable "Open album" for the life of the process.
 const albumOfCache = new Map();
+const albumInFlight = new Map();
+const ALBUM_TTL = 6 * 60 * 60_000;
+const ALBUM_MISS_TTL = 10 * 60_000;
+const ALBUM_CACHE_MAX = 500;
+
+/** Remember an album answer, evicting the oldest entry past the ceiling. */
+function rememberAlbum(videoId, value, generation = identityGeneration) {
+  if (generation !== identityGeneration) return;
+  albumOfCache.set(videoId, { value, expiresAt: Date.now() + (value ? ALBUM_TTL : ALBUM_MISS_TTL) });
+  if (albumOfCache.size <= ALBUM_CACHE_MAX) return;
+  const now = Date.now();
+  for (const [k, v] of albumOfCache) if (v.expiresAt <= now) albumOfCache.delete(k);
+  for (const k of albumOfCache.keys()) {
+    if (albumOfCache.size <= ALBUM_CACHE_MAX) break;
+    albumOfCache.delete(k);
+  }
+}
 
 /**
  * The album a track belongs to, resolved from the Music catalogue.
@@ -448,61 +1020,79 @@ const albumOfCache = new Map();
  * honest way to answer "open the album of this song". A miss stays a miss: a
  * wrong album is worse than a disabled button.
  */
-export async function albumForVideo(videoId, meta = {}) {
-  if (albumOfCache.has(videoId)) return albumOfCache.get(videoId);
-  const yt = await getYT();
-  let { title, artist } = meta;
+export function albumForVideo(videoId, meta = {}) {
+  const pending = albumInFlight.get(videoId);
+  if (pending) return pending;
+  const generation = identityGeneration;
+  let work;
+  work = findAlbumForVideo(videoId, meta, generation).finally(() => {
+    if (generation === identityGeneration && albumInFlight.get(videoId) === work) {
+      albumInFlight.delete(videoId);
+    }
+  });
+  albumInFlight.set(videoId, work);
+  return work;
+}
+
+async function findAlbumForVideo(videoId, meta, generation) {
+  const cached = albumOfCache.get(videoId);
+  if (cached) {
+    if (cached.expiresAt > Date.now()) return cached.value;
+    albumOfCache.delete(videoId);
+  }
+  let { title, artist } = meta ?? {};
   if (!title) {
     try {
       const info = await withTimeout(
-        yt.getBasicInfo(videoId, { client: 'IOS' }),
+        (yt) => yt.getBasicInfo(videoId, { client: 'IOS' }),
         config.resolveTimeoutMs,
         'getBasicInfo',
       );
-      title = info.basic_info?.title ?? null;
-      artist = artist ?? info.basic_info?.author ?? null;
+      title = text(info?.basic_info?.title);
+      artist = artist ?? text(info?.basic_info?.author);
     } catch {
-      // Fall through: without a title there is nothing to search for.
+      // No title means there is nothing to search for, and that is a transient
+      // failure rather than a fact about the track: do not cache it.
+      return null;
     }
   }
 
   // An upload title is "Artist - Song (Official Video)"; the catalogue row is
   // "Song". Searching the raw upload title biases the result to the upload
   // itself, so the credit and the qualifiers are stripped first.
-  const parsed = parseVideoTitle(title ?? '');
-  const songTitle = parsed.artist ? parsed.title : (title ?? '');
-  const credited = parsed.artist ?? artist ?? null;
+  const parsed = parseVideoTitle(text(title) ?? '');
+  const songTitle = String(parsed.artist ? parsed.title : (text(title) ?? '')).trim();
+  const credited = parsed.artist ?? text(artist) ?? null;
+  // Nothing to search for is not "this track has no album".
+  if (!songTitle) return null;
 
   let found = null;
-  if (songTitle) {
-    const q = [songTitle, credited].filter(Boolean).join(' ');
-    try {
-      const res = await withTimeout(
-        yt.music.search(q, { type: 'song' }),
-        config.resolveTimeoutMs,
-        'album lookup',
-      );
-      const rows = (res?.songs?.contents ?? []).map(toMusicTrack).filter((t) => t?.albumId);
-      // Match on the *song* identity, not the upload title: the same recording
-      // is usually a different video id on the album than the video upload.
-      const wanted = songKey({ title: songTitle, artist: credited ?? '', itemType: 'song' });
-      const hit = rows.find((r) => r.videoId === videoId)
-        ?? rows.find((r) => songKey({ ...r, itemType: 'song' }) === wanted);
-      if (hit) {
-        found = {
-          albumId: hit.albumId,
-          title: hit.album ?? null,
-          author: hit.artist ?? credited ?? null,
-        };
-      }
-    } catch {
-      // A failed lookup is not cached as a miss; it may succeed later.
-      return null;
+  const q = [songTitle, credited].filter(Boolean).join(' ');
+  try {
+    const res = await withTimeout(
+      (yt) => yt.music.search(q, { type: 'song' }),
+      config.resolveTimeoutMs,
+      'album lookup',
+    );
+    const rows = list(res?.songs?.contents).map(toMusicTrack).filter((t) => t?.albumId);
+    // Match on the *song* identity, not the upload title: the same recording
+    // is usually a different video id on the album than the video upload.
+    const wanted = songKey({ title: songTitle, artist: credited ?? '', itemType: 'song' });
+    const hit = rows.find((r) => r.videoId === videoId)
+      ?? rows.find((r) => songKey({ ...r, itemType: 'song' }) === wanted);
+    if (hit) {
+      found = {
+        albumId: hit.albumId,
+        title: hit.album ?? null,
+        author: hit.artist ?? credited ?? null,
+      };
     }
+  } catch {
+    // A failed lookup is not cached as a miss; it may succeed later.
+    return null;
   }
 
-  albumOfCache.set(videoId, found);
-  if (albumOfCache.size > 500) albumOfCache.delete(albumOfCache.keys().next().value);
+  rememberAlbum(videoId, found, generation);
   return found;
 }
 
@@ -516,22 +1106,29 @@ export async function albumForVideo(videoId, meta = {}) {
  */
 let genreTilesPromise = null;
 export function genreTiles() {
-  genreTilesPromise ??= (async () => {
-    const yt = await getYT();
-    const feed = await withTimeout(yt.music.getExplore(), config.resolveTimeoutMs, 'explore');
-    const shelf = (feed?.sections ?? []).find((s) => /moods/i.test(text(s.header?.title) ?? ''));
-    return (shelf?.contents ?? [])
-      .map((v) => ({
+  if (genreTilesPromise) return genreTilesPromise;
+  const generation = identityGeneration;
+  let pending;
+  pending = (async () => {
+    const feed = await withTimeout(
+      (yt) => yt.music.getExplore(),
+      config.resolveTimeoutMs,
+      'explore',
+    );
+    const shelf = list(feed?.sections).find((s) => /moods/i.test(text(s?.header?.title) ?? ''));
+    return list(shelf?.contents)
+      .map((v) => (v && typeof v === 'object' ? {
         name: text(v.button_text) ?? text(v.text) ?? text(v.title),
-        params: v.endpoint?.payload?.params ?? null,
-        browseId: v.endpoint?.payload?.browseId ?? null,
-      }))
-      .filter((g) => g.name && g.params && g.browseId);
+        params: str(v.endpoint?.payload?.params),
+        browseId: str(v.endpoint?.payload?.browseId),
+      } : null))
+      .filter((g) => g?.name && g.params && g.browseId);
   })().catch((err) => {
-    genreTilesPromise = null;
+    if (generation === identityGeneration && genreTilesPromise === pending) genreTilesPromise = null;
     throw err;
   });
-  return genreTilesPromise;
+  genreTilesPromise = pending;
+  return pending;
 }
 
 /**
@@ -545,33 +1142,33 @@ export function genreTiles() {
  */
 export async function genreSongs(genre, limit = 20) {
   const name = String(genre ?? '').trim();
-  if (!name) return [];
-  const yt = await getYT();
+  const capped = publicLimit(limit, 20);
+  if (!name || capped === 0) return [];
   const tiles = await genreTiles();
   const tile = tiles.find((g) => g.name.toLowerCase() === name.toLowerCase())
     ?? tiles.find((g) => g.name.toLowerCase().includes(name.toLowerCase()));
   if (!tile) return [];
 
   const res = await withTimeout(
-    yt.actions.execute('/browse', { browseId: tile.browseId, params: tile.params, client: 'YTMUSIC' }),
+    (yt) => yt.actions.execute('/browse', { browseId: tile.browseId, params: tile.params, client: 'YTMUSIC' }),
     config.resolveTimeoutMs,
     'genre songs',
   );
   const data = res?.data ?? res;
-  const sections = data?.contents?.singleColumnBrowseResultsRenderer?.tabs?.[0]
-    ?.tabRenderer?.content?.sectionListRenderer?.contents ?? [];
-  const heading = (s) => s?.musicCarouselShelfRenderer?.header?.musicCarouselShelfBasicHeaderRenderer
-    ?.title?.runs?.map((r) => r.text).join('') ?? null;
+  const sections = list(data?.contents?.singleColumnBrowseResultsRenderer?.tabs?.[0]
+    ?.tabRenderer?.content?.sectionListRenderer?.contents);
+  const heading = (s) => list(s?.musicCarouselShelfRenderer?.header?.musicCarouselShelfBasicHeaderRenderer
+    ?.title?.runs).map((r) => text(r?.text)).filter(Boolean).join('') || null;
   const shelf = sections.find((s) => /^songs$/i.test(heading(s) ?? ''))
     ?? sections.find((s) => /^music videos$/i.test(heading(s) ?? ''));
-  const rows = shelf?.musicCarouselShelfRenderer?.contents ?? [];
+  const rows = list(shelf?.musicCarouselShelfRenderer?.contents);
 
   return rows
     .map(rawMusicRow)
     .filter(Boolean)
     // The genre page already ranks by popularity; the byline carries the views
     // so the caller can prefer bigger songs without a second lookup.
-    .slice(0, limit);
+    .slice(0, capped);
 }
 
 /**
@@ -582,18 +1179,18 @@ export async function genreSongs(genre, limit = 20) {
  * the thumbnail's play button — the title's own endpoint is a browse link.
  */
 function rawMusicRow(item) {
-  const r = item?.musicResponsiveListItemRenderer;
-  if (!r) return null;
-  const col = (i) => (r.flexColumns?.[i]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs ?? [])
-    .map((x) => x.text).join('');
+  if (!item || typeof item !== 'object') return null;
+  const r = item.musicResponsiveListItemRenderer;
+  if (!r || typeof r !== 'object') return null;
+  const col = (i) => list(list(r.flexColumns)[i]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs)
+    .map((x) => text(x?.text)).filter(Boolean).join('');
   const title = col(0)?.trim();
   const byline = col(1) ?? '';
-  const videoId = r.overlay?.musicItemThumbnailOverlayRenderer?.content?.musicPlayButtonRenderer
-    ?.playNavigationEndpoint?.watchEndpoint?.videoId
-    ?? r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs?.[0]
-      ?.navigationEndpoint?.watchEndpoint?.videoId
-    ?? null;
-  if (!videoId || typeof videoId !== 'string' || videoId.length !== 11 || !title) return null;
+  const videoId = str(r.overlay?.musicItemThumbnailOverlayRenderer?.content?.musicPlayButtonRenderer
+    ?.playNavigationEndpoint?.watchEndpoint?.videoId)
+    ?? str(list(list(r.flexColumns)[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs)[0]
+      ?.navigationEndpoint?.watchEndpoint?.videoId);
+  if (!videoId || videoId.length !== 11 || !title) return null;
   const [artistPart] = byline.split('\u2022');
   const artist = artistPart?.trim() || null;
   const views = /([\d.,]+\s*[KMB]?)\s*views?/i.exec(byline);
@@ -602,7 +1199,8 @@ function rawMusicRow(item) {
     title,
     artist,
     channel: artist,
-    durationS: null,
+    // "Artist • 86M views • 3:05" on the video shelf of a genre page.
+    durationS: durationFromParts(byline.split('\u2022').map((s) => s.trim())),
     thumb: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
     album: col(2)?.trim() || null,
     views: views ? toCount(views[1]) : 0,
@@ -617,17 +1215,19 @@ function rawMusicRow(item) {
  * to a couple of tracks by the caller so a station never turns into a chart.
  */
 export async function exploreTrending(limit = 12) {
-  const yt = await getYT();
-  const feed = await withTimeout(yt.music.getExplore(), config.resolveTimeoutMs, 'explore');
-  const section = (feed?.sections ?? []).find((s) => /trending/i.test(text(s.header?.title) ?? ''));
-  return (section?.contents ?? [])
+  const capped = publicLimit(limit, 12);
+  if (capped === 0) return [];
+  const feed = await withTimeout(
+    (yt) => yt.music.getExplore(),
+    config.resolveTimeoutMs,
+    'explore',
+  );
+  const section = list(feed?.sections).find((s) => /trending/i.test(text(s?.header?.title) ?? ''));
+  return list(section?.contents)
     .map((v) => (v?.item_type === 'song' || v?.item_type === 'video' ? toMusicTrack(v) : null))
     .filter(Boolean)
-    .slice(0, limit);
+    .slice(0, capped);
 }
-
-// videoId -> { url, mime, bitrate, expiresAt }
-const urlCache = new Map();
 
 /**
  * Is this an ongoing live broadcast? yt-dlp cannot "download" one (it would
@@ -636,34 +1236,85 @@ const urlCache = new Map();
  * Best effort: if the lookup fails (bot gate, timeout, transient outage) this
  * returns false and playback proceeds. A failed *check* must never stop a
  * track that could otherwise play.
+ *
+ * Answers are cached per id for a few minutes, because the check is a full
+ * YouTube round-trip and two different places ask about the same id within one
+ * request: /api/stream probes before it downloads, and ensureAudio() probes
+ * before it takes a download slot. Only an actual boolean answer is cached:
+ * an exception or a changed/missing renderer is not evidence of "not live".
  */
-export async function isLive(videoId) {
-  try {
-    const yt = await getYT();
-    const info = await withTimeout(
-      yt.getBasicInfo(videoId, { client: 'IOS' }),
-      config.resolveTimeoutMs,
-      'getBasicInfo',
-    );
-    return Boolean(info.basic_info?.is_live ?? false);
-  } catch {
-    return false;
-  }
+const LIVE_CACHE_TTL_MS = 5 * 60_000;
+const LIVE_CACHE_MAX = 500;
+const liveCache = new Map(); // videoId -> { at, live }
+const liveInFlight = new Map();
+
+export function isLive(videoId) {
+  const hit = liveCache.get(videoId);
+  if (hit && Date.now() - hit.at < LIVE_CACHE_TTL_MS) return Promise.resolve(hit.live);
+  if (hit) liveCache.delete(videoId);
+  const pending = liveInFlight.get(videoId);
+  if (pending) return pending;
+
+  const generation = identityGeneration;
+  let work;
+  work = (async () => {
+    try {
+      const info = await withTimeout(
+        (yt) => yt.getBasicInfo(videoId, { client: 'IOS' }),
+        config.resolveTimeoutMs,
+        'getBasicInfo',
+      );
+      const live = info?.basic_info?.is_live;
+      if (typeof live !== 'boolean') return false;
+      if (generation === identityGeneration) {
+        liveCache.set(videoId, { at: Date.now(), live });
+        for (const key of liveCache.keys()) {
+          if (liveCache.size <= LIVE_CACHE_MAX) break;
+          liveCache.delete(key);
+        }
+      }
+      return live;
+    } catch {
+      return false;
+    } finally {
+      if (generation === identityGeneration && liveInFlight.get(videoId) === work) {
+        liveInFlight.delete(videoId);
+      }
+    }
+  })();
+  liveInFlight.set(videoId, work);
+  return work;
 }
 
 /**
  * Lyrics via YouTube Music. Best effort: a track without lyrics is normal, not
  * an error, so this resolves to null instead of throwing. Verified against a
  * real track (Radiohead - Creep) returning ~800 chars of plain text.
+ *
+ * A null is deliberately ambiguous — "no lyrics" and "the lookup failed" look
+ * the same here — so the *route* must not cache it for long (it gives a null
+ * three minutes and a hit six hours).
  */
 export async function fetchLyrics(videoId) {
-  const yt = await getYT();
   try {
-    const shelf = await withTimeout(yt.music.getLyrics(videoId), config.resolveTimeoutMs, 'lyrics');
+    const shelf = await withTimeout(
+      (yt) => yt.music.getLyrics(videoId),
+      config.resolveTimeoutMs,
+      'lyrics',
+    );
     const d = shelf?.description;
-    const text = typeof d === 'string' ? d : d?.toString?.() ?? null;
-    return text && text.trim() ? text.trim() : null;
+    // Only a string or a run object can be lyrics; a number or a boolean is a
+    // malformed answer, not something to print.
+    const lyrics = typeof d === 'string'
+      ? d
+      : (d && typeof d === 'object'
+        ? (typeof d.text === 'string'
+          ? d.text
+          : (typeof d.toString === 'function' && d.toString !== Object.prototype.toString ? String(d) : null))
+        : null);
+    return lyrics && lyrics.trim() ? lyrics.trim() : null;
   } catch {
+    // Includes getYT(): a session that cannot be created is not a lyric-less track.
     return null;
   }
 }
@@ -677,15 +1328,15 @@ export async function fetchLyrics(videoId) {
  * older typed shelves, so a future API shuffle degrades instead of going blank.
  */
 function thumbFrom(node) {
-  let url = node?.thumbnails?.[0]?.url
+  let url = str(node?.thumbnails?.[0]?.url)
     // `MusicTwoRowItem` exposes the avatar/cover as a plain `thumbnail` array.
-    ?? node?.thumbnail?.[0]?.url
-    ?? node?.author?.thumbnails?.[0]?.url;
+    ?? str(node?.thumbnail?.[0]?.url)
+    ?? str(node?.author?.thumbnails?.[0]?.url);
   if (!url) {
     const img = node?.content_image?.primary_thumbnail?.image
       ?? node?.content_image?.image
       ?? node?.primary_thumbnail?.image;
-    url = img?.[0]?.url ?? img?.url ?? null;
+    url = str(list(img)[0]?.url) ?? str(img?.url);
   }
   if (!url) return null;
   // YouTube returns protocol-relative URLs for channel avatars (//yt3.ggpht…).
@@ -694,13 +1345,12 @@ function thumbFrom(node) {
 
 /** Parse "12M subscribers" / "1.2K videos" into a number for ranking. */
 function lockupTitle(node) {
-  const t = node?.metadata?.title;
-  return typeof t === 'string' ? t : t?.text ?? t?.toString?.() ?? null;
+  return text(node?.metadata?.title);
 }
 
 function lockupSubtitle(node) {
-  const rows = node?.metadata?.metadata?.metadata_rows ?? [];
-  const parts = rows.flatMap((r) => (r.metadata_parts ?? []).map((p) => p?.text?.text ?? p?.text ?? ''));
+  const rows = list(node?.metadata?.metadata?.metadata_rows);
+  const parts = rows.flatMap((r) => list(r?.metadata_parts).map((p) => text(p?.text?.text ?? p?.text)));
   return parts.filter(Boolean).join(' · ') || null;
 }
 
@@ -713,11 +1363,12 @@ function lockupSubtitle(node) {
  * search tab can afford per row.
  */
 function toReleaseItem(v) {
-  const id = v?.id;
+  if (!v || typeof v !== 'object') return null;
+  const id = v.id;
   if (typeof id !== 'string' || !/^MPR[\w-]+$/.test(id)) return null;
   const title = text(v.title);
   if (!title) return null;
-  const byline = parseReleaseByline(text(v.flex_columns?.[1]?.title) ?? text(v.subtitle));
+  const byline = parseReleaseByline(text(list(v.flex_columns)[1]?.title) ?? text(v.subtitle));
   return {
     id,
     title,
@@ -741,27 +1392,33 @@ function toReleaseItem(v) {
  * release (a non-music channel, an obscure uploader).
  */
 export async function searchAlbums(query, limit = 18) {
-  const yt = await getYT();
-
+  const capped = publicLimit(limit, 18);
+  if (capped === 0) return [];
   try {
     const res = await withTimeout(
-      yt.music.search(query, { type: 'album' }),
+      (yt) => yt.music.search(query, { type: 'album' }),
       config.resolveTimeoutMs,
       'album search',
     );
-    const releases = (res?.albums?.contents ?? [])
-      .map(toReleaseItem).filter(Boolean).slice(0, limit);
+    const releases = list(res?.albums?.contents)
+      .map(toReleaseItem).filter(Boolean).slice(0, capped);
     if (releases.length) return releases;
-  } catch {
+  } catch (err) {
+    if (isPolicyFailure(err)) throw err;
     // Fall through: a failed catalogue lookup must not empty the album tab.
   }
 
-  const res = await withTimeout(yt.search(query, { type: 'playlist' }), config.resolveTimeoutMs, 'album search');
-  const pool = res.playlists ?? res.results ?? [];
+  const res = await withTimeout(
+    (yt) => yt.search(query, { type: 'playlist' }),
+    config.resolveTimeoutMs,
+    'album search',
+  );
+  const pool = list(res?.playlists ?? res?.results);
   return pool.map((p) => {
+    if (!p || typeof p !== 'object') return null;
     if (p.type === 'LockupView' || p.content_id) {
       return {
-        id: p.content_id ?? null,
+        id: str(p.content_id),
         title: lockupTitle(p),
         author: lockupSubtitle(p),
         trackCount: null,
@@ -769,17 +1426,18 @@ export async function searchAlbums(query, limit = 18) {
       };
     }
     return {
-      id: p.id,
+      id: str(p.id),
       title: text(p.title),
       author: text(p.author?.name),
-      trackCount: p.video_count ?? p.videoCount ?? null,
+      trackCount: num(p.video_count ?? p.videoCount),
       thumb: thumbFrom(p),
     };
-  }).filter((p) => p.id && p.title).slice(0, limit);
+  }).filter((p) => p?.id && p.title).slice(0, capped);
 }
 
 export async function searchArtists(query, limit = 18) {
-  const yt = await getYT();
+  const capped = publicLimit(limit, 18);
+  if (capped === 0) return [];
 
   // The Music catalogue's artist shelf is the right source for a "who is this"
   // answer: it is relevance-ranked by the same graph the artist pages come
@@ -788,31 +1446,39 @@ export async function searchArtists(query, limit = 18) {
   // The channel search stays as the fallback, for non-music channels.
   try {
     const res = await withTimeout(
-      yt.music.search(query, { type: 'artist' }),
+      (yt) => yt.music.search(query, { type: 'artist' }),
       config.resolveTimeoutMs,
       'artist search',
     );
-    const rows = (res?.artists?.contents ?? [])
-      .map((c) => ({
-        id: c.id ?? null,
-        title: text(c.name) ?? text(c.title) ?? null,
-        subscribers: text(c.subscribers) ?? null,
+    const rows = list(res?.artists?.contents)
+      .map((c) => (c && typeof c === 'object' ? {
+        id: str(c.id),
+        title: text(c.name) ?? text(c.title),
+        // An empty string is not a subscriber count: it rendered as "0" and
+        // sorted every artist with a blank byline to the bottom.
+        subscribers: text(c.subscribers) || null,
         handle: null,
         videoCount: null,
         thumb: thumbFrom(c),
-      }))
+      } : null))
       // Only rows whose id is a channel: `music.getArtist` accepts nothing else.
-      .filter((c) => c.id && c.title && /^UC[\w-]{20,}$/.test(c.id));
+      .filter((c) => c?.id && c.title && /^UC[\w-]{20,}$/.test(c.id));
     // Order is the catalogue's own relevance ranking; re-sorting by audience
     // would push the actual artist down behind a better-known neighbour.
-    if (rows.length) return rows.slice(0, limit);
-  } catch {
+    if (rows.length) return rows.slice(0, capped);
+  } catch (err) {
+    if (isPolicyFailure(err)) throw err;
     // Fall through: a failed Music lookup must not empty the artists tab.
   }
 
-  const res = await withTimeout(yt.search(query, { type: 'channel' }), config.resolveTimeoutMs, 'artist search');
-  const pool = res.channels ?? res.results ?? [];
+  const res = await withTimeout(
+    (yt) => yt.search(query, { type: 'channel' }),
+    config.resolveTimeoutMs,
+    'artist search',
+  );
+  const pool = list(res?.channels ?? res?.results);
   return pool.map((c) => {
+    if (!c || typeof c !== 'object') return null;
     // The channel renderer's fields shift between builds: sometimes
     // subscriber_count holds "@handle" and video_count holds "12M subscribers".
     // Read every candidate string and classify by content, not by field name.
@@ -824,7 +1490,7 @@ export async function searchArtists(query, limit = 18) {
     const subs = /([\d.,]+\s*[KMB]?)\s*subscribers?/i.exec(raw);
     const handle = /@[\w.-]+/.exec(raw);
     return {
-      id: c.id ?? c.content_id ?? null,
+      id: str(c.id ?? c.content_id),
       title: text(c.author?.name) ?? lockupTitle(c) ?? text(c.title),
       subscribers: subs ? subs[1].replace(/\s+/g, '') + ' subscribers' : null,
       handle: handle ? handle[0] : null,
@@ -832,10 +1498,10 @@ export async function searchArtists(query, limit = 18) {
       thumb: thumbFrom(c),
     };
   })
-    .filter((c) => c.id && c.title)
+    .filter((c) => c?.id && c.title)
     // Rank by audience so the actual artist outranks fan re-upload channels.
     .sort((a, b) => toCount(b.subscribers) - toCount(a.subscribers))
-    .slice(0, limit);
+    .slice(0, capped);
 }
 
 /**
@@ -867,79 +1533,37 @@ function uniqueSongs(tracks) {
  * the playlist without a second lookup.
  */
 export async function playlistTracks(playlistId, limit = 100) {
-  const yt = await getYT();
+  const capped = publicLimit(limit, 100);
 
   // Music-catalogue ids (VLPL…) are only readable through the Music client;
   // a plain PL… id from the library's album tab goes through the normal one.
   if (/^VL/.test(playlistId)) {
-    const pl = await withTimeout(yt.music.getPlaylist(playlistId), config.resolveTimeoutMs, 'playlist');
-    const tracks = (pl?.contents ?? pl?.items ?? [])
+    const pl = await withTimeout(
+      (yt) => yt.music.getPlaylist(playlistId),
+      config.resolveTimeoutMs,
+      'playlist',
+    );
+    const tracks = list(pl?.contents ?? pl?.items)
       .map((v) => ((v?.item_type === 'song' || v?.item_type === 'video') ? toMusicTrack(v) : null))
       .filter(Boolean);
     return {
       title: text(pl?.header?.title),
       author: null,
       type: 'Playlist',
-      tracks: uniqueSongs(tracks).slice(0, limit),
+      tracks: uniqueSongs(tracks).slice(0, capped),
     };
   }
 
-  const pl = await withTimeout(yt.getPlaylist(playlistId), config.resolveTimeoutMs, 'playlist');
-  const tracks = (pl?.videos ?? pl?.items ?? []).map(toTrack).filter(Boolean);
+  const pl = await withTimeout(
+    (yt) => yt.getPlaylist(playlistId),
+    config.resolveTimeoutMs,
+    'playlist',
+  );
+  const tracks = list(pl?.videos ?? pl?.items).map(toTrack).filter(Boolean);
   return {
     title: text(pl?.info?.title),
     author: text(pl?.info?.author?.name),
-    type: pl?.info?.author?.name ? 'Playlist' : 'Album',
-    tracks: uniqueSongs(tracks).slice(0, limit),
+    type: text(pl?.info?.author?.name) ? 'Playlist' : 'Album',
+    tracks: uniqueSongs(tracks).slice(0, capped),
   };
 }
-
-export function clearAudioCache(videoId) {
-  if (videoId) urlCache.delete(videoId);
-  else urlCache.clear();
-}
-
-/**
- * Resolve a playable audio URL for the iOS client path (itag 140 = AAC/MP4,
- * which Safari plays natively, so no transcoding is ever needed).
- *
- * The URL is IP-bound and expires, so it is only ever used server-side by the
- * proxy; the browser never sees it.
- */
-export async function resolveAudio(videoId) {
-  const hit = urlCache.get(videoId);
-  if (hit && hit.expiresAt > Date.now()) return hit;
-
-  const yt = await getYT();
-  const info = await withTimeout(
-    yt.getBasicInfo(videoId, { client: 'IOS' }),
-    config.resolveTimeoutMs,
-    'getBasicInfo',
-  );
-
-  const formats = (info.streaming_data?.adaptive_formats ?? [])
-    .filter((f) => f.has_audio && !f.has_video);
-
-  // Prefer AAC (Safari-safe); never hand Safari WebM/Opus.
-  const aac = formats.filter((f) => f.mime_type?.startsWith('audio/mp4'));
-  const pool = aac.length ? aac : formats;
-  const best = pool.sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0];
-  if (!best) throw new Error('No audio format available for this video.');
-
-  const url = await best.decipher(yt.session.player);
-  const entry = {
-    url,
-    mime: best.mime_type ?? 'audio/mp4',
-    bitrate: best.bitrate ?? null,
-    itag: best.itag,
-    contentLength: Number(best.content_length) || null,
-    expiresAt: Date.now() + config.urlTtlMs,
-  };
-  urlCache.set(videoId, entry);
-  if (urlCache.size > 500) {
-    for (const [k, v] of urlCache) if (v.expiresAt <= Date.now()) urlCache.delete(k);
-  }
-  return entry;
-}
-
-export { IOS_UA };

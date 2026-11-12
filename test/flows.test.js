@@ -89,6 +89,9 @@ test('a playlist is created in-app: validation, then a real playlist page', { sk
 
 test('add to playlist then remove from playlist, both without a reload', { skip }, async () => {
   await withApp({ viewport: VIEW.mobile390, page: 'playlist', playlistId: seeded.id }, async () => {
+    // The collection page paints a skeleton before its GET lands, so wait for
+    // the real rows instead of racing the round trip.
+    await browser.waitFor(`document.querySelectorAll('#page-root .track-row').length >= 1`, 8000).catch(() => {});
     const before = await browser.eval(`document.querySelectorAll('#page-root .track-row').length`);
     assert.ok(before >= 1, 'seed playlist lost its track');
 
@@ -103,7 +106,15 @@ test('add to playlist then remove from playlist, both without a reload', { skip 
     const items = await browser.eval(`document.querySelector('#context-menu').innerText`);
     assert.match(items, /Remove from playlist/);
 
-    await browser.eval(`document.querySelector('#context-menu [data-menu-action="remove-from-playlist"]').click()`);
+    await browser.eval(`(() => {
+      // Hold the collection reload: the confirmed DELETE must announce success
+      // before this read, not after it. This used to leave an intermittent empty
+      // toast under load, because row removal and notification shared one tail.
+      window.__ux.delays.playlist = 5000;
+      document.querySelector('#toast-text').textContent = '';
+      document.querySelector('#context-menu [data-menu-action="remove-from-playlist"]').click();
+    })()`);
+    await browser.waitFor(`/Removed/i.test(document.querySelector('#toast-text')?.textContent || '')`, 1000);
     await browser.waitFor(`document.querySelectorAll('#page-root .track-row').length === ${before - 1}`, 8000);
     assert.match(await browser.eval(`document.querySelector('#toast-text').textContent`), /Removed/i);
 
@@ -372,9 +383,13 @@ test('a copied link opens sonora and plays that exact track', { skip }, async ()
   assert.equal(await browser.eval('location.hash'), `#/t/${SEED_TRACK.videoId}`);
   assert.match(await browser.eval(`document.querySelector('#toast-text').textContent || ''`), /Playing/i);
 
-  // A link to something the instance has never seen fails politely.
+  // A link to an id this instance has never catalogued still plays: the shared
+  // id is a play intent, so the client falls back to a minimal track instead of
+  // refusing (the server may also answer with a synthetic track).
   await browser.goto(`${server.base}/#/t/AAAAAAAAAAA`);
-  await browser.waitFor(`/has not seen yet/i.test(document.querySelector('#toast-text')?.textContent || '')`, 10_000);
+  await browser.waitFor(`/Playing/i.test(document.querySelector('#toast-text')?.textContent || '')`, 10_000);
+  assert.equal(await browser.eval(`document.getElementById('player').classList.contains('is-empty')`), false,
+    'a shared id the instance has not seen must still load in the player');
   assert.equal(await browser.eval(`document.getElementById('auth-overlay').hidden`), true);
 });
 

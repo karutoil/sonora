@@ -6,7 +6,13 @@
    Placement is deliberate: the stack floats in the gap above the player, which
    is 99px on desktop, 94px at tablet width (player row 82px) and 148px on
    mobile (71px player + 67px nav). Nothing here ever covers the mini player,
-   the nav or a focused control. */
+   the nav or a focused control.
+
+   Weight is deliberate too: every piece of chrome here is one line (a pill, or
+   the install row's single 54px band). The install offer used to be a 120px
+   card with a big coral tile and two stacked buttons, which made it the
+   loudest object on every phone screen; see the install section for what it
+   costs the page now, and for the one place the offer reserves its own space. */
 
 .pwa-stack {
   position: fixed;
@@ -16,17 +22,56 @@
      redesign of the player (or a new breakpoint) can never make this chrome
      cover it. The calc() below is the no-measurement fallback. */
   bottom: var(--pwa-bottom, calc(99px + env(safe-area-inset-bottom, 0px)));
-  z-index: 30; /* over the player (20), under every overlay (50+) */
+  z-index: 30; /* base: over the player (20). The update/offline pills lift
+                  above the app's overlays in the rule that follows. */
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 8px;
-  padding: 0 12px;
+  /* the app's own screen gutter, plus the landscape notch insets, so the row
+     lines up with the page's text column instead of floating at its own 12px */
+  padding: 0 calc(var(--gutter, 17px) + var(--sar, 0px)) 0 calc(var(--gutter, 17px) + var(--sal, 0px));
   pointer-events: none;
   font-family: Inter, system-ui, -apple-system, sans-serif;
 }
 
 .pwa-stack > * { pointer-events: auto; }
+
+/* The two pills that carry news the user has to act on — "New version
+   available · Refresh" and "You're offline" — cannot stay at the base 30.
+   Every app overlay is `--z-overlay` (50) with `position: fixed; inset: 0`, and
+   `.now-modal` is a full-screen opaque panel on a phone: while the Now Playing
+   sheet is open — which is whenever a phone user is actually listening — both
+   pills were painted underneath it, invisible, and a thumb where Refresh sits
+   hit the scrim and closed the sheet instead of reloading. One above the
+   overlay is still below `--z-menu` (60) and `--z-toast` (80), so a real menu or
+   toast still covers them, and `pointer-events` above leaves the rest of the
+   fixed row transparent to the sheet underneath. `:has()` scopes the lift to
+   those two kinds (install and the chin notice stay where they were); a browser
+   without `:has()` drops the whole rule and keeps 30, which is today's
+   behaviour rather than a new failure. */
+.pwa-stack:has(.pwa-pill[data-kind="update"]),
+.pwa-stack:has(.pwa-pill[data-kind="offline"]) {
+  z-index: calc(var(--z-overlay, 50) + 1);
+}
+
+/* ── material ────────────────────────────────────────────────────────────
+   One warm charcoal material for every piece of install chrome, expressed
+   through the app's own surface tokens so a change there moves this with it.
+   The literals are fallbacks: this file stays correct on its own, exactly as
+   the note at the top promises. */
+.pwa-stack,
+.pwa-sheet-backdrop {
+  --pwa-surface: var(--panel, #1e1b18);
+  --pwa-surface-raised: var(--card, #24211d);
+  --pwa-ink: var(--white, #faf7f3);
+  --pwa-ink-2: var(--text-2, #cdc8c2);
+  --pwa-ink-3: var(--muted, #a8a29c);
+  --pwa-line: var(--line-2, rgba(255, 255, 255, 0.11));
+  --pwa-lift: var(--shadow-2, 0 12px 32px rgba(0, 0, 0, 0.45));
+  /* a sleeve sits on the surface rather than floating in it */
+  --pwa-sleeve-ring: 0 0 0 1px var(--line-2, rgba(255, 255, 255, 0.11));
+}
 
 @media (max-width: 1080px) {
   .pwa-stack { bottom: var(--pwa-bottom, calc(94px + env(safe-area-inset-bottom, 0px))); }
@@ -42,14 +87,20 @@
   display: flex;
   align-items: center;
   gap: 9px;
+  /* a landscape notch squeezes the row from the sides, so the width follows
+     the padded content box, not the viewport */
   max-width: min(440px, calc(100vw - 24px));
+  max-width: min(440px, 100%);
   min-height: 40px;
   padding: 4px 6px 4px 14px;
-  border: 1px solid #ffffff1f;
-  border-radius: 999px;
-  background: #201d22f2;
-  color: #f4f0ec;
-  box-shadow: 0 12px 34px #00000080;
+  border: 1px solid var(--pwa-line);
+  border-radius: var(--r-pill, 999px);
+  /* Opaque first, then the frosted version: a browser without color-mix()
+     keeps the solid warm charcoal instead of dropping the background. */
+  background: var(--pwa-surface);
+  background: color-mix(in srgb, var(--pwa-surface) 96%, transparent);
+  color: var(--pwa-ink);
+  box-shadow: var(--pwa-lift);
   font-size: 12px;
   font-weight: 700;
   line-height: 1.25;
@@ -76,18 +127,18 @@
 }
 
 .pwa-pill[data-tone="offline"] .pwa-pill-dot {
-  background: #eab369;
+  background: var(--warn, #eab369);
   box-shadow: 0 0 0 3px #eab36929;
 }
 
 .pwa-pill[data-tone="online"] .pwa-pill-dot {
-  background: #7ed3a2;
+  background: var(--ok, #7ed3a2);
   box-shadow: 0 0 0 3px #7ed3a229;
 }
 
 /* the bottom-edge self-check: amber, and its numbers must line up */
 .pwa-pill[data-tone="warn"] .pwa-pill-dot {
-  background: #eab369;
+  background: var(--warn, #eab369);
   box-shadow: 0 0 0 3px #eab36929;
 }
 .pwa-pill[data-tone="warn"] .pwa-pill-text {
@@ -103,9 +154,9 @@
 .pwa-pill[data-kind="install"] .pwa-pill-action {
   padding: 0 14px;
   background: var(--accent, #ff997b);
-  color: #251914;
+  color: var(--accent-ink, #251914);
 }
-.pwa-pill[data-kind="install"] .pwa-pill-action:hover { background: #ffab92; }
+.pwa-pill[data-kind="install"] .pwa-pill-action:hover { background: var(--accent-2, #ffab92); }
 
 .pwa-pill-action,
 .pwa-pill-dismiss {
@@ -113,7 +164,8 @@
   align-items: center;
   justify-content: center;
   flex: none;
-  min-height: 32px;
+  min-height: 44px;
+  min-width: 44px;
   padding: 0 12px;
   border: 0;
   border-radius: 999px;
@@ -123,14 +175,12 @@
   font-size: 12px;
   font-weight: 800;
   cursor: pointer;
-  /* Grow the hit area to 44px without making the pill itself chunky. */
-  margin-block: -6px;
 }
 
 .pwa-pill-dismiss {
-  width: 32px;
+  width: 44px;
   padding: 0;
-  color: #a8a4ac;
+  color: var(--pwa-ink-3);
   font-size: 15px;
   font-weight: 600;
 }
@@ -140,68 +190,114 @@
 
 .pwa-pill-action:active { transform: scale(0.97); }
 
-/* ── install banner ────────────────────────────────────────────────────── */
-
+/* ── install chrome: one compact row ─────────────────────────────────────
+   The offer used to be a card: a 38px coral app tile, two stacked 44px buttons
+   in a column of their own, and a second line of copy. On a 390px phone that
+   measured 120px tall and floated over the page — the loudest object on every
+   screen, and a lid over the last station or library row. It is now a single
+   54px band (capped at 56px): a 26px sleeve mark, one line of text, one primary
+   action, one quiet dismiss, all on one baseline just above the player. */
 .pwa-banner {
+  position: relative;
   display: flex;
   align-items: center;
-  gap: 12px;
-  width: min(440px, calc(100vw - 24px));
-  padding: 12px;
-  border: 1px solid #ffffff22;
-  border-radius: 16px;
-  background: linear-gradient(148deg, #2b252b 0%, #1a191e 100%);
-  box-shadow: 0 20px 52px #000000a6, inset 0 1px #ffffff14;
-  color: #f4f0ec;
+  gap: 9px;
+  /* The app's gutter is the row's gutter (.pwa-stack pads by it). Height is the
+     sum of its parts and is checked by test/ux.test.js: 44px controls + 4px
+     padding + 1px border = 54px, under the contract's 56px cap. The controls
+     are 44px for real — a real box, not a pseudo-element grown hit area —
+     because a hit box has to be the box the finger lands on. */
+  width: min(440px, 100%);
+  min-height: 44px;
+  max-height: 56px;
+  padding: 4px 4px 4px 10px;
+  border: 1px solid var(--pwa-line);
+  border-radius: var(--r-md, 16px);
+  /* warm charcoal, lit from above — the same material as the app's own
+     floating surfaces, not a second palette. */
+  background: linear-gradient(180deg, var(--pwa-surface-raised) 0%, var(--pwa-surface) 72%);
+  box-shadow: var(--pwa-lift), inset 0 1px rgba(255, 255, 255, 0.06);
+  color: var(--pwa-ink);
   animation: pwa-rise 240ms cubic-bezier(0.22, 0.68, 0.18, 1);
 }
 
+/* The mark is a sleeve, not a tile: 26px, --r-cover, one hairline ring. Small
+   enough that the row reads as text first — the coral plate is a signpost for
+   "this is sonora", not the loudest shape on the screen. */
 .pwa-banner-art {
   flex: none;
-  width: 38px;
-  height: 38px;
-  border-radius: 11px;
-  box-shadow: 0 6px 18px #ff997b2e;
-  transform: rotate(-4deg);
+  width: 26px;
+  height: 26px;
+  aspect-ratio: 1;
+  object-fit: cover;
+  border-radius: var(--r-cover, var(--r-xs, 8px));
+  box-shadow: 0 0 0 1px var(--pwa-line), 0 3px 10px rgba(0, 0, 0, 0.34);
 }
 
-.pwa-banner-body { flex: 1; min-width: 0; }
+/* One line of copy, one line only. The explanatory sentence pwa.js renders
+   stays in the DOM for screen readers (and is still announced, the row's
+   accessible name is the title) but would otherwise cost two more lines. */
+.pwa-banner-body {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  flex: 1 1 auto;
+  min-width: 0;
+}
 
 .pwa-banner-title {
   margin: 0;
+  overflow: hidden;
   font-family: "Inter Display", Inter, system-ui, sans-serif;
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 800;
-  letter-spacing: -0.015em;
-  color: #f8f5f2;
+  letter-spacing: -0.012em;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--pwa-ink);
 }
 
+/* Visually hidden, not removed: "one tap from your home screen — full screen,
+   works offline" is worth a screen reader's attention and nothing else's. */
 .pwa-banner-text {
-  margin: 3px 0 0;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
   font-size: 11.5px;
-  font-weight: 500;
   line-height: 1.45;
-  color: #a9a5ad;
+  color: var(--pwa-ink-3);
 }
 
+/* Install and Not now, side by side on the row's centre line. */
 .pwa-banner-actions {
   display: flex;
-  flex-direction: column;
-  align-items: stretch;
-  gap: 6px;
+  align-items: center;
+  gap: 2px;
   flex: none;
 }
 
+/* Both actions are 44px tall and at least 44px wide: the tap target is the
+   box the finger lands on, so it is the box that is big. The row stays under
+   56px because the padding gives way, not the control. */
 .pwa-banner-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-height: 44px; /* touch target, per the UX spec */
-  padding: 0 15px;
+  min-height: 44px;
+  min-width: 44px;
+  margin: 0;
+  padding: 0 13px;
   border: 1px solid transparent;
-  border-radius: 999px;
+  border-radius: var(--r-pill, 999px);
   background: transparent;
-  color: #d8d4da;
+  color: var(--pwa-ink-2);
   font: inherit;
   font-family: Inter, system-ui, sans-serif;
   font-size: 12px;
@@ -213,14 +309,62 @@
 
 .pwa-banner-btn.primary {
   background: var(--accent, #ff997b);
-  color: #251914;
+  color: var(--accent-ink, #251914);
 }
 
-.pwa-banner-btn.primary:hover { background: #ffab92; }
-.pwa-banner-btn.primary:active { transform: scale(0.98); }
+.pwa-banner-btn.primary:hover { background: var(--accent-2, #ffab92); }
+.pwa-banner-btn.primary:active { transform: scale(0.97); }
 
-.pwa-banner-btn.ghost { border-color: #ffffff26; color: #c5c1c9; }
-.pwa-banner-btn.ghost:hover { background: #ffffff12; color: #f4f0ec; }
+/* "Not now" is a dismiss, so it is a word, not a second button: muted ink, no
+   border, and it only gains a surface under the pointer or the focus ring. */
+.pwa-banner-btn.ghost { padding: 0 10px; color: var(--pwa-ink-3); font-weight: 700; }
+.pwa-banner-btn.ghost:hover { background: rgba(255, 255, 255, 0.08); color: var(--pwa-ink); }
+.pwa-banner-btn.ghost:active { transform: scale(0.97); }
+
+/* ── the row pays for its own height ─────────────────────────────────────
+   Even at 54px the band floats over the bottom of the page's scroll area, and
+   on a phone that is exactly where the last station row or library card lands
+   at full scroll. So for as long as an install offer exists, the scroll
+   container is given that band (row + the player gap + its ring) back as real
+   space: no row is ever left under the chrome. pwa.js removes the node on
+   Install, on "Not now" and on the 14-day snooze, and the padding leaves with
+   it — a dismissed offer costs the page nothing.
+
+   This is the one selector in this file that is not a `.pwa-*` class, and it
+   is why: app.css is not this file's to edit. It reserves that space from the
+   scroll *viewport* (margin), not from the end of the scroll *content*
+   (padding). Padding only helps a page that already overflows; on a short page
+   — two station rows, the first radio card row — the band still sliced the
+   last live line, which is exactly the case this rule exists to prevent.
+   Shrinking the scroller puts the band in space no content can occupy, at any
+   page length. Browsers without :has() drop the rule and keep the float. */
+:root:has(.pwa-banner) .main { padding-bottom: 58px; }
+
+/* The desktop offer is the same thing at notification weight, and it is a
+   `.pwa-pill` rather than a `.pwa-banner`, so it needs the same reservation —
+   it used to float over the top of the third card in the radio grid. The pill
+   sits higher above the player than the band does, hence the roomier figure. */
+@media (min-width: 651px) {
+  :root:has(.pwa-pill) .main { padding-bottom: 72px; }
+}
+
+/* …and on any screen tall enough to afford the space, reserve it from the
+   scroll viewport itself so the band can never sit on a rendered row either.
+   The 700px floor is not arbitrary: at 320x568 shrinking the scroller robs the
+   hero of its height and pushes its footer under the player, so the short-screen
+   behaviour stays "scroll clear" and tall screens get "never covered". */
+@media (min-height: 700px) {
+  :root:has(.pwa-banner) .main { margin-bottom: 58px; padding-bottom: 0; }
+  @media (min-width: 651px) {
+    :root:has(.pwa-pill) .main { margin-bottom: 72px; padding-bottom: 0; }
+  }
+}
+
+/* On a wide screen the band is a pill, so it must also stop straddling the
+   content/rail boundary: it ends where the player's right cluster ends. */
+@media (min-width: 651px) {
+  .pwa-stack { right: calc(var(--rail-w, 0px) + var(--chrome-gutter, 24px)); }
+}
 
 /* ── iOS "Add to Home Screen" sheet ────────────────────────────────────── */
 
@@ -233,7 +377,8 @@
   justify-content: center;
   padding: calc(16px + env(safe-area-inset-top, 0px)) 16px
     calc(16px + env(safe-area-inset-bottom, 0px));
-  background: #08080bbf;
+  /* warm, near-black scrim: the page behind cools down instead of going blue */
+  background: rgba(11, 9, 7, 0.76);
   -webkit-backdrop-filter: blur(16px);
   backdrop-filter: blur(16px);
   animation: pwa-fade 160ms ease-out;
@@ -246,11 +391,11 @@
   max-height: calc(100dvh - 32px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
   overflow: auto;
   padding: 22px;
-  border: 1px solid #ffffff26;
-  border-radius: 22px;
-  background: linear-gradient(160deg, #2b242b 0%, #17171c 100%);
-  box-shadow: 0 34px 90px #000000b3, inset 0 1px #ffffff14;
-  color: #f4f0ec;
+  border: 1px solid var(--pwa-line);
+  border-radius: var(--r-lg, 22px);
+  background: linear-gradient(160deg, var(--pwa-surface-raised) 0%, var(--pwa-surface) 100%);
+  box-shadow: var(--shadow-3, 0 28px 80px rgba(0, 0, 0, 0.55)), inset 0 1px rgba(255, 255, 255, 0.08);
+  color: var(--pwa-ink);
   animation: pwa-pop 240ms cubic-bezier(0.22, 0.68, 0.18, 1);
 }
 
@@ -265,9 +410,11 @@
   flex: none;
   width: 44px;
   height: 44px;
-  border-radius: 13px;
+  aspect-ratio: 1;
+  object-fit: cover;
+  border-radius: var(--r-cover, var(--r-xs, 8px));
   transform: rotate(-4deg);
-  box-shadow: 0 8px 22px #ff997b2e;
+  box-shadow: var(--pwa-sleeve-ring), 0 8px 22px rgba(0, 0, 0, 0.42);
 }
 
 .pwa-sheet-title {
@@ -283,7 +430,7 @@
   margin: 0;
   font-size: 12px;
   line-height: 1.55;
-  color: #a9a5ad;
+  color: var(--pwa-ink-3);
 }
 
 .pwa-sheet-close {
@@ -295,14 +442,14 @@
   margin: -8px -8px 0 auto;
   border: 0;
   border-radius: 50%;
-  background: #ffffff14;
-  color: #f4f0ec;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--pwa-ink);
   font: inherit;
   font-size: 14px;
   cursor: pointer;
 }
 
-.pwa-sheet-close:hover { background: #ffffff24; }
+.pwa-sheet-close:hover { background: rgba(255, 255, 255, 0.14); }
 
 .pwa-steps {
   display: grid;
@@ -393,19 +540,21 @@
   }
 }
 
+/* 320px phones: the same row, tightened. The sleeve mark stays (it is what
+   makes the row sonora's) and the word "Not now" loses padding, not meaning. */
 @media (max-width: 360px) {
-  .pwa-banner-art { display: none; }
-  .pwa-banner { gap: 10px; }
+  .pwa-banner { gap: 8px; padding: 4px 4px 4px 8px; }
+  .pwa-banner-btn { padding: 0 11px; font-size: 11.5px; }
+  .pwa-banner-btn.ghost { padding: 0 8px; }
   .pwa-pill { font-size: 11px; }
 }
 
-/* Landscape phones: the banner would eat half the screen. Keep the one-line
-   offer, drop the explanatory line, and lay the actions out side by side. */
+/* Landscape phones: the row is already one line, so it only needs to be
+   shorter than the nav it sits above. Both art dimensions move together — a
+   sleeve that changes width but not height is a squashed sleeve. */
 @media (max-height: 480px) {
-  .pwa-banner { padding: 8px 10px; gap: 10px; }
-  .pwa-banner-text { display: none; }
-  .pwa-banner-actions { flex-direction: row; }
-  .pwa-banner-art { width: 32px; height: 32px; border-radius: 9px; }
+  .pwa-banner { padding: 4px 4px 4px 8px; gap: 8px; }
+  .pwa-banner-art { width: 22px; height: 22px; }
 }
 
 @keyframes pwa-sheet-up {
@@ -429,6 +578,32 @@
     padding-right: calc(20px + var(--sar, 0px));
   }
   .pwa-pill { align-self: flex-end; }
+}
+
+/* On a phone the offer is part of the player stack, not a card on the glass.
+   A 54px rounded card floating 148px up the screen covered whatever row was
+   under it and read as a second design language. Flush to the edges, on the
+   player's own surface, with a hairline instead of a shadow, it docks: the
+   eye reads one bottom stack (offer → player → nav) instead of three layers. */
+@media (max-width: 650px) {
+  .pwa-stack {
+    padding-left: 0;
+    padding-right: 0;
+    gap: 0;
+  }
+  .pwa-banner {
+    width: 100%;
+    max-width: none;
+    border-radius: 0;
+    border-left: 0;
+    border-right: 0;
+    border-bottom: 0;
+    padding: 2px 8px 2px var(--gutter, 17px);
+    background: var(--panel, #191a1f);
+    box-shadow: inset 0 1px var(--line, rgba(255, 255, 255, 0.075));
+  }
+  /* the band now sits directly on the player, so its own lift is wrong */
+  .pwa-banner::after { display: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {

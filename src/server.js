@@ -1,4 +1,5 @@
 import Fastify from 'fastify';
+import compress from '@fastify/compress';
 import fastifyStatic from '@fastify/static';
 import fastifyCookie from '@fastify/cookie';
 import rateLimit from '@fastify/rate-limit';
@@ -34,17 +35,19 @@ import {
   listRoomsForUser, signGuest, readGuest,
   followArtist, unfollowArtist, listFollows, isFollowing,
   listNotifications, countUnread, markNotificationsRead, markAllNotificationsRead,
-  pruneNotifications,
+  pruneNotifications, transaction, pruneExpiredCache, pruneOrphanCache, touchUserSeen,
+  prunePlays,
 } from './db.js';
 import {
   RoomError, ROOM_CODE, createRoom, joinRoom, leaveRoom, endRoom, updateRoom,
   inviteUser, uninviteUser, peopleFor, applyCommand, openStream, memberRoster,
   viewRoom, expireRooms, roomPreview, publicSnapshot, guestStreamAllowed,
+  transferHost, touchRoomPresence,
 } from './rooms.js';
 import {
   rankSeeds, buildStation, stationName, stationBlurb, rotateSeeds, rotateArtists,
   rejectedBySkip, planPage, withLane, artistKeyOf, STATION_LIMIT, EXTEND_LIMIT,
-  MAX_PER_ARTIST, MAX_PER_SEED_ARTIST,
+  normalizeStationCursor, advanceStationCursor,
 } from './station.js';
 import { songKey, cardMetadata } from './search-rank.js';
 import { checkArtist, pollFollows } from './follows.js';
@@ -58,9 +61,16 @@ import {
   ensureAudio, cachedAudio, pruneCache, pruneCacheTo, clearCache, removeCachedAudio,
   cacheStats, runProcess, ytdlpBin, ytdlpExtraArgs,
 } from './audio.js';
+// The queue as one continuous stream: the only playback shape that survives an
+// iPhone locking its screen (see src/queue-stream.js).
+import {
+  planQueueStream, getPlan, openQueueStream, attachSession, getSession,
+  sessionNow, playlistFor, readSegment, closeSession, windowSeqs, seqAt,
+  ensureSegments, ensureSegment, noteSegmentFetch, maybeReposition,
+} from './queue-stream.js';
 import {
   parseNetscape, parseAny, inspectJar, saveJar, clearJar, restoreJar, jarStatus,
-  activeCookiesPath, dbGet, decrypt,
+  activeCookiesPath,
 } from './cookies.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -68,6 +78,95 @@ const PUBLIC = path.join(__dirname, '..', 'public');
 const VIDEO_ID = /^[A-Za-z0-9_-]{11}$/;
 const COOKIE = 'sonora_session';
 const startedAt = new Date();
+
+// ── process-owned work ──────────────────────────────────────────────────
+// A response finishing does not mean the work it started has finished. Own every
+// detached promise here, so shutdown can stop scheduling new work, cancel jobs
+// through their module's own AbortSignal, and give their cleanup a bounded grace
+// period before SQLite closes. Request-owned jobs use the same registry: they are
+// drained too, but only detached jobs are cancelled while their responses may
+// already have completed.
+const schedulerHandles = new Set();
+const jobs = new Set();
+let closing = false;
+
+function trackJob(label, work, { detached = false, cancel = null } = {}) {
+  if (closing) return null;
+  const job = { label, detached, cancel, promise: null };
+  // Starting in a microtask adds the job to the registry before user code can
+  // throw and also turns a synchronous throw into a normal, observed rejection.
+  job.promise = Promise.resolve().then(work);
+  jobs.add(job);
+  const settled = () => { jobs.delete(job); };
+  job.promise.then(settled, settled);
+  return job;
+}
+
+function trackDetached(label, work, options = {}) {
+  return trackJob(label, work, { ...options, detached: true });
+}
+
+function schedulePeriodic(work, intervalMs) {
+  const handle = setInterval(work, intervalMs);
+  handle.unref?.();
+  schedulerHandles.add(handle);
+  return handle;
+}
+
+function stopSchedulers() {
+  for (const handle of schedulerHandles) clearInterval(handle);
+  schedulerHandles.clear();
+}
+
+/** Cancel detached subscribers, then await every tracked job for a finite time. */
+async function drainJobs() {
+  stopSchedulers();
+  for (const job of jobs) {
+    if (!job.detached || !job.cancel) continue;
+    try { job.cancel(); } catch (err) {
+      console.warn(`[sonora] could not cancel ${job.label}:`, err?.message ?? err);
+    }
+  }
+  if (!jobs.size) return;
+
+  const pending = [...jobs];
+  let timer;
+  const expired = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(false), 2500);
+    timer.unref?.();
+  });
+  const drained = Promise.allSettled(pending.map((job) => job.promise)).then(() => true);
+  const complete = await Promise.race([drained, expired]);
+  clearTimeout(timer);
+  if (!complete) {
+    // The caller exits synchronously after closing SQLite when this deadline is
+    // exceeded. An uncancellable upstream promise therefore cannot wake up and
+    // write to a closing database; the media/follows modules still need a native
+    // cancellation API if such work is ever meant to be reusable after shutdown.
+    console.warn('[sonora] background job drain timed out:', pending
+      .filter((job) => jobs.has(job)).map((job) => job.label).join(', '));
+  }
+}
+
+/**
+ * A route-independent security classification for one request target.
+ *
+ * Fastify routes a percent-encoded `/%61pi/me` to `/api/me`, and Node also
+ * accepts the absolute-form target `http://host/api/me`. Looking only at the raw
+ * request target made both spellings invisible to the API limiter and no-store
+ * hook. Parse origin/absolute forms, then decode the path once for both
+ * decisions. Malformed targets fail closed: an unknown route may lose the static
+ * cache/rate-limit exemption, but an API route cannot silently bypass them.
+ */
+function isApiRequest(req) {
+  const raw = String(req.raw?.url ?? req.url ?? '');
+  try {
+    const pathname = decodeURIComponent(new URL(raw, 'http://local').pathname);
+    return pathname.startsWith('/api/');
+  } catch {
+    return true;
+  }
+}
 
 /**
  * The set of *songs* (not just video ids) this user has refused.
@@ -80,37 +179,139 @@ function dislikedSongKeys(userId) {
   const keys = new Set();
   for (const t of listDislikes(userId)) {
     if (!t.title) continue;
-    const key = songKey({ title: t.title, channel: t.channel, itemType: 'song' });
-    if (key) keys.add(key);
+    // The *same* key function the recommendations are filtered with. A dislike
+    // stores the raw upload title ("Radiohead - Creep (Official Video)"), while
+    // a candidate row is a video whose title gets parsed by songKey() into
+    // "creep|radiohead"; keying the dislike as an already-parsed song meant the
+    // two never collided, so "fewer like this" looked ignored on re-uploads.
+    // Both shapes are recorded: the parsed one for video rows, the explicit
+    // song one for catalogue rows that arrive without an artist credit.
+    const parsed = songKey({ title: t.title, channel: t.channel });
+    const explicit = songKey({ title: t.title, channel: t.channel, itemType: 'song' });
+    if (parsed) keys.add(parsed);
+    if (explicit) keys.add(explicit);
   }
   return keys;
 }
 
 /**
  * The personal station is built from this user's listening, likes and dislikes,
- * so any change to those inputs must drop the cached queue. Without this a
- * disliked track would keep playing until the ten-minute cache expired.
+ * so any change to those inputs must drop the cached queue. The epoch also
+ * invalidates work already in flight: deleting a cache row alone lets an older
+ * slow build return its evidence and write it straight back after the delete.
+ *
+ * Kept synchronous and one-argument for every mutation route, including the
+ * admin clear-history handoff. Once this returns, older attempts cannot publish.
  */
+const STATION_EPOCHS = new Map();
+const STATION_EPOCHS_MAX = 512;
+function stationEpoch(userId) {
+  return STATION_EPOCHS.get(userId) ?? 0;
+}
 function invalidateStation(userId) {
+  const next = stationEpoch(userId) >= Number.MAX_SAFE_INTEGER ? 0 : stationEpoch(userId) + 1;
+  if (STATION_EPOCHS.size >= STATION_EPOCHS_MAX && !STATION_EPOCHS.has(userId)) {
+    let drop = Math.ceil(STATION_EPOCHS_MAX / 3);
+    for (const id of STATION_EPOCHS.keys()) {
+      if (drop-- <= 0) break;
+      STATION_EPOCHS.delete(id);
+    }
+  }
+  STATION_EPOCHS.set(userId, next);
   cacheDeletePrefix(`station:${userId}:`);
+}
+
+/**
+ * Request-boundary input rules shared by the library routes. `null` is an
+ * omitted optional number (the client uses it when media metadata is unknown),
+ * but strings, fractions, negatives and values outside SQLite's exact JS integer
+ * range are not silently rounded or clamped into a different user instruction.
+ */
+function optionalDurationValid(value) {
+  return value === undefined || value === null
+    || (Number.isSafeInteger(value) && value >= 0);
+}
+
+function optionalBooleanValid(body, field) {
+  return body?.[field] === undefined || typeof body[field] === 'boolean';
+}
+
+function positiveSafeId(value) {
+  const raw = String(value ?? '');
+  if (!/^[1-9]\d*$/.test(raw)) return null;
+  const id = Number(raw);
+  return Number.isSafeInteger(id) ? id : null;
 }
 
 /**
  * Track metadata a write may carry, so the server can remember a track it has
  * never seen. Liking a song opened from a share link used to store a like with
  * no title, which made that song invisible to the station *and* to the library.
+ *
+ * `tracks` is the shared catalogue, not the current user's private copy. Never
+ * upsert browser-supplied metadata over a row another user may already see.
  */
 function rememberFromBody(videoId, b = {}) {
+  if (getTrack(videoId)) return;
   const title = typeof b.title === 'string' ? b.title.slice(0, 200).trim() : '';
   if (!title) return;
   upsertTrack({
     videoId,
     title,
     channel: typeof b.channel === 'string' ? b.channel.slice(0, 200) : null,
+    channelId: typeof b.channelId === 'string' ? b.channelId.slice(0, 80) : null,
     thumb: typeof b.thumb === 'string' ? b.thumb.slice(0, 500) : null,
-    durationS: Number.isFinite(b.durationS) ? Math.round(b.durationS) : null,
+    durationS: b.durationS ?? null,
   });
 }
+
+// ── hot-path statements ─────────────────────────────────────────────────
+// db.prepare() compiles SQL, so calling it inside a handler pays that cost on
+// every single request. These are the statements the per-request path uses
+// (session lookup, the shared player-state row, the stats header), compiled
+// once here instead of once per request.
+const SQL = {
+  userById: db.prepare(`
+    SELECT id, name, role, disabled, session_version FROM users WHERE id = ?
+  `),
+  userCount: db.prepare('SELECT COUNT(*) AS n FROM users'),
+  playerState: db.prepare('SELECT state, updated_at FROM player_state WHERE user_id = ?'),
+  savePlayerState: db.prepare(`
+    INSERT INTO player_state (user_id, state, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at
+  `),
+  // The pre-write depth of one track. A progress heartbeat invalidates only
+  // when it crosses the station's 60% eligibility threshold, not on every tick.
+  stationDepth: db.prepare(`
+    SELECT MAX(CASE WHEN duration_ms > 0 AND position_ms IS NOT NULL
+                    THEN MIN(1.0, CAST(position_ms AS REAL) / duration_ms)
+                    ELSE 0 END) AS deepest
+    FROM plays WHERE user_id = ? AND video_id = ?
+      AND kind IN ('start','progress','complete','skip')
+  `),
+  stats: db.prepare(`
+    SELECT
+      COUNT(*) FILTER (WHERE kind = 'start')  AS starts,
+      COUNT(*) FILTER (WHERE kind = 'complete') AS completes,
+      COUNT(*) FILTER (WHERE kind = 'skip')   AS skips
+    FROM plays WHERE user_id = ? AND kind IN ('start','complete','skip')
+  `),
+  likeCount: db.prepare('SELECT COUNT(*) AS n FROM likes WHERE user_id = ?'),
+  likePresent: db.prepare('SELECT 1 AS present FROM likes WHERE user_id = ? AND video_id = ?'),
+  dislikePresent: db.prepare('SELECT 1 AS present FROM dislikes WHERE user_id = ? AND video_id = ?'),
+  playlistOwned: db.prepare('SELECT id FROM playlists WHERE id = ? AND user_id = ?'),
+  playlistItem: db.prepare('SELECT 1 AS present FROM playlist_items WHERE playlist_id = ? AND video_id = ?'),
+  updateDeviceOnLogin: db.prepare(`
+    UPDATE devices SET name = ?, platform = COALESCE(?, platform), user_agent = ?,
+      last_seen_at = ?, last_login_at = ?, last_ip = ?, remembered = ?
+    WHERE id = ?
+  `),
+  // Rotation chain lookup: `replaced_by` records the successor's *token hash*,
+  // not its row id (see consumeRefreshToken), so the grace window walks the
+  // chain by hash.
+  refreshByHash: db.prepare('SELECT * FROM refresh_tokens WHERE token_hash = ?'),
+  deleteChallenge: db.prepare('DELETE FROM webauthn_challenges WHERE id = ? AND kind = ?'),
+};
 
 bootstrapUser();
 // Re-materialise an imported cookie jar so a restart keeps the session.
@@ -128,15 +329,63 @@ await app.register(fastifyCookie);
 // The shell (HTML/CSS/JS/icons) is exempt: one page load fetches a dozen of
 // those, and rate-limiting them turns a few open tabs into a blank page served
 // with 429 to the module loader. Everything under /api/ stays limited.
+//
+// "Exempt" is not "unlimited": the public routes outside /api/ that touch a
+// database or a network — /l/:code, /l/:code/live, /t/:id, /t/:id/art.jpg and
+// /oembed.json — each set their own per-IP limit with `allowList: null`, which
+// replaces this exemption for that route. A route added here that reads upstream
+// or writes state must do the same.
+
+/**
+ * What is worth compressing: the shell's text, CSS, JSON (including the manifest),
+ * JS and SVG.
+ *
+ * An allowlist rather than the plugin's default, because the default gets two
+ * things wrong here. `application/javascript` is *not* in it (and that is how
+ * `@fastify/static` labels `.js` on some installs), and the default's
+ * `octet-stream` arm is how the admin database backup is served. Never
+ * `text/event-stream`: the room SSE stream must not be buffered by a compressor.
+ *
+ * This list is a *narrowing*, not a veto: `@fastify/compress` falls back to
+ * mime-db's own `compressible` flag for any type this says no to, and mime-db
+ * calls `application/octet-stream` compressible. The backup route therefore opts
+ * out with `compress: false` — a gzip-encoded `.db` download is a corrupt backup.
+ */
+const COMPRESSIBLE_TYPES = /^(?:text\/(?!event-stream)|(?:application|text)\/(?:[\w.+-]*\+)?(?:json|xml|javascript)|image\/svg\+xml)/i;
+
 await app.register(rateLimit, {
   max: 600,
   timeWindow: '1 minute',
-  allowList: (req) => !String(req.raw?.url ?? '').startsWith('/api/'),
+  allowList: (req) => !isApiRequest(req),
+});
+// The shell was shipped raw: app.js is ~395 KB and app.css ~182 KB, which is the
+// whole page load on a phone. Registered before @fastify/static so the static
+// routes carry the hook.
+//
+// It must stay off the media paths. `@fastify/compress` skips a 206 itself (a
+// `Content-Range` describes unencoded byte offsets) and the type list above keeps
+// it off `/api/stream`'s `audio/mp4` and the queue stream's `video/mp2t` as well,
+// so a ranged or streamed response is never re-encoded even when a proxy in front
+// advertises `accept-encoding`.
+await app.register(compress, {
+  // Brotli is what a modern browser asks for; gzip covers the rest.
+  encodings: ['br', 'gzip'],
+  // Below this the header and the framing cost more than the bytes saved.
+  threshold: 1024,
+  customTypes: COMPRESSIBLE_TYPES,
+  // Responses only. Nothing here is asked to inflate a request body, and turning
+  // it on would let a 64 KB gzip body (the body limit counts the compressed
+  // bytes) expand into a much larger document before Fastify's JSON parse — a
+  // decompression bomb in exchange for a feature no client uses.
+  globalDecompression: false,
 });
 await app.register(fastifyStatic, {
   root: PUBLIC,
   prefix: '/',
   // The PWA updates by reloading; never let a proxy pin an old bundle.
+  // Never expose repository/deployment files accidentally placed below public/.
+  // `deny` rejects the path whether or not a dotfile actually exists there.
+  dotfiles: 'deny',
   // Note: v10 passes the Fastify reply, not a raw ServerResponse.
   setHeaders: (reply, filePath) => {
     reply.header(
@@ -146,10 +395,63 @@ await app.register(fastifyStatic, {
   },
 });
 
+/**
+ * Does an `If-None-Match` header name this tag? `*`, a list, and the `W/` prefix
+ * are all legal (RFC 9110 §13.1.2) and a browser will send back exactly what it
+ * was given, prefixed with `W/` if it stored it as weak.
+ */
+function etagMatches(header, etag) {
+  if (typeof header !== 'string') return false;
+  const bare = etag.replace(/^W\//, '');
+  return header.split(',').some((part) => {
+    const tag = part.trim().replace(/^W\//, '');
+    return tag === '*' || tag === bare;
+  });
+}
+
+/**
+ * The service worker, with a tag that is its content.
+ *
+ * Every other static file keeps `@fastify/static`'s validator, which is
+ * size+mtime — in a container the mtime is the COPY time, so two builds of the
+ * same size share it and a client gets a 304 for a worker whose bytes changed.
+ * For every other file that is a stale asset; for the worker it is a wedged
+ * update: the browser never installs the new worker, so the app updates
+ * *never* arrive, and nothing in the app can see why.
+ *
+ * Hashing per request rather than at boot is deliberate: a deploy rewrites
+ * public/ under a running process (only src/ is frozen at start), so a boot-time
+ * hash would certify bytes that are no longer on disk. One small file, one read
+ * and one SHA per page load, and the tag always names the bytes just served.
+ */
+app.get('/sw.js', {
+  // A strong tag names one representation, so this route is not compressed: the
+  // same tag must not label both an identity and a gzip body.
+  compress: false,
+}, async (req, reply) => {
+  let body;
+  try {
+    body = await fs.promises.readFile(path.join(PUBLIC, 'sw.js'));
+  } catch {
+    return reply.code(404).send({ error: 'Not found.' });
+  }
+  const etag = `"sw-${crypto.createHash('sha256').update(body).digest('hex').slice(0, 12)}"`;
+  // `no-cache`, not `no-store`: the worker must be revalidated on every check,
+  // and the 304 it gets when nothing changed is the cheap answer.
+  reply.header('cache-control', 'no-cache').header('etag', etag);
+  if (etagMatches(req.headers['if-none-match'], etag)) return reply.code(304).send();
+  return reply.type('text/javascript; charset=utf-8').send(body);
+});
+
 // ── auth ────────────────────────────────────────────────────────────────
 
 const REFRESH_COOKIE = 'sonora_refresh';
+// One cookie per ceremony. A shared name meant a login ceremony started while a
+// registration was open overwrote the registration's challenge cookie, and the
+// registration then failed with "that passkey request expired".
 const CHALLENGE_COOKIE = 'sonora_webauthn';
+const CHALLENGE_COOKIE_REGISTER = 'sonora_webauthn_register';
+const CHALLENGE_COOKIE_LOGIN = 'sonora_webauthn_login';
 
 const trim = (value, max = 200) => {
   const s = typeof value === 'string' ? value.trim() : '';
@@ -159,9 +461,7 @@ const trim = (value, max = 200) => {
 function currentUser(req) {
   const payload = readSession(req.cookies?.[COOKIE]);
   if (!payload) return null;
-  const row = db.prepare(`
-    SELECT id, name, role, disabled, session_version FROM users WHERE id = ?
-  `).get(payload.uid);
+  const row = SQL.userById.get(payload.uid);
   if (!row || row.disabled) return null;
   // Stateless sessions are revoked by bumping session_version. Tokens issued
   // before the column existed are treated as version 1 (the migration default),
@@ -177,6 +477,10 @@ function currentUser(req) {
     // phone's ranged audio requests would be pointless churn.
     if (Date.now() - Date.parse(device.last_seen_at ?? 0) > 5 * 60_000) {
       touchDevice(device.id, { ip: req.ip });
+      // "Last seen" in the admin user list was only ever last *login*; this is
+      // the same write, throttled inside the db helper so it cannot become a
+      // per-request update on the audio path.
+      touchUserSeen(row.id);
     }
     return {
       id: row.id, name: row.name, role: row.role,
@@ -187,8 +491,76 @@ function currentUser(req) {
 }
 
 app.decorateRequest('user', null);
-app.addHook('onRequest', async (req) => {
+app.addHook('onRequest', async (req, reply) => {
+  // Baseline hardening on every response (JSON, HTML and static alike). There is
+  // deliberately no CSP here: the share/listen pages carry inline styles and the
+  // app is an unbundled ES module, so a policy that actually helps is a bigger
+  // change than this pass.
+  reply.header('x-content-type-options', 'nosniff');
+  reply.header('x-frame-options', 'SAMEORIGIN');
+  reply.header('referrer-policy', 'same-origin');
   req.user = currentUser(req);
+});
+
+// Cookies are ambient authority. A cross-origin page must not be able to use a
+// session, refresh, WebAuthn-challenge or room-guest cookie for a state-changing
+// request merely because SameSite happens to permit it (notably sibling sites).
+// Origin is authoritative when present; Fetch Metadata covers modern requests
+// without one. Legacy/non-browser clients with neither remain supported, while
+// the JSON requirement below still excludes every simple HTML form body type.
+const API_MUTATION_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+const JSON_CONTENT_TYPE = /^\s*application\/json\s*(?:;|$)/i;
+
+function hasCredentialCookie(req) {
+  const cookies = req.cookies ?? {};
+  return Boolean(
+    cookies[COOKIE] || cookies[REFRESH_COOKIE] || cookies[CHALLENGE_COOKIE]
+    || cookies[CHALLENGE_COOKIE_REGISTER] || cookies[CHALLENGE_COOKIE_LOGIN]
+    // The guest constant is declared with the listener implementation below;
+    // use its stable wire name here rather than widening this hook's scope.
+    || cookies.sonora_guest
+  );
+}
+
+function requestHasBody(req) {
+  // Transfer-Encoding means a body is possible even before its chunks arrive.
+  // For Content-Length, zero is deliberately exempt: several legitimate room and
+  // auth operations are POSTs with an empty body and no JSON document to declare.
+  if (req.headers['transfer-encoding'] !== undefined) return true;
+  const length = req.headers['content-length'];
+  return length !== undefined && /^\d+$/.test(String(length)) && Number(length) > 0;
+}
+
+app.addHook('preValidation', async (req, reply) => {
+  if (!isApiRequest(req) || !API_MUTATION_METHODS.has(req.method)) return;
+
+  if (hasCredentialCookie(req)) {
+    const site = String(req.headers['sec-fetch-site'] ?? '').toLowerCase();
+    if (site && site !== 'same-origin' && site !== 'none') {
+      return reply.code(403).send({ error: 'Cross-site request refused.' });
+    }
+
+    const origin = req.headers.origin;
+    if (origin !== undefined) {
+      const expected = requestOrigin(req);
+      let actual = null;
+      try {
+        const parsed = new URL(String(origin));
+        if (['http:', 'https:'].includes(parsed.protocol)
+          && !parsed.username && !parsed.password && parsed.pathname === '/'
+          && !parsed.search && !parsed.hash) actual = parsed.origin;
+      } catch {
+        // Handled by the comparison below; never reflect the supplied value.
+      }
+      if (String(origin) === 'null' || !expected || actual !== expected) {
+        return reply.code(403).send({ error: 'Request origin does not match.' });
+      }
+    }
+  }
+
+  if (requestHasBody(req) && !JSON_CONTENT_TYPE.test(String(req.headers['content-type'] ?? ''))) {
+    return reply.code(415).send({ error: 'JSON request body requires Content-Type: application/json.' });
+  }
 });
 
 /**
@@ -198,7 +570,15 @@ app.addHook('onRequest', async (req) => {
  * cache headers below, so only /api/ is swept here.
  */
 app.addHook('onSend', async (req, reply, payload) => {
-  if (!req.url.startsWith('/api/')) return payload;
+  if (!isApiRequest(req)) {
+    // A failed public lookup or an unsafe URL is not a cacheable representation.
+    // This also covers @fastify/static denials and public-route 429 responses;
+    // successful share/art responses keep the explicit policy set by their route.
+    if (reply.statusCode >= 400 && reply.getHeader('cache-control') == null) {
+      reply.header('cache-control', 'no-store');
+    }
+    return payload;
+  }
   // A handler that set its own cache-control made a deliberate decision; this
   // hook runs *after* the route, so it used to silently clobber it with
   // no-store. That broke two things quietly:
@@ -256,24 +636,131 @@ const publicDevice = (d) => (d ? {
   remembered: Boolean(d.remembered),
 } : null);
 
-function baseCookie() {
-  return { httpOnly: true, sameSite: 'lax', secure: !config.isDev, path: '/' };
+/**
+ * The scheme this request actually arrived on.
+ *
+ * `req.protocol` is the honest answer for a direct connection; behind a tunnel it
+ * is only right when the proxy is trusted, which is exactly what
+ * SONORA_TRUST_PROXY says. Shared with rpContext so cookies and passkeys agree
+ * about what the public origin is.
+ */
+function requestProto(req) {
+  // Fastify has already applied the authenticated proxy rule, including the
+  // immediate-peer check. Never read X-Forwarded-Proto directly here: doing so
+  // would trust it even on a direct request from an unlisted address.
+  return lastHop(req?.protocol ?? 'http') || 'http';
+}
+
+/**
+ * The *last* element of a comma-separated proxy header.
+ *
+ * These headers are append-lists: each proxy adds its own view to the end, so
+ * the first element is whatever the *client* sent — free text. Reading `[0]`
+ * therefore let a client pick the scheme and host its own session cookies and
+ * passkey ceremony were bound to (a broken ceremony and a wrong `Secure` flag
+ * rather than account takeover, but both are self-inflicted outages). The last
+ * element is the one the trusted hop in front of us appended, which is the only
+ * hop whose word this process has any reason to take. With a single proxy the
+ * two are the same string, so nothing changes for a normal deployment.
+ */
+function lastHop(value) {
+  return String(value ?? '').split(',').pop().trim();
+}
+
+/**
+ * The request's actual HTTP origin, with no configured share-card override.
+ * Fastify has already decided whether the immediate peer may supply forwarded
+ * host/scheme headers. Parsing the pair as a URL both normalizes default ports
+ * and rejects a Host containing credentials, a path or other URL syntax.
+ */
+function requestOrigin(req) {
+  const proto = requestProto(req).toLowerCase();
+  if (proto !== 'http' && proto !== 'https') return null;
+  const host = String(req?.host ?? req?.headers?.host ?? '');
+  if (!host) return null;
+  try {
+    const url = new URL(`${proto}://${host}`);
+    if (url.username || url.password || url.pathname !== '/' || url.search || url.hash) return null;
+    return url.origin;
+  } catch {
+    return null;
+  }
+}
+
+/** The hostname this request was addressed to, minus any port. */
+function requestHostname(req) {
+  // req.host includes X-Forwarded-Host only when Fastify accepted the peer in
+  // SONORA_TRUST_PROXY; ordinary/direct requests expose the actual Host header.
+  return hostnameOf(String(req?.host ?? req?.headers?.host ?? ''));
+}
+
+// Browsers treat these as secure contexts even over plain HTTP.
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+
+/**
+ * Should this response's cookies carry `Secure`?
+ *
+ * It was `!config.isDev`, i.e. "is a secret configured" — a property of the
+ * deployment, never of the request. A container on a LAN serves http://192.168.x.x
+ * with a secret configured, so every session cookie was Secure and Chrome threw
+ * it away: login answered 200, /api/me answered 401, the form silently reset.
+ * Depending on the request instead gives the right answer on HTTPS, on localhost
+ * (a secure context) and on a plain-HTTP LAN, with SONORA_SECURE_COOKIES for the
+ * setups a request cannot describe.
+ */
+function cookieSecure(req) {
+  if (config.secureCookies === 'always') return true;
+  if (config.secureCookies === 'never') return false;
+  if (requestProto(req) === 'https') return true;
+  const host = requestHostname(req).toLowerCase();
+  return LOOPBACK_HOSTS.has(host) || host.endsWith('.localhost');
+}
+
+function baseCookie(req) {
+  return { httpOnly: true, sameSite: 'lax', secure: cookieSecure(req), path: '/' };
 }
 
 function clearAuthCookies(reply) {
   return reply
     .clearCookie(COOKIE, { path: '/' })
     .clearCookie(REFRESH_COOKIE, { path: '/' })
-    .clearCookie(CHALLENGE_COOKIE, { path: '/' });
+    .clearCookie(CHALLENGE_COOKIE, { path: '/' })
+    .clearCookie(CHALLENGE_COOKIE_REGISTER, { path: '/' })
+    .clearCookie(CHALLENGE_COOKIE_LOGIN, { path: '/' });
 }
 
-function setChallengeCookie(reply, id) {
-  reply.setCookie(CHALLENGE_COOKIE, id, { ...baseCookie(), maxAge: 300 });
+function challengeCookieName(kind) {
+  return kind === 'register' ? CHALLENGE_COOKIE_REGISTER : CHALLENGE_COOKIE_LOGIN;
 }
 
-function setRefreshCookie(reply, { token, expiresAt }) {
+function setChallengeCookie(req, reply, id, kind) {
+  reply.setCookie(challengeCookieName(kind), id, { ...baseCookie(req), maxAge: 300 });
+}
+
+/** Discard the ceremony this browser replaces when it starts another of the same kind. */
+function discardSupersededChallenge(req, kind) {
+  const ids = new Set([
+    req.cookies?.[challengeCookieName(kind)],
+    req.cookies?.[CHALLENGE_COOKIE],
+  ]);
+  for (const id of ids) {
+    if (id) SQL.deleteChallenge.run(id, kind);
+  }
+}
+
+/** A stale body must never clear the cookie belonging to its newer successor. */
+function clearChallengeCookie(req, reply, kind, id) {
+  if (!id) return;
+  const name = challengeCookieName(kind);
+  if (req.cookies?.[name] === id) reply.clearCookie(name, { path: '/' });
+  if (req.cookies?.[CHALLENGE_COOKIE] === id) {
+    reply.clearCookie(CHALLENGE_COOKIE, { path: '/' });
+  }
+}
+
+function setRefreshCookie(req, reply, { token, expiresAt }) {
   const seconds = Math.max(1, Math.floor((new Date(expiresAt).getTime() - Date.now()) / 1000));
-  reply.setCookie(REFRESH_COOKIE, token, { ...baseCookie(), maxAge: seconds });
+  reply.setCookie(REFRESH_COOKIE, token, { ...baseCookie(req), maxAge: seconds });
 }
 
 function inferDeviceName(req) {
@@ -303,11 +790,7 @@ function resolveDevice(req, user, remember) {
   const now = new Date().toISOString();
   const existing = findDeviceByClient(user.id, clientDeviceId);
   if (existing) {
-    db.prepare(`
-      UPDATE devices SET name = ?, platform = COALESCE(?, platform), user_agent = ?,
-        last_seen_at = ?, last_login_at = ?, last_ip = ?, remembered = ?
-      WHERE id = ?
-    `).run(name, platform, userAgent, now, now, ip, remember ? 1 : 0, existing.id);
+    SQL.updateDeviceOnLogin.run(name, platform, userAgent, now, now, ip, remember ? 1 : 0, existing.id);
     return getDevice(existing.id);
   }
   try {
@@ -331,7 +814,7 @@ function resolveDevice(req, user, remember) {
  * the old token *and* hand out its recorded replacement, so issuing a second one
  * here would orphan a live token and break the rotation chain.
  */
-function startSession(reply, user, device, remember, refresh = null) {
+function startSession(req, reply, user, device, remember, refresh = null) {
   const ttlMs = config.sessionMinutes * 60_000;
   const token = signSession({
     uid: user.id,
@@ -340,19 +823,23 @@ function startSession(reply, user, device, remember, refresh = null) {
     exp: Date.now() + ttlMs,
   });
   reply.setCookie(COOKIE, token, {
-    ...baseCookie(),
+    ...baseCookie(req),
     ...(remember ? { maxAge: Math.floor(ttlMs / 1000) } : {}),
   });
   if (remember) {
     const issued = refresh ?? issueRefreshToken({
       deviceId: device.id, userId: user.id, ttlMs: config.refreshDays * 86_400_000,
     });
-    setRefreshCookie(reply, issued);
+    setRefreshCookie(req, reply, issued);
     setDeviceRemembered(device.id, true);
     return issued;
   }
   revokeDeviceTokens(device.id);
   setDeviceRemembered(device.id, false);
+  // A remembered -> session-only sign-in revoked the credential in SQLite but
+  // left its cookie in the browser. The next background refresh then looked like
+  // a theft attempt rather than the user's explicit "forget this device".
+  reply.clearCookie(REFRESH_COOKIE, { path: '/' });
   return null;
 }
 
@@ -366,7 +853,8 @@ function deviceForRefreshCookie(req) {
 // ── WebAuthn / passkey plumbing ─────────────────────────────────────────
 
 function hostnameOf(hostHeader) {
-  const raw = String(hostHeader ?? '').split(',')[0].trim();
+  // Last hop, not first: see lastHop().
+  const raw = lastHop(hostHeader);
   if (!raw) return 'localhost';
   if (raw.startsWith('[')) {
     const end = raw.indexOf(']');
@@ -382,12 +870,18 @@ function hostnameOf(hostHeader) {
  * for localhost and a direct HTTPS reverse proxy.
  */
 function rpContext(req) {
-  const hostHeader = String(req.headers['x-forwarded-host'] ?? req.headers.host ?? '')
-    .split(',')[0].trim() || 'localhost';
-  const proto = String(req.headers['x-forwarded-proto'] ?? req.protocol ?? 'http')
-    .split(',')[0].trim() || 'http';
+  // The forwarded headers are consulted only when the proxy is trusted, same
+  // as req.ip. A client who can set x-forwarded-host themselves would otherwise
+  // poison the RP ID/origin a passkey ceremony is bound to, which is strictly
+  // worse than a mis-scoped-but-honest rpID behind an unconfigured proxy: the
+  // fix for that case is SONORA_TRUST_PROXY=1, not a client-controlled header.
+  // Trusted or not, the value read is the LAST comma-separated element — the one
+  // the hop in front of us appended — never the caller's own (see lastHop()).
+  const hostname = requestHostname(req);
+  const hostHeader = lastHop(req.host ?? req.headers.host) || 'localhost';
+  const proto = requestProto(req);
   return {
-    rpID: config.rpId ?? hostnameOf(hostHeader),
+    rpID: config.rpId ?? hostname,
     origin: config.origin ?? `${proto}://${hostHeader}`,
   };
 }
@@ -410,23 +904,103 @@ function passkeySupport(ctx) {
   return { supported: true, rpID: ctx.rpID, origin: ctx.origin };
 }
 
-function challengeIdFrom(req) {
+function challengeIdFrom(req, kind) {
   const id = trim(req.body?.challengeId, 200);
-  const cookie = req.cookies?.[CHALLENGE_COOKIE];
+  const name = challengeCookieName(kind);
+  // The legacy shared name is still read so a ceremony started before a deploy
+  // (or by an older client) can finish; it is no longer written.
+  const cookie = req.cookies?.[name] ?? req.cookies?.[CHALLENGE_COOKIE];
   if (!id || !cookie || id !== cookie) return null;
   return id;
 }
 
+/**
+ * A stand-in user row for an unknown account name.
+ *
+ * `findUser()` returning null used to short-circuit the password check, so an
+ * unknown name answered in ~0.1 ms and a real one in ~34 ms (one scrypt pass):
+ * the login form was an account oracle. Verifying against a fixed hash spends the
+ * same work either way.
+ */
+const TIMING_DUMMY_USER = {
+  pass_hash: crypto.scryptSync('sonora-timing-dummy', 'sonora-timing-salt', 32).toString('hex'),
+  salt: 'sonora-timing-salt',
+};
+
 // ── auth routes ─────────────────────────────────────────────────────────
+
+/** Match the same exact, case-sensitive spelling as SQLite account lookups. */
+// Preserve SQLite's case-sensitive account identity. Folding these keys joined
+// two distinct accounts (Alice and alice) into one lockout and let failures for
+// either lock out the other.
+const loginKey = (name) => String(name ?? '').trim().slice(0, 200);
+
+// A wrong-passphrase counter that is independent of the client's address.
+//
+// The login route is rate-limited per IP, and with SONORA_TRUST_PROXY=1 that
+// bucket is whatever X-Forwarded-For the client cares to invent — one header per
+// guess. Nothing counted failures *per account*, so the passphrase check was the
+// only cost, and scrypt is synchronous: a few thousand guesses is also a few
+// thousand event-loop stalls. Five free attempts, then an exponential wait
+// (30 s doubling, capped at 15 min) answered as 429 + Retry-After.
+//
+// Deliberately in memory: a restart clears it (restarting is not a brute-force
+// tool), and persisting it would mean a database write on every wrong guess from
+// an unauthenticated route — the cheapest possible way to grow the database
+// remotely. The name is counted whether or not it exists, so the lockout itself
+// says nothing about which accounts are real, and a successful sign-in clears
+// the entry so a person who finally remembers their passphrase is not punished
+// for it.
+const LOGIN_FAIL_FREE = 5;
+const LOGIN_LOCK_BASE_MS = 30_000;
+const LOGIN_LOCK_MAX_MS = 15 * 60_000;
+const LOGIN_FAILURES_MAX = 2048;
+const loginFailures = new Map(); // loginKey(name) → { fails, until }
+
+/** Milliseconds until this name may be attempted again; 0 when it may now. */
+function loginLockedFor(name) {
+  const entry = loginFailures.get(loginKey(name));
+  if (!entry?.until) return 0;
+  const left = entry.until - Date.now();
+  if (left > 0) return left;
+  // The wait is over: the count survives one more window so the schedule keeps
+  // escalating, but the lock itself only lifts once someone tries again.
+  entry.until = 0;
+  return 0;
+}
+
+function noteLoginFailure(name) {
+  const key = loginKey(name);
+  const entry = loginFailures.get(key) ?? { fails: 0, until: 0 };
+  entry.fails += 1;
+  if (entry.fails >= LOGIN_FAIL_FREE) {
+    const step = entry.fails - LOGIN_FAIL_FREE;
+    entry.until = Date.now() + Math.min(LOGIN_LOCK_BASE_MS * 2 ** step, LOGIN_LOCK_MAX_MS);
+  }
+  // Bounded: an anonymous client posting a fresh name every second must not be
+  // able to grow this map without limit.
+  if (!loginFailures.has(key) && loginFailures.size >= LOGIN_FAILURES_MAX) {
+    loginFailures.delete(loginFailures.keys().next().value);
+  }
+  loginFailures.set(key, entry);
+}
+
+function clearLoginFailures(name) {
+  loginFailures.delete(loginKey(name));
+}
 
 app.get('/api/auth/capabilities', async (req) => {
   const ctx = rpContext(req);
-  const hasUsers = db.prepare('SELECT COUNT(*) AS n FROM users').get().n > 0;
+  const hasUsers = SQL.userCount.get().n > 0;
   return {
     hasUsers,
     passkeys: passkeySupport(ctx),
     sessionMinutes: config.sessionMinutes,
     refreshDays: config.refreshDays,
+    // Whether this *request* would receive Secure cookies. Derived, not
+    // configured, so a client can explain "sign-in did nothing" on a plain-HTTP
+    // LAN instead of silently dropping the session.
+    cookies: { secure: cookieSecure(req), mode: config.secureCookies },
   };
 });
 
@@ -438,18 +1012,35 @@ app.post('/api/auth/login', {
   // "session lost" in an unrelated test three cases later.
   config: { rateLimit: { max: config.loginRateMax, timeWindow: config.loginRateWindow } },
 }, async (req, reply) => {
-  const name = String(req.body?.name ?? config.bootstrapUser).trim();
+  // Clamped like every other user-supplied string: the body limit bounds the
+  // size, but a 64 KB name would still be hashed and looked up for nothing.
+  const name = String(req.body?.name ?? config.bootstrapUser).trim().slice(0, 200);
+  // Per-account lockout, keyed by the name that was *attempted* whether or not
+  // it exists (see LOGIN_FAIL_FREE): the IP bucket above is free to rotate with
+  // X-Forwarded-For, so it cannot be the only defence against a dictionary run
+  // on one account. Checked before the scrypt spend, and answered with
+  // Retry-After rather than a silent 401 so a locked-out human knows to wait.
+  const lockMs = loginLockedFor(name);
+  if (lockMs) {
+    reply.header('retry-after', String(Math.ceil(lockMs / 1000)));
+    return reply.code(429).send({ error: 'Too many wrong attempts for this account. Try again shortly.' });
+  }
   const pass = String(req.body?.passphrase ?? '');
   const user = findUser(name);
-  if (!user || !pass || !verifyPassword(user, pass)) {
+  // Same scrypt cost for an unknown name (see TIMING_DUMMY_USER): the response
+  // must not say which half of the pair was wrong, in words or in timing.
+  const passOk = verifyPassword(user ?? TIMING_DUMMY_USER, pass || ' ');
+  if (!user || !pass || !passOk) {
+    noteLoginFailure(name);
     return reply.code(401).send({ error: 'Wrong name or passphrase.' });
   }
+  clearLoginFailures(name);
   if (user.disabled) {
     return reply.code(403).send({ error: 'This account has been disabled by an administrator.' });
   }
   const remember = req.body?.remember === true;
   const device = resolveDevice(req, user, remember);
-  startSession(reply, user, device, remember);
+  startSession(req, reply, user, device, remember);
   touchLogin(user.id);
   return reply.send({
     user: publicUser(user),
@@ -460,10 +1051,57 @@ app.post('/api/auth/login', {
 });
 
 /**
+ * Continue a rotation chain from a token that was *itself* rotated.
+ *
+ * Rotation is not idempotent, and one browser has more than one tab (the client
+ * dedupes per page, and a 200 lost in flight is indistinguishable from theft).
+ * Any second presentation of a just-rotated token therefore deleted the device
+ * and signed every tab out, with `refresh_replay` in the audit log blaming the
+ * user's own browser. Within SONORA_REFRESH_GRACE_MS of the rotation, a replay
+ * instead rotates the successor forward and answers 200; outside it, the theft
+ * response stands. A chain that ended in a revocation-not-rotation (logout,
+ * "sign out everywhere", expiry) is never forgiven.
+ *
+ * Returns the response body on success, or null to let the caller treat the
+ * presentation as a replay.
+ */
+function rotateWithinGrace(req, reply, row) {
+  if (!row?.revoked_at || !row.replaced_by || config.refreshGraceMs <= 0) return null;
+  const usedAt = Date.parse(String(row.last_used_at ?? '')) || 0;
+  if (!usedAt || Date.now() - usedAt > config.refreshGraceMs) return null;
+  const device = getDevice(row.device_id);
+  const user = getUser(row.user_id);
+  if (!device || device.revoked_at || !user || user.disabled) return null;
+
+  // Walk to the newest link: another tab may already have rotated the
+  // successor onward, and the whole chain belongs to this one device.
+  let tail = SQL.refreshByHash.get(row.replaced_by);
+  if (!tail || tail.device_id !== device.id || tail.user_id !== user.id) return null;
+  for (let hops = 0; tail?.replaced_by && hops < 8; hops += 1) {
+    const link = SQL.refreshByHash.get(tail.replaced_by);
+    if (!link || link.device_id !== device.id) break;
+    tail = link;
+  }
+  if (tail.revoked_at) return null;
+  if (new Date(tail.expires_at).getTime() < Date.now()) return null;
+
+  const next = issueRefreshToken({
+    deviceId: device.id, userId: user.id, ttlMs: config.refreshDays * 86_400_000,
+  });
+  if (!consumeRefreshToken(tail.id, next.tokenHash)) {
+    revokeRefreshToken(next.id);
+    return null;
+  }
+  touchDevice(device.id, { ip: req.ip, login: true });
+  startSession(req, reply, user, device, true, next);
+  return { user: publicUser(user), device: publicDevice(device), refreshed: true, rotated: true };
+}
+
+/**
  * Exchange a saved device's refresh token for a fresh access token. The token
- * rotates on every use: replaying an already-used token is treated as theft and
- * deletes the device, so both the thief and the legitimate client are locked out
- * and must sign in again.
+ * rotates on every use: replaying an already-used token outside the grace window
+ * is treated as theft and deletes the device, so both the thief and the
+ * legitimate client are locked out and must sign in again.
  */
 app.post('/api/auth/refresh', {
   config: { rateLimit: { max: 60, timeWindow: '1 minute' } },
@@ -475,7 +1113,17 @@ app.post('/api/auth/refresh', {
     return clearAuthCookies(reply).code(401).send({ error: 'That saved session is no longer valid.' });
   }
   if (row.revoked_at) {
-    // Replay of a rotated token: revoke the whole device rather than trust it.
+    if (!row.replaced_by) {
+      // Logout, an explicit forget, expiry and an administrator's revocation are
+      // ordinary revoked credentials. Only reuse *inside a rotation chain* is the
+      // theft signal; conflating the two let such a cookie delete the device's
+      // still-current access session.
+      return clearAuthCookies(reply).code(401).send({ error: 'That saved session is no longer valid. Sign in again.' });
+    }
+    const graced = rotateWithinGrace(req, reply, row);
+    if (graced) return graced;
+    // Replay of a rotated token outside the window: revoke the whole device
+    // rather than trust it.
     deleteDevice(row.device_id);
     recordAudit({ actorId: row.user_id, action: 'refresh_replay', target: row.device_id, detail: 'rotated token reused; device revoked' });
     return clearAuthCookies(reply).code(401).send({ error: 'That saved session was already used. Sign in again.' });
@@ -495,15 +1143,19 @@ app.post('/api/auth/refresh', {
   });
   if (!consumeRefreshToken(row.id, next.tokenHash)) {
     // Lost a race with another tab: that request already rotated the token, so
-    // the replacement we just minted is orphaned. Drop it and treat this as a
-    // replay — the device is revoked rather than left in an ambiguous state.
+    // the replacement we just minted is orphaned. That is a race, not theft —
+    // take the grace path with the row as it is now, and only revoke when even
+    // that is refused.
     revokeRefreshToken(next.id);
+    const fresh = getRefreshToken(hashToken(raw));
+    const graced = fresh ? rotateWithinGrace(req, reply, fresh) : null;
+    if (graced) return graced;
     deleteDevice(device.id);
     recordAudit({ actorId: user.id, action: 'refresh_replay', target: device.id, detail: 'concurrent rotation' });
     return clearAuthCookies(reply).code(401).send({ error: 'That saved session was already used. Sign in again.' });
   }
   touchDevice(device.id, { ip: req.ip, login: true });
-  startSession(reply, user, device, true, next);
+  startSession(req, reply, user, device, true, next);
   return { user: publicUser(user), device: publicDevice(device), refreshed: true };
 });
 
@@ -558,13 +1210,22 @@ app.post('/api/auth/passkey/register/options', {
     userDisplayName: user.name,
     attestationType: 'none',
     excludeCredentials: listPasskeyCredentials(user.id),
-    authenticatorSelection: { residentKey: 'preferred', userVerification: 'required' },
+    // `required`, not `preferred`. A discoverable (resident) key is what lets
+    // sign-in work without the server naming an account first — which is the
+    // only shape of the login-options answer that does not leak "this name
+    // exists". Registering a non-resident credential would create a passkey its
+    // owner cannot use on the login screen, because that endpoint no longer
+    // sends allowCredentials.
+    authenticatorSelection: { residentKey: 'required', userVerification: 'required' },
   });
+  // One latest ceremony per kind and browser. The old cookie names the exact
+  // row to discard; starting again does not leave an orphan until the TTL sweep.
+  discardSupersededChallenge(req, 'register');
   const challengeId = createChallenge({
     userId: user.id, kind: 'register', challenge: options.challenge,
     rpId: ctx.rpID, origin: ctx.origin,
   });
-  setChallengeCookie(reply, challengeId);
+  setChallengeCookie(req, reply, challengeId, 'register');
   return { challengeId, options };
 });
 
@@ -573,9 +1234,9 @@ app.post('/api/auth/passkey/register/verify', {
 }, async (req, reply) => {
   const user = requireUser(req, reply);
   if (!user) return;
-  const challengeId = challengeIdFrom(req);
+  const challengeId = challengeIdFrom(req, 'register');
   const row = challengeId ? takeChallenge(challengeId, 'register') : null;
-  reply.clearCookie(CHALLENGE_COOKIE, { path: '/' });
+  clearChallengeCookie(req, reply, 'register', challengeId);
   if (!row || row.user_id !== user.id) {
     return reply.code(400).send({ error: 'That passkey request expired. Try again.' });
   }
@@ -642,30 +1303,38 @@ app.post('/api/auth/passkey/login/options', {
   const support = passkeySupport(ctx);
   if (!support.supported) return reply.code(400).send({ error: support.reason });
   deleteExpiredChallenges();
-  // A name is only a hint: unknown names still get discoverable-credential
-  // options, so the endpoint cannot be used to enumerate accounts.
-  const name = trim(req.body?.name, 80);
-  const user = name ? findUser(name) : null;
-  const allowCredentials = user ? listPasskeyCredentials(user.id) : [];
+  // Discoverable credentials only, and the posted name is ignored.
+  //
+  // This endpoint used to resolve the name and send that account's
+  // `allowCredentials`, which made the *response shape* an oracle: an entry in
+  // the list means "this name exists and has a passkey", and its absence means
+  // "unknown name" — the account enumeration docs/auth.md says cannot happen.
+  // Sending the list only when it is non-empty is what leaked.
+  //
+  // So the name is a hint the client may collect and the server drops: the
+  // picker is the account selector. That works because registration now asks for
+  // a resident key (see register/options), which is what makes a credential
+  // discoverable without being named first. The answer for an unknown name, a
+  // known name and a known name with no passkeys is byte-identical.
   const options = await generateAuthenticationOptions({
     rpID: ctx.rpID,
     userVerification: 'required',
-    ...(allowCredentials.length ? { allowCredentials } : {}),
   });
+  discardSupersededChallenge(req, 'authenticate');
   const challengeId = createChallenge({
-    userId: user?.id ?? null, kind: 'authenticate', challenge: options.challenge,
+    userId: null, kind: 'authenticate', challenge: options.challenge,
     rpId: ctx.rpID, origin: ctx.origin,
   });
-  setChallengeCookie(reply, challengeId);
+  setChallengeCookie(req, reply, challengeId, 'authenticate');
   return { challengeId, options };
 });
 
 app.post('/api/auth/passkey/login/verify', {
   config: { rateLimit: { max: 20, timeWindow: '1 minute' } },
 }, async (req, reply) => {
-  const challengeId = challengeIdFrom(req);
+  const challengeId = challengeIdFrom(req, 'authenticate');
   const row = challengeId ? takeChallenge(challengeId, 'authenticate') : null;
-  reply.clearCookie(CHALLENGE_COOKIE, { path: '/' });
+  clearChallengeCookie(req, reply, 'authenticate', challengeId);
   if (!row) return reply.code(400).send({ error: 'That passkey request expired. Try again.' });
 
   const response = req.body?.response;
@@ -687,7 +1356,13 @@ app.post('/api/auth/passkey/login/verify', {
       credential: {
         id: passkey.credential_id,
         publicKey: Buffer.from(passkey.public_key, 'base64url'),
-        counter: passkey.counter ?? 0,
+        // Synced (backed-up) credentials — iCloud Keychain, Google Password
+        // Manager — re-derive their counter on a new device, so a strict
+        // monotonic check "works today and never again" on the only passkey the
+        // user owns. @simplewebauthn/server rejects a non-advancing counter by
+        // throwing; handing it 0 for a backed-up credential disables that check
+        // for exactly those, and the counter is still stored from the response.
+        counter: passkey.backed_up ? 0 : (passkey.counter ?? 0),
         transports: passkey.transports ? passkey.transports.split(',').filter(Boolean) : undefined,
       },
       requireUserVerification: true,
@@ -696,23 +1371,24 @@ app.post('/api/auth/passkey/login/verify', {
       return reply.code(401).send({ error: 'That passkey did not verify.' });
     }
     const authInfo = verification.authenticationInfo;
-    // A counter that fails to advance is the classic cloned-authenticator tell.
-    // Many platform passkeys legitimately report 0, so only a real regression counts.
-    if (authInfo.newCounter > 0 && passkey.counter > 0 && authInfo.newCounter <= passkey.counter) {
-      recordAudit({ actorId: user.id, actorName: user.name, action: 'passkey_replay', target: String(passkey.id), detail: 'counter did not advance' });
-      return reply.code(401).send({ error: 'That passkey looks cloned. Use another sign-in method.' });
-    }
     updatePasskeyUse(passkey.id, authInfo.newCounter ?? 0, {
       deviceType: authInfo.credentialDeviceType ?? null,
       backedUp: Boolean(authInfo.credentialBackedUp),
     });
     const remember = req.body?.remember === true;
     const device = resolveDevice(req, user, remember);
-    startSession(reply, user, device, remember);
+    startSession(req, reply, user, device, remember);
     touchLogin(user.id);
     return { user: publicUser(user), device: publicDevice(device), remembered: remember };
   } catch (err) {
-    req.log.warn({ err: err?.message }, 'passkey authentication failed');
+    const message = String(err?.message ?? '');
+    // The library's own clone signal. Surfaced distinctly (and audited) instead
+    // of as the generic "did not verify", which read as "your passkey broke".
+    if (/counter value .* was lower than expected/i.test(message)) {
+      recordAudit({ actorId: user.id, actorName: user.name, action: 'passkey_replay', target: String(passkey.id), detail: 'counter did not advance' });
+      return reply.code(401).send({ error: 'That passkey looks cloned. Use another sign-in method.' });
+    }
+    req.log.warn({ err: message }, 'passkey authentication failed');
     return reply.code(401).send({ error: 'That passkey did not verify.' });
   }
 });
@@ -747,9 +1423,36 @@ app.patch('/api/auth/devices/:id', async (req, reply) => {
   // "Remember this device" must be reversible after the fact: a laptop signed in
   // on a borrowed network can be dropped back to a session-only login without
   // signing out and back in.
+  //
+  // Both directions are implemented, because `{remembered: true}` used to pass
+  // validation, rename nothing, revoke nothing and answer 200 with the device
+  // still remembered:false — a success response for a change that never
+  // happened, which later reads as "remember me randomly turned itself off".
+  // Re-enabling mints exactly what a remembered sign-in would have: a refresh
+  // token for that device and a persistent access cookie.
   const remembered = typeof req.body?.remembered === 'boolean' ? req.body.remembered : null;
+  if (remembered === true && id !== user.deviceId) {
+    // This response cannot deliver a cookie to another browser. Minting an
+    // undelivered token used to claim that device was remembered, leaving the
+    // other browser signed out and accumulating unusable token rows.
+    return reply.code(409).send({
+      error: 'That device must enable “remember me” while it is signed in.',
+    });
+  }
   if (!name && remembered === null) return reply.code(400).send({ error: 'Nothing to change.' });
   if (name) renameDevice(user.id, id, name);
+  if (remembered === true) {
+    // This device: the cookies in this very response carry the change. The
+    // cross-device case returned 409 above because this browser cannot deliver
+    // a refresh cookie to another browser.
+    //
+    // The *full* user row, not the session view: startSession stamps the token
+    // with `session_version`, and currentUser's shape does not carry it, so the
+    // fallback of 1 would mint a cookie this account's own version check rejects
+    // (it is > 1 after any "sign out everywhere").
+    startSession(req, reply, getUser(user.id) ?? user, device, true);
+    recordAudit({ actorId: user.id, actorName: user.name, action: 'device_remember', target: id });
+  }
   if (remembered === false) {
     revokeDeviceTokens(id);
     setDeviceRemembered(id, false);
@@ -761,7 +1464,7 @@ app.patch('/api/auth/devices/:id', async (req, reply) => {
         ver: getUser(user.id)?.session_version ?? 1,
         sid: id,
         exp: Date.now() + config.sessionMinutes * 60_000,
-      }), baseCookie());
+      }), baseCookie(req));
       reply.clearCookie(REFRESH_COOKIE, { path: '/' });
     }
     recordAudit({ actorId: user.id, actorName: user.name, action: 'device_forget', target: id });
@@ -801,7 +1504,7 @@ app.post('/api/auth/devices/revoke-others', async (req, reply) => {
     clearAuthCookies(reply);
     return { signedOut: true, revoked: removed };
   }
-  startSession(reply, fresh, device, Boolean(device.remembered));
+  startSession(req, reply, fresh, device, Boolean(device.remembered));
   return { revoked: removed, device: publicDevice(device) };
 });
 
@@ -823,11 +1526,192 @@ app.post('/api/auth/signout-all', async (req, reply) => {
 const SEARCH_TYPES = new Set(['all', 'song', 'album', 'artist', 'playlist']);
 const SEARCH_LIMITS = { song: 20, artist: 4, album: 12, playlist: 8 };
 const SEARCH_TTL_MS = 3 * 60_000;
+// A normal search All request creates four shelf rows. These bounds stop an
+// account turning arbitrary q strings into a permanent, unbounded SQLite cache.
+const SEARCH_CACHE_MAX_ROWS = 256;
+const SEARCH_CACHE_MAX_BYTES = 4 * 1024 * 1024;
+const SEARCH_QUERY_MAX = 24;
+const SEARCH_QUERY_WINDOW_MS = 60_000;
+const searchQueryBudget = new Map(); // userId -> { resetAt, queries: Set<string> }
+
+class SearchQueryLimitError extends Error {
+  constructor(retryAfterMs) {
+    super('Too many distinct search queries.');
+    this.code = 'SEARCH_RATE_LIMITED';
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+const canonicalSearchQuery = (q) => String(q).normalize('NFKC').toLowerCase();
+
+/** Charge a new cache-miss query once per account/window, not once per shelf. */
+function searchQueryAllowed(userId, q) {
+  const now = Date.now();
+  let bucket = searchQueryBudget.get(userId);
+  if (!bucket || bucket.resetAt <= now) {
+    bucket = { resetAt: now + SEARCH_QUERY_WINDOW_MS, queries: new Set() };
+  }
+  const key = canonicalSearchQuery(q);
+  if (bucket.queries.has(key)) {
+    searchQueryBudget.delete(userId);
+    searchQueryBudget.set(userId, bucket);
+    return { allowed: true, retryAfterMs: 0 };
+  }
+  if (bucket.queries.size >= SEARCH_QUERY_MAX) {
+    return { allowed: false, retryAfterMs: Math.max(1, bucket.resetAt - now) };
+  }
+  bucket.queries.add(key);
+  searchQueryBudget.delete(userId);
+  searchQueryBudget.set(userId, bucket);
+  // The accounts themselves are durable; this in-memory bookkeeping need not be.
+  if (searchQueryBudget.size > 512) searchQueryBudget.delete(searchQueryBudget.keys().next().value);
+  return { allowed: true, retryAfterMs: 0 };
+}
+
+// Every statement is explicitly range-limited. In particular, adding cache
+// pressure must never evict a personal station or a six-hour lyrics answer.
+const SEARCH_CACHE_SQL = {
+  expired: db.prepare(`DELETE FROM upstream_cache
+    WHERE key >= 'search:' AND key < 'search:\uFFFF' AND expires_at <= ?`),
+  stats: db.prepare(`SELECT COUNT(*) AS rows,
+      COALESCE(SUM(LENGTH(CAST(key AS BLOB)) + LENGTH(CAST(value AS BLOB))), 0) AS bytes
+    FROM upstream_cache WHERE key >= 'search:' AND key < 'search:\uFFFF'`),
+  excessRows: db.prepare(`DELETE FROM upstream_cache WHERE key IN (
+      SELECT key FROM upstream_cache
+      WHERE key >= 'search:' AND key < 'search:\uFFFF'
+      ORDER BY expires_at ASC, key ASC LIMIT ?
+    )`),
+  oldest: db.prepare(`SELECT key,
+      LENGTH(CAST(key AS BLOB)) + LENGTH(CAST(value AS BLOB)) AS bytes
+    FROM upstream_cache WHERE key >= 'search:' AND key < 'search:\uFFFF'
+    ORDER BY expires_at ASC, key ASC LIMIT 1`),
+  deleteKey: db.prepare(`DELETE FROM upstream_cache
+    WHERE key >= 'search:' AND key < 'search:\uFFFF' AND key = ?`),
+};
+
+/** Expire and evict inside the caller's transaction, only in the search range. */
+function pruneSearchCache(now = Date.now()) {
+  SEARCH_CACHE_SQL.expired.run(now);
+  let stats = SEARCH_CACHE_SQL.stats.get();
+  if (stats.rows > SEARCH_CACHE_MAX_ROWS) {
+    SEARCH_CACHE_SQL.excessRows.run(stats.rows - SEARCH_CACHE_MAX_ROWS);
+    stats = SEARCH_CACHE_SQL.stats.get();
+  }
+  while (stats.bytes > SEARCH_CACHE_MAX_BYTES) {
+    const oldest = SEARCH_CACHE_SQL.oldest.get();
+    if (!oldest) break;
+    SEARCH_CACHE_SQL.deleteKey.run(oldest.key);
+    stats = { rows: stats.rows - 1, bytes: stats.bytes - oldest.bytes };
+  }
+}
+
+function cacheSearchGroup(key, items) {
+  // A failed bound or serialization rolls back the cache write as well: a
+  // failed request must not leave an answer that the next caller mistakes for
+  // a successful empty shelf.
+  transaction(() => {
+    cacheSet(key, items, SEARCH_TTL_MS);
+    pruneSearchCache();
+  });
+}
 
 // Two requests for the same shelf (a double-tap on Search, two tabs, the client
 // re-rendering) would both miss the cache and both hit YouTube. One upstream
 // call per query/type is enough: the second request waits on the first.
 const searchInFlight = new Map();
+
+/**
+ * One upstream call per key, even when the same thing is asked for twice at once.
+ *
+ * A cache cannot answer the second of two simultaneous misses — both callers
+ * look before either has filled it — so the in-flight map is what actually
+ * collapses them. The entry is removed as soon as the work settles (a rejection
+ * included), so the next caller retries instead of waiting on a dead promise.
+ * Keyed by request shape, shared by every route that can be double-tapped.
+ */
+function coalesce(inFlight, key, load) {
+  const pending = inFlight.get(key);
+  if (pending) return pending;
+  const work = (async () => load())().finally(() => inFlight.delete(key));
+  inFlight.set(key, work);
+  return work;
+}
+
+/**
+ * Upstream failures a listener can act on, mapped once instead of per route.
+ *
+ * These routes used to let a YouTube failure fall into the global error handler,
+ * which answers `500 Internal error.` — so Play-radio during a bot-gate/outage
+ * reported a server bug, the client's bot-gate UI never fired, and a dead
+ * album/playlist id looked like a crash rather than "that release does not
+ * exist". The classification is by message because youtube.js throws plain
+ * Errors; anything unrecognised stays a 502 (upstream), never a 500 (us).
+ */
+const UPSTREAM_BOT_GATE = /sign in to confirm|not a bot|login_required|bot gate/i;
+const UPSTREAM_TIMEOUT = /timed out|timeout|aborted/i;
+const UPSTREAM_MISSING = /\bnot found\b|does not exist|unavailable|404/i;
+const UPSTREAM_RATE_LIMIT = /\b429\b|too many requests|rate[- ]limit/i;
+
+/** Sanitize an upstream error once; partial search responses use the same body. */
+function classifyUpstreamFailure(err, label) {
+  // searchTracks deliberately aggregates two independent source outages. Route
+  // classification must look through that wrapper instead of downgrading a
+  // shared timeout or policy block to an unhelpful generic 502.
+  const causes = [err, ...(Array.isArray(err?.errors) ? err.errors : [])].filter(Boolean);
+  const message = causes.map((cause) => String(cause?.message ?? '')).join('; ');
+  const statuses = causes.map((cause) => Number(
+    cause?.response?.status ?? cause?.status ?? cause?.statusCode,
+  ));
+  const retry = causes.map((cause) => Number(cause?.retryAfterMs))
+    .find((ms) => Number.isFinite(ms) && ms > 0) ?? null;
+  if (UPSTREAM_BOT_GATE.test(message)) {
+    // Same signal /api/stream raises, so one bot-gate banner covers every route.
+    botGateAt = Date.now();
+    return {
+      status: 503,
+      retryAfterMs: retry,
+      body: {
+        error: 'YouTube is blocking this IP until a sign-in is provided. Set SONORA_YTDLP_COOKIES.',
+        code: 'BOT_GATED',
+      },
+    };
+  }
+  if (causes.some((cause) => cause?.code === 'YT_BLOCKED')
+    || statuses.includes(429) || UPSTREAM_RATE_LIMIT.test(message)) {
+    return {
+      status: 503,
+      retryAfterMs: retry,
+      body: { error: `YouTube is rate-limiting ${label}. Try again shortly.`, code: 'UPSTREAM_RATE_LIMITED' },
+    };
+  }
+  if (UPSTREAM_TIMEOUT.test(message)
+    || causes.some((cause) => cause?.name === 'TimeoutError' || cause?.name === 'AbortError' || cause?.code === 'YT_TIMEOUT')) {
+    return {
+      status: 503,
+      retryAfterMs: retry,
+      body: { error: `YouTube did not answer for ${label}. Try again.`, code: 'UPSTREAM_TIMEOUT' },
+    };
+  }
+  if (UPSTREAM_MISSING.test(message) || statuses.includes(404)) {
+    return { status: 404, retryAfterMs: retry, body: { error: `YouTube has no ${label} for that id.`, code: 'NOT_FOUND' } };
+  }
+  return {
+    status: 502,
+    retryAfterMs: retry,
+    body: { error: `Could not load ${label} from YouTube.`, code: 'UPSTREAM_FAILED' },
+  };
+}
+
+function sendUpstreamFailure(reply, failure) {
+  if (failure.retryAfterMs) {
+    reply.header('retry-after', String(Math.max(1, Math.ceil(failure.retryAfterMs / 1000))));
+  }
+  return reply.code(failure.status).send(failure.body);
+}
+
+function upstreamFailure(reply, err, label) {
+  return sendUpstreamFailure(reply, classifyUpstreamFailure(err, label));
+}
 
 /**
  * One type's worth of a search answer, cached on its own.
@@ -838,22 +1722,29 @@ const searchInFlight = new Map();
  * query, the type and the limit, so a 4-artist shelf and a longer one cannot be
  * served from each other's slot.
  *
- * Failures are deliberately *not* cached by the caller (`catch` sits outside),
- * so a transient upstream error does not stick for the whole TTL.
+ * Returns `{ items, cached }` because the caller has side effects to skip. Only
+ * the request that actually invoked YouTube is uncached; a coalesced follower
+ * must not repeat the same transaction after awaiting the leader's answer.
+ *
+ * Failures are deliberately *not* cached: loading precedes the transaction that
+ * stores a resolved shelf. A rejected load therefore retries on the next call.
  */
-async function searchGroup(type, q, load) {
-  const key = `search:${type}:${SEARCH_LIMITS[type]}:${q.toLowerCase()}`;
+async function searchGroup(type, q, userId, load) {
+  const normalizedQuery = canonicalSearchQuery(q);
+  const key = `search:${type}:${SEARCH_LIMITS[type]}:${normalizedQuery}`;
   const hit = cacheGet(key);
-  if (hit) return hit;
-  const pending = searchInFlight.get(key);
-  if (pending) return pending;
-  const work = (async () => {
-    const items = await load();
-    cacheSet(key, items, SEARCH_TTL_MS);
-    return items;
-  })().finally(() => searchInFlight.delete(key));
-  searchInFlight.set(key, work);
-  return work;
+  // [] is a successful cache hit too; do not use its length as success evidence.
+  if (hit !== null) return { items: hit, cached: true };
+  let loadedHere = false;
+  const items = await coalesce(searchInFlight, key, async () => {
+    const allowance = searchQueryAllowed(userId, q);
+    if (!allowance.allowed) throw new SearchQueryLimitError(allowance.retryAfterMs);
+    loadedHere = true;
+    const loaded = await load();
+    cacheSearchGroup(key, loaded);
+    return loaded;
+  });
+  return { items, cached: !loadedHere };
 }
 
 /**
@@ -867,39 +1758,89 @@ async function searchGroup(type, q, load) {
  * changes — only its `counts` say what was asked for.
  */
 app.get('/api/search', async (req, reply) => {
-  if (!requireUser(req, reply)) return;
+  const user = requireUser(req, reply);
+  if (!user) return;
   const q = String(req.query?.q ?? '').trim().slice(0, 200);
   if (!q) return reply.code(400).send({ error: 'Missing q.' });
   const type = String(req.query?.type ?? 'all').trim().toLowerCase() || 'all';
   if (!SEARCH_TYPES.has(type)) return reply.code(400).send({ error: 'Unknown type.' });
   const wants = (t) => type === 'all' || type === t;
 
-  const [tracks, artists, albums, playlists] = await Promise.all([
-    wants('song')
-      ? searchGroup('song', q, () => searchTracks(q, SEARCH_LIMITS.song)).catch(() => [])
-      : [],
-    wants('artist')
-      ? searchGroup('artist', q, () => searchArtists(q, SEARCH_LIMITS.artist)).catch(() => [])
-      : [],
-    wants('album')
-      ? searchGroup('album', q, () => searchAlbums(q, SEARCH_LIMITS.album)).catch(() => [])
-      : [],
-    wants('playlist')
-      ? searchGroup('playlist', q, () => searchPlaylists(q, SEARCH_LIMITS.playlist)).catch(() => [])
-      : [],
+  // Keep the rejection as data. Empty items alone cannot distinguish a failed
+  // shelf from a successful search with no matches, which made total upstream
+  // outages look like a cacheable 200 answer. Unrequested shelves stay inert.
+  const shelf = (t, load) => (wants(t)
+    ? searchGroup(t, q, user.id, load).then(
+      (result) => ({ ...result, ok: true }),
+      (error) => ({ items: [], cached: true, ok: false, error }),
+    )
+    : Promise.resolve({ items: [], cached: true, ok: true }));
+
+  const [songs, artists, albums, playlists] = await Promise.all([
+    shelf('song', () => searchTracks(q, SEARCH_LIMITS.song)),
+    shelf('artist', () => searchArtists(q, SEARCH_LIMITS.artist)),
+    shelf('album', () => searchAlbums(q, SEARCH_LIMITS.album)),
+    shelf('playlist', () => searchPlaylists(q, SEARCH_LIMITS.playlist)),
   ]);
+  const requested = [
+    { type: 'song', field: 'tracks', label: 'song search', result: songs },
+    { type: 'artist', field: 'artists', label: 'artist search', result: artists },
+    { type: 'album', field: 'albums', label: 'album search', result: albums },
+    { type: 'playlist', field: 'playlists', label: 'playlist search', result: playlists },
+  ].filter(({ type: shelfType }) => wants(shelfType));
+  const failed = requested.filter(({ result }) => !result.ok);
+  for (const failure of failed) {
+    const err = failure.result.error;
+    req.log.warn({
+      shelf: failure.type,
+      err: err?.message ?? String(err),
+      causes: Array.isArray(err?.errors) ? err.errors.map((cause) => cause?.message ?? String(cause)) : undefined,
+    }, 'search shelf failed');
+  }
 
-  // A cached song shelf still feeds the track table, so upsert runs on every
-  // answer rather than only on the request that missed the cache.
-  for (const t of tracks) upsertTrack(t);
+  if (failed.length === requested.length) {
+    const limited = failed.find(({ result }) => result.error instanceof SearchQueryLimitError);
+    if (limited) {
+      const retryAfterMs = limited.result.error.retryAfterMs;
+      reply.header('retry-after', String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
+      return reply.code(429).send({
+        error: 'Too many different searches. Listen for a minute or repeat a recent search.',
+        code: 'SEARCH_RATE_LIMITED',
+      });
+    }
+    // One classified failure for the request, rather than four empty arrays.
+    // Prefer an actionable policy/timeout signal over a generic shelf failure;
+    // otherwise which error the listener saw would depend on shelf ordering.
+    const priority = {
+      BOT_GATED: 0, UPSTREAM_RATE_LIMITED: 1, UPSTREAM_TIMEOUT: 2,
+      UPSTREAM_FAILED: 3, NOT_FOUND: 4,
+    };
+    const selected = failed.map((failure) => classifyUpstreamFailure(failure.result.error, 'search results'))
+      .sort((a, b) => (priority[a.body.code] ?? 5) - (priority[b.body.code] ?? 5))[0];
+    return sendUpstreamFailure(reply, selected);
+  }
 
-  const artistItems = artists.map(({ id, title, subscribers, thumb }) => ({ id, title, subscribers, thumb }));
+  const errors = {};
+  for (const failure of failed) {
+    const err = failure.result.error;
+    errors[failure.field] = err instanceof SearchQueryLimitError
+      ? { error: 'Too many different searches. Try this shelf again shortly.', code: 'SEARCH_RATE_LIMITED' }
+      : classifyUpstreamFailure(err, failure.label).body;
+  }
+
+  const tracks = songs.items;
+
+  // Exactly one caller of a cold coalesced search owns this transaction. Cached
+  // answers and followers only read its result; neither commits the rows again.
+  if (!songs.cached && tracks.length) transaction(() => { for (const t of tracks) upsertTrack(t); });
+
+  const artistItems = artists.items.map(({ id, title, subscribers, thumb }) => ({ id, title, subscribers, thumb }));
   // `type` here is the shelf the row belongs to, not the release format: the
   // client renders both album and single rows with the same collection route.
-  const albumItems = albums.map(({ id, title, author, year, trackCount, thumb }) => ({
+  const albumItems = albums.items.map(({ id, title, author, year, trackCount, thumb }) => ({
     id, title, author: author ?? null, year: year ?? null, trackCount: trackCount ?? null, thumb, type: 'Album',
   }));
-  const playlistItems = playlists.map(({ id, title, author, trackCount, thumb }) => ({
+  const playlistItems = playlists.items.map(({ id, title, author, trackCount, thumb }) => ({
     id, title, author: author ?? null, trackCount: trackCount ?? null, thumb, type: 'Playlist',
   }));
 
@@ -915,6 +1856,7 @@ app.get('/api/search', async (req, reply) => {
       albums: albumItems.length,
       playlists: playlistItems.length,
     },
+    ...(Object.keys(errors).length ? { errors } : {}),
   };
 });
 
@@ -926,10 +1868,20 @@ app.get('/api/radio', async (req, reply) => {
   // A dislike is a standing instruction: never hand one back in a station.
   const disliked = dislikedIds(user.id);
   const songs = dislikedSongKeys(user.id);
-  const tracks = (await upNext(seed))
+  let related;
+  try {
+    related = await upNext(seed);
+  } catch (err) {
+    // Play-radio is the most-pressed button in the app, so a bot-gate or an
+    // upstream timeout here must reach the client as such: a bare 500 read as a
+    // server bug and never triggered the bot-gate banner.
+    req.log.warn({ seed, err: err.message }, 'radio lookup failed');
+    return upstreamFailure(reply, err, 'that seed');
+  }
+  const tracks = related
     .filter((t) => !disliked.has(t.videoId))
     .filter((t) => !songs.has(songKey({ ...t, itemType: 'song' })));
-  for (const t of tracks) upsertTrack(t);
+  transaction(() => { for (const t of tracks) upsertTrack(t); });
   return { tracks };
 });
 
@@ -987,11 +1939,21 @@ function stationRefusals(userId) {
  * planner fills from the others. A station that is a little more familiar beats
  * a station that does not load.
  */
-async function stationPage(userId, {
+/** Keep a best-effort lane's empty answer distinct from its failure. */
+async function stationPool(load) {
+  try {
+    return { tracks: (await load()) ?? [], failed: false };
+  } catch {
+    return { tracks: [], failed: true };
+  }
+}
+
+async function stationPageAttempt(userId, {
   cursor = 0, exclude = new Set(), limit = STATION_LIMIT, includeSeeds = true,
 } = {}) {
+  cursor = normalizeStationCursor(cursor);
   const { candidates, disliked, dislikedSongs, rejected } = stationRefusals(userId);
-  const seeds = rankSeeds({ ...candidates, disliked });
+  const seeds = rankSeeds({ ...candidates, disliked, dislikedSongs });
   if (!seeds.length) return { seeds, tracks: [] };
 
   const plan = planPage({ limit, includeSeeds });
@@ -1002,8 +1964,17 @@ async function stationPage(userId, {
     .map((a) => a.name);
 
   // The artists this person actually plays: the definition of "familiar" for
-  // the whole page, and the set whose own band is capped hardest.
-  const knownArtists = new Set(allStationArtistNames(userId));
+  // the whole page. Which band is capped hardest is keyed off `seedArtists`
+  // below, not this set — see the seed cap in station.js.
+  //
+  // Normalised once, here. adjacentProfile compares `artistKeyOf(a.name)`
+  // (lower-case, punctuation-free) against this set, so a set of raw channel
+  // strings never matched: every artist with a capital letter or a space was
+  // "new", and the discovery lane kept re-offering names the listener already
+  // plays. station.js normalises again internally, which is idempotent.
+  const knownArtists = new Set(
+    allStationArtistNames(userId).map((a) => artistKeyOf(a)).filter(Boolean),
+  );
   const seedArtists = new Set(seeds.map((s) => String(s.channel ?? '')).filter(Boolean));
 
   // Two stages on purpose: the genre lane's vote needs the neighbours the
@@ -1015,11 +1986,13 @@ async function stationPage(userId, {
     .then((names) => trendingPool(seeds, names, plan.fetch.trending))
     .catch(() => []);
 
-  const [related, byArtist, adjacent] = await Promise.all([
-    Promise.all(picked.map((s) => upNext(s.videoId, 25).catch(() => []))),
-    Promise.all(artistNames.map((a) => searchTracks(a, 12).catch(() => []))),
+  const [relatedPools, artistPools, adjacent] = await Promise.all([
+    Promise.all(picked.map((s) => stationPool(() => upNext(s.videoId, 25)))),
+    Promise.all(artistNames.map((a) => stationPool(() => searchTracks(a, 12)))),
     adjacentProfile(picked, knownArtists, plan.fetch.adjacent, { onNeighbours: resolveNeighbours }),
   ]);
+  const related = relatedPools.map((pool) => pool.tracks);
+  const byArtist = artistPools.map((pool) => pool.tracks);
   // A lane with no artist pages to read never calls back; resolve it anyway so
   // the trending lane cannot wait forever.
   resolveNeighbours([]);
@@ -1030,7 +2003,7 @@ async function stationPage(userId, {
   // half the same band (familiar) and half the neighbouring scene (new).
   // Routing them apart is what stops the familiar lane from silently owning the
   // page — and it costs no extra request, which the neighbour lookups do.
-  const knownKey = new Set([...knownArtists].map((a) => artistKeyOf(a)));
+  const knownKey = knownArtists;
   const familiarRecs = [];
   const newRecs = [];
   for (const t of [...related, ...byArtist].flat()) {
@@ -1067,13 +2040,67 @@ async function stationPage(userId, {
     seedArtists,
     plan,
     limit,
+    // The cursor is what makes a Rebuild a different draw. Without it every
+    // expansion pool is read in the same order, so the same candidates hit the
+    // same per-artist caps and the page comes back as a permutation of itself.
+    cursor,
   });
 
   // Every track the page delivers is also evidence for the next one: playing
   // one of these through makes its artist familiar, which is what lets the
   // station follow the listener somewhere new.
-  for (const t of tracks) upsertTrack(t);
-  return { seeds, tracks, lanes: laneSummary(tracks) };
+  transaction(() => { for (const t of tracks) upsertTrack(t); });
+  const failures = [...relatedPools, ...artistPools].filter((pool) => pool.failed).length
+    + adjacent.failed;
+  const healthyCandidates = [...relatedPools, ...artistPools]
+    .some((pool) => !pool.failed && pool.tracks.length > 0)
+    || (adjacent.attempted > adjacent.failed && adjacent.tracks.length > 0);
+  // A failed page cannot prove that this seed is exhausted. Advance only after
+  // a genuinely healthy empty draw, or after a healthy lane supplied candidates
+  // which the queue's exclusion/refusal rules then consumed.
+  const retry = tracks.length === 0 && failures > 0 && !healthyCandidates;
+  return { seeds, tracks, lanes: laneSummary(tracks), retry };
+}
+
+/**
+ * Never publish an attempt whose evidence changed across an upstream await.
+ * Three retries suffice for ordinary concurrent writes without letting a busy
+ * listener create an unbounded rebuild loop. The bounded fallback re-reads the
+ * latest refusals and re-plans the last candidate pools locally; if even that
+ * is racing, the route's final epoch check still controls caching.
+ */
+async function stationPage(userId, options = {}) {
+  let page;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const epoch = stationEpoch(userId);
+    page = await stationPageAttempt(userId, options);
+    if (stationEpoch(userId) === epoch) return { ...page, epoch };
+  }
+
+  const { candidates, disliked, dislikedSongs, rejected } = stationRefusals(userId);
+  const seeds = rankSeeds({ ...candidates, disliked, dislikedSongs });
+  if (!seeds.length) return { seeds, tracks: [], epoch: stationEpoch(userId), retry: false };
+  const cursor = normalizeStationCursor(options.cursor ?? 0);
+  const limit = options.limit ?? STATION_LIMIT;
+  const includeSeeds = options.includeSeeds ?? true;
+  const seen = new Set(options.exclude ?? []);
+  for (const id of rejected) seen.add(id);
+  if (!includeSeeds) for (const seed of seeds) seen.add(seed.videoId);
+  const picked = rotateSeeds(seeds, { cursor, count: 3 });
+  const tracks = buildStation({
+    seeds: includeSeeds ? picked : [],
+    expansions: ['sameArtist', 'adjacent', 'trending'].map((lane) => withLane(
+      page.tracks.filter((track) => track.lane === lane), lane,
+    )),
+    disliked, dislikedSongs, exclude: seen,
+    knownArtists: new Set(allStationArtistNames(userId).map((a) => artistKeyOf(a)).filter(Boolean)),
+    seedArtists: new Set(seeds.map((s) => String(s.channel ?? '')).filter(Boolean)),
+    plan: planPage({ limit, includeSeeds }), limit, cursor,
+  });
+  return {
+    seeds, tracks, lanes: laneSummary(tracks), epoch: stationEpoch(userId),
+    retry: tracks.length === 0,
+  };
 }
 
 /** How a page split across the lanes, for the log and for tests. */
@@ -1113,12 +2140,32 @@ function allStationArtistNames(userId) {
  * search for them returns a rapper with "(feat. …)" in the title, a worship
  * band and a podcast. The id is the only thing that means one artist.
  */
+const STATION_NEIGHBOUR_CATALOGUES = 3;
 async function adjacentProfile(picked, knownArtists, limit = 8, { onNeighbours = null } = {}) {
-  if (!picked.length || limit <= 0) return { tracks: [], neighbours: [] };
-  const profiles = await Promise.all(picked.slice(0, 2).map(async (s) => {
-    const id = s.channelId ?? await artistIdFor(s.channel).catch(() => null);
+  const stats = { attempted: 0, failed: 0 };
+  if (!picked.length || limit <= 0) return { tracks: [], neighbours: [], ...stats };
+  const attempt = async (load) => {
+    stats.attempted += 1;
+    try { return await load(); } catch {
+      stats.failed += 1;
+      return null;
+    }
+  };
+
+  // Reuse one root profile per artist even when two different seed songs by
+  // that artist both made the draw. A stored channelId skips the name search.
+  const roots = [];
+  const seenRoots = new Set();
+  for (const seed of picked.slice(0, 2)) {
+    const key = seed.channelId ?? artistKeyOf(seed.channel);
+    if (!key || seenRoots.has(key)) continue;
+    seenRoots.add(key);
+    roots.push(seed);
+  }
+  const profiles = await Promise.all(roots.map(async (seed) => {
+    const id = seed.channelId ?? await attempt(() => artistIdFor(seed.channel));
     if (!id) return null;
-    return artistProfile(id).catch(() => null);
+    return attempt(() => artistProfile(id));
   }));
 
   const neighbours = [];
@@ -1133,17 +2180,16 @@ async function adjacentProfile(picked, knownArtists, limit = 8, { onNeighbours =
   }
   onNeighbours?.(neighbours.map((n) => n.name));
 
-  // Each neighbour contributes its own catalogue's top songs, one at a time,
-  // so a single lookalike band cannot own the lane.
-  const lists = await Promise.all(neighbours.slice(0, 6).map(async (n) => {
+  // Bandwidth is bounded below in youtube.js; do not also queue every unique
+  // neighbour a page names. Three catalogues are enough to round-robin a lane,
+  // and unused names still participate in the cheap genre vote above.
+  const lists = await Promise.all(neighbours.slice(0, STATION_NEIGHBOUR_CATALOGUES).map(async (n) => {
     if (!n.id) return [];
-    const page = await artistProfile(n.id).catch(() => null);
+    const page = await attempt(() => artistProfile(n.id));
     return page?.songs ?? [];
   }));
 
   // One song per neighbour per round, up to the ceiling the caller asked for.
-  // The caller is generous (see planPage.fetch): every pool is filtered again
-  // for refusals and duplicates, so asking for exactly the quota returns short.
   const ceiling = Math.max(limit, 12);
   const tracks = [];
   for (let round = 0; tracks.length < ceiling && lists.some((l) => l.length > round); round++) {
@@ -1152,7 +2198,7 @@ async function adjacentProfile(picked, knownArtists, limit = 8, { onNeighbours =
       if (t && tracks.length < ceiling) tracks.push(t);
     }
   }
-  return { tracks, neighbours: neighbours.map((n) => n.name) };
+  return { tracks, neighbours: neighbours.map((n) => n.name), ...stats };
 }
 
 /**
@@ -1178,10 +2224,11 @@ async function trendingPool(seedArtists = [], neighbourNames = [], limit = 6) {
   const genre = await genreForArtists(seedArtists.map((s) => s.channel).filter(Boolean), neighbourNames)
     .catch(() => null);
   if (!genre) return [];
-  // The whole shelf, not just this page's quota: the planner decides how many
-  // of these slots are trending, and later pages need the rows this page did
-  // not use (they are already in `exclude`).
-  return genreSongs(genre, 40).catch(() => []);
+  // genreShelves() already fetched 50 rows to make the vote. Reuse those rows
+  // for the 40-track pool instead of fetching the winning shelf a second time.
+  const shelves = await genreShelves().catch(() => []);
+  const winner = shelves.find((shelf) => shelf.name.toLowerCase() === genre.toLowerCase());
+  return winner?.tracks.slice(0, 40) ?? [];
 }
 
 /**
@@ -1201,6 +2248,23 @@ async function trendingPool(seedArtists = [], neighbourNames = [], limit = 6) {
  * match at all leaves the lane empty and the planner fills from the others.
  */
 const GENRE_CACHE = new Map();
+/**
+ * Bound an in-memory Map by dropping its oldest third once it reaches `max`.
+ *
+ * Insertion order is age — nothing re-inserts to refresh — so the first third is
+ * the coldest. Shared by the genre vote below and the artwork cache (see
+ * imgCacheSet): both are keyed by a caller-influenced value, and a Map keyed that
+ * way is a slow memory leak unless something evicts it.
+ */
+const GENRE_CACHE_MAX = 500;
+function evictOldestThird(map, max) {
+  if (map.size < max) return;
+  let drop = Math.ceil(max / 3);
+  for (const k of map.keys()) {
+    if (drop-- <= 0) break;
+    map.delete(k);
+  }
+}
 // Moods, decades and languages read as "genre tiles" but answer a different
 // question; the station wants a musical lane.
 const NOT_A_GENRE = /^(?:decades|chill|commute|energize|feel good|focus|gaming|halloween|party|romance|sad|sleep|workout|songwriters & producers|soundtracks & musicals|family|african|arabic|bollywood & indian|brazilian|j-pop|k-pop|mandopop & cantopop|opm)$/i;
@@ -1218,12 +2282,14 @@ let genreShelvesPromise = null;
 function genreShelves() {
   genreShelvesPromise ??= (async () => {
     const tiles = (await genreTiles()).filter((t) => !NOT_A_GENRE.test(t.name));
-    const shelves = await Promise.all(tiles.map(async (tile) => ({
-      name: tile.name,
-      artists: new Set((await genreSongs(tile.name, 50).catch(() => []))
-        .map((s) => artistKeyOf(s.channel ?? s.artist))
-        .filter(Boolean)),
-    })));
+    const shelves = await Promise.all(tiles.map(async (tile) => {
+      const tracks = await genreSongs(tile.name, 50).catch(() => []);
+      return {
+        name: tile.name,
+        artists: new Set(tracks.map((s) => artistKeyOf(s.channel ?? s.artist)).filter(Boolean)),
+        tracks,
+      };
+    }));
     return shelves.filter((s) => s.artists.size);
   })().catch((err) => {
     genreShelvesPromise = null;
@@ -1236,9 +2302,11 @@ async function genreForArtists(artists = [], adjacentNames = []) {
   const names = [...new Set(artists.map((a) => artistKeyOf(a)).filter(Boolean))].slice(0, 4);
   if (!names.length) return null;
   const neighbours = new Set(adjacentNames.map((a) => artistKeyOf(a)).filter(Boolean));
-  const key = genreCacheKey(names);
-  const cached = GENRE_CACHE.get(key);
-  if (cached) return cached;
+  // Neighbours are an input to the vote, not incidental context. Keeping them
+  // out of this key pinned later pages to a genre chosen for somebody else's
+  // neighbourhood; the two sides stay role-separated as well as sorted.
+  const key = `${genreCacheKey(names)}>${genreCacheKey([...neighbours])}`;
+  if (GENRE_CACHE.has(key)) return GENRE_CACHE.get(key);
 
   const shelves = await genreShelves();
   if (!shelves.length) return null;
@@ -1258,6 +2326,10 @@ async function genreForArtists(artists = [], adjacentNames = []) {
   }
 
   const genre = best && best.score > 0 ? best.name : null;
+  // Bounded like every other in-memory map here: the key is the combination of
+  // a user's top artists, so it is one permanent entry per distinct combination
+  // for the life of the process — unbounded, and driven by what people listen to.
+  evictOldestThird(GENRE_CACHE, GENRE_CACHE_MAX);
   GENRE_CACHE.set(key, genre);
   return genre;
 }
@@ -1279,6 +2351,29 @@ async function genreForArtists(artists = [], adjacentNames = []) {
  * Dislikes and repeated skips are removed from every layer: they cannot seed,
  * cannot be recommended back in, and cannot appear in the finished queue.
  */
+/**
+ * How far each user's Rebuild has walked the seed list.
+ *
+ * The seed cursor is the only thing that makes one station page differ from the
+ * next (`rotateSeeds` walks the seed list by it), so a page built at a pinned
+ * cursor of 0 is the same page every time — which made **Rebuild** a no-op that
+ * re-fetched the same three seeds, and for a new account with three seeds or
+ * fewer (nothing to rotate) re-derived the identical 30 tracks. Advancing a
+ * per-user cursor by the same stride `/api/station/next` uses gives Rebuild a
+ * genuinely different draw. Bounded like every other map here: an entry per
+ * account that has ever pressed the button is not worth an unbounded leak.
+ */
+const STATION_REBUILD_CURSORS = new Map();
+const STATION_REBUILD_CURSORS_MAX = 512;
+
+/** One seed-stride per Rebuild, so pressing it twice is two different draws. */
+function nextRebuildCursor(userId) {
+  const next = advanceStationCursor(STATION_REBUILD_CURSORS.get(userId) ?? 0);
+  evictOldestThird(STATION_REBUILD_CURSORS, STATION_REBUILD_CURSORS_MAX);
+  STATION_REBUILD_CURSORS.set(userId, next);
+  return next;
+}
+
 app.get('/api/station', async (req, reply) => {
   const user = requireUser(req, reply);
   if (!user) return;
@@ -1290,18 +2385,45 @@ app.get('/api/station', async (req, reply) => {
   // this key). Cache it so the pinned entry feels instant. `?fresh=1` is the
   // Rebuild button: it asks for a new draw on purpose.
   const fresh = String(req.query?.fresh ?? '') === '1';
-  const key = `station:${user.id}:${fresh ? `fresh:${Date.now()}` : 'first'}`;
+  const epoch = stationEpoch(user.id);
+  const key = `station:${user.id}:${epoch}:${fresh ? `fresh:${Date.now()}` : 'first'}`;
   const hit = fresh ? null : cacheGet(key);
   if (hit) return { ...hit, cached: true };
 
-  const { seeds, tracks, lanes } = await stationPage(user.id, {
-    cursor: 0, limit: STATION_LIMIT, includeSeeds: true,
+  // The cache check above cannot stop two *simultaneous* misses, and a station
+  // page is 6-15 upstream calls. A double-tap on Play, a launch plus a refresh,
+  // or two tabs used to build it once per request, and the slower answer then
+  // overwrote the cache with a page the faster one had already been given. The
+  // in-flight map collapses them onto one build (search does the same, see
+  // coalesce); a `?fresh=1` draw is deliberately excluded — asking twice for a
+  // new draw is not asking for the same answer.
+  const build = () => stationPage(user.id, {
+    cursor: fresh ? nextRebuildCursor(user.id) : 0,
+    limit: STATION_LIMIT,
+    includeSeeds: true,
   });
+  const page = fresh ? await build() : await coalesce(searchInFlight, key, build);
+  const { seeds, tracks, lanes } = page;
+  // The final handoff is synchronous, but an invalidation can have run after
+  // the attempt resolved and before this continuation. Never frame that page as
+  // current evidence, and never seed the cache with it.
+  if (page.epoch !== stationEpoch(user.id)) {
+    return {
+      name, blurb: stationBlurb({}), seeds: [], tracks: [], empty: true,
+      reason: 'station-changing', retry: true,
+    };
+  }
   if (!seeds.length) {
     // An honest empty station beats a random one: it says what to do next.
-    return { name, blurb: stationBlurb({}), seeds: [], tracks: [], empty: true };
+    return { name, blurb: stationBlurb({}), seeds: [], tracks: [], empty: true, reason: 'no-seeds' };
   }
 
+  // Seeds but nothing deliverable is a *failure*, not a station: a transient
+  // upstream refusal used to render as a working hero ("Built from N songs",
+  // Play) with an empty Up-next and a Play button that toasted "needs a few
+  // listens first" — and the shape was then cached for ten minutes. Say what
+  // happened, offer a retry, and cache nothing.
+  const empty = tracks.length === 0;
   const payload = {
     name,
     blurb: stationBlurb({
@@ -1316,11 +2438,16 @@ app.get('/api/station', async (req, reply) => {
     // "why is my station all the same band" must be answerable from the
     // response instead of guessed at from the log.
     lanes,
-    empty: false,
+    empty,
+    ...(empty ? { reason: 'no-tracks', retry: true } : {}),
   };
   // Ten minutes: opening the station twice is instant, but a queue cannot
-  // outlive a listening session.
-  cacheSet(key, payload, 10 * 60_000);
+  // outlive a listening session. A `fresh` draw is deliberately NOT stored: its
+  // key carries the timestamp, so nothing would ever read it back and the row
+  // would sit in upstream_cache until the hourly sweep — one dead blob per
+  // Rebuild press. A failed draw is never stored either, so the next visit
+  // tries again instead of repeating the empty page for ten minutes.
+  if (!fresh && !empty && page.epoch === stationEpoch(user.id)) cacheSet(key, payload, 10 * 60_000);
   return payload;
 });
 
@@ -1339,20 +2466,44 @@ app.get('/api/station/next', async (req, reply) => {
   const user = requireUser(req, reply);
   if (!user) return;
 
-  const cursor = Math.max(0, Math.trunc(Number(req.query?.cursor) || 0));
+  // Non-finite and unsafe client arithmetic resets to zero. A later response is
+  // advanced with a checked/wrapping helper rather than `cursor + 3`, which can
+  // silently stop changing in the unsafe integer range.
+  const cursor = normalizeStationCursor(req.query?.cursor);
   const raw = String(req.query?.exclude ?? '');
   const exclude = new Set(raw.split(',').map((s) => s.trim()).filter((s) => VIDEO_ID.test(s)).slice(0, 400));
 
-  const { seeds, tracks, lanes } = await stationPage(user.id, {
-    cursor, exclude, limit: EXTEND_LIMIT, includeSeeds: false,
-  });
-  if (!seeds.length) return { tracks: [], cursor, empty: true };
+  // Never cached (the point is to answer from what the evidence says *now*), so
+  // nothing stopped a reload-happy client from stacking builds: a refresh, a
+  // browser back and a second tab all send the same cursor and each paid for a
+  // full page. Identical in-flight requests share one build, and a per-account
+  // ceiling bounds the rest — 30 a minute is one every two seconds, far above
+  // the "queue is running low" rate this is called at, and low enough that a
+  // loop cannot hold every download slot hostage.
+  if (!stationNextBudgetOk(user.id)) {
+    reply.header('retry-after', '60');
+    return reply.code(429).send({ error: 'Slow down — the station is already loading.', code: 'BUSY' });
+  }
+  const epoch = stationEpoch(user.id);
+  const page = await coalesce(
+    searchInFlight,
+    `station-next:${user.id}:${epoch}:${cursor}:${[...exclude].join(',')}`,
+    () => stationPage(user.id, { cursor, exclude, limit: EXTEND_LIMIT, includeSeeds: false }),
+  );
+  const { seeds, tracks, lanes } = page;
+  if (page.epoch !== stationEpoch(user.id)) {
+    return { tracks: [], cursor, empty: false, retry: true, reason: 'station-changing' };
+  }
+  if (!seeds.length) return { tracks: [], cursor, empty: true, reason: 'no-seeds' };
+  if (page.retry && !tracks.length) {
+    return { tracks: [], lanes, cursor, empty: false, retry: true, reason: 'lanes-unavailable' };
+  }
   return {
     tracks,
     lanes,
-    // How far the *next* call should start. A page that found nothing still
-    // advances, so a dry stretch cannot pin the station to one seed forever.
-    cursor: cursor + 3,
+    // How far the *next* call should start. Genuine exhaustion advances; a
+    // transient all-lane failure above explicitly retries at this same cursor.
+    cursor: advanceStationCursor(cursor),
     empty: false,
   };
 });
@@ -1375,8 +2526,17 @@ app.get('/api/browse/:kind', async (req, reply) => {
     const key = `browse:playlists:${q.toLowerCase()}`;
     const hit = cacheGet(key);
     if (hit) return { items: hit };
-    const items = await searchMoodPlaylists(q);
-    cacheSet(key, items, 10 * 60_000);
+    let items;
+    try {
+      items = await coalesce(searchInFlight, key, async () => {
+        const loaded = await searchMoodPlaylists(q);
+        cacheSet(key, loaded, 10 * 60_000);
+        return loaded;
+      });
+    } catch (err) {
+      req.log.warn({ q, err: err.message }, 'mood playlist lookup failed');
+      return upstreamFailure(reply, err, 'playlist');
+    }
     return { items };
   }
 
@@ -1395,7 +2555,13 @@ app.get('/api/browse/:kind', async (req, reply) => {
         })),
       };
     }
-    const fallback = await searchArtists(q || 'music');
+    let fallback;
+    try {
+      fallback = await searchArtists(q || 'music');
+    } catch (err) {
+      req.log.warn({ q, err: err.message }, 'artist browse lookup failed');
+      return upstreamFailure(reply, err, 'artists');
+    }
     return { items: fallback.map((a) => ({ ...a, source: 'search' })) };
   }
 
@@ -1404,8 +2570,19 @@ app.get('/api/browse/:kind', async (req, reply) => {
   const key = `browse:albums:${seed}`;
   const hit = cacheGet(key);
   if (hit) return { items: hit };
-  const items = await searchAlbums(seed);
-  cacheSet(key, items, 10 * 60_000);
+  let items;
+  try {
+    // A cached album shelf is free; a miss is an upstream call, so two tabs
+    // opening Browse at once share one (see coalesce).
+    items = await coalesce(searchInFlight, key, async () => {
+      const loaded = await searchAlbums(seed);
+      cacheSet(key, loaded, 10 * 60_000);
+      return loaded;
+    });
+  } catch (err) {
+    req.log.warn({ seed, err: err.message }, 'album browse lookup failed');
+    return upstreamFailure(reply, err, 'albums by that artist');
+  }
   return { items };
 });
 
@@ -1433,13 +2610,35 @@ app.get('/api/artist/:id', async (req, reply) => {
   // else who opens the page for the next ten minutes.
   if (hit) return { ...hit, following: isFollowing(user.id, hit.id ?? raw) };
 
-  const id = /^UC[\w-]{20,}$/.test(raw) ? raw : await artistIdFor(raw);
+  // A name has to be resolved through the ranked artist search first, which is
+  // an upstream call of its own: a bot-gate here must not be reported as "no
+  // such artist", or the client blames the link instead of the IP.
+  let id = /^UC[\w-]{20,}$/.test(raw) ? raw : null;
+  if (!id) {
+    try {
+      id = await artistIdFor(raw);
+    } catch (err) {
+      req.log.warn({ raw, err: err.message }, 'artist id resolution failed');
+      return upstreamFailure(reply, err, 'that artist');
+    }
+  }
   if (!id) return reply.code(404).send({ error: 'No such artist.' });
 
-  const page = await artistPage(id);
-  for (const t of [...page.songs, ...page.videos]) upsertTrack(t);
-  const payload = { ...page, id };
-  cacheSet(key, payload, 10 * 60_000);
+  let payload;
+  try {
+    // Coalesced as well as cached: opening an artist page twice at once (two
+    // tabs, a double-tap) is one page fetch, not two.
+    payload = await coalesce(searchInFlight, key, async () => {
+      const page = await artistPage(id);
+      transaction(() => { for (const t of [...page.songs, ...page.videos]) upsertTrack(t); });
+      const loaded = { ...page, id };
+      cacheSet(key, loaded, 10 * 60_000);
+      return loaded;
+    });
+  } catch (err) {
+    req.log.warn({ id, err: err.message }, 'artist page failed');
+    return upstreamFailure(reply, err, 'that artist');
+  }
   return { ...payload, following: isFollowing(user.id, id) };
 });
 
@@ -1447,38 +2646,68 @@ app.get('/api/artist/:id', async (req, reply) => {
  * Which release a track belongs to, for "Open album".
  *
  * The client only asks when the track's own row did not carry an album id
- * (up-next, videos, older library rows). `title`/`artist` are accepted as
- * hints so the server does not have to re-read the track from YouTube.
+ * (up-next, videos, older library rows). The `?title=`/`?artist=` hints are
+ * deliberately NOT trusted any more: see below.
  */
 app.get('/api/album/for/:videoId', async (req, reply) => {
   if (!requireUser(req, reply)) return;
   const { videoId } = req.params;
   if (!VIDEO_ID.test(videoId)) return reply.code(400).send({ error: 'Bad video id.' });
-  const title = String(req.query?.title ?? '').trim().slice(0, 200) || null;
-  const artist = String(req.query?.artist ?? '').trim().slice(0, 200) || null;
   const known = getTrack(videoId);
+  // Only server-derived metadata reaches albumForVideo: it caches its answer
+  // (including "no album") for the life of the process, so a caller-supplied
+  // ?title= that did not match the track pair poisoned that cache — "Open
+  // album" stayed greyed out for that song until a restart. A stored row is
+  // trustworthy; a client hint is not, so it is ignored.
   const found = await albumForVideo(videoId, {
-    title: title ?? known?.title ?? null,
-    artist: artist ?? known?.channel ?? null,
+    title: known?.title ?? null,
+    artist: known?.channel ?? null,
   });
   return { albumId: found?.albumId ?? null, title: found?.title ?? null, author: found?.author ?? null };
 });
 
-/** Open a YouTube playlist or album by id. */
+/**
+ * Open a YouTube playlist or album by id.
+ *
+ * Cached for ten minutes and coalesced, like `/api/artist/:id` and
+ * `/api/browse/albums`. It was the one detail page that re-fetched on every
+ * open: back/forward, a reload and every revisit re-paid the resolution timeout
+ * (25 s worst case) plus a 100-row upsert transaction, and `id` is any 200-char
+ * string a client cares to send, so the same route was also the cheapest way to
+ * drive arbitrary upstream load and `tracks` growth. A cached answer is one
+ * object; a *failure* is never cached, so a transient gate is retried.
+ */
 app.get('/api/album/:id', async (req, reply) => {
   if (!requireUser(req, reply)) return;
   const id = String(req.params.id).slice(0, 200);
-  // MPR… is a Music album, which the playlist reader cannot fetch. Albums
-  // opened from an artist page arrive in that form; the library's album tab
-  // still uses PL ids and keeps the old path.
-  if (/^MPR[\w-]+$/.test(id)) {
-    const data = await albumPage(id);
-    for (const t of data.tracks) upsertTrack(t);
-    return { ...data, albumId: id };
+  if (!id) return reply.code(400).send({ error: 'Bad album id.' });
+
+  const key = `album:${id}`;
+  const hit = cacheGet(key);
+  if (hit) return hit;
+
+  try {
+    return await coalesce(searchInFlight, key, async () => {
+      // MPR… is a Music album, which the playlist reader cannot fetch. Albums
+      // opened from an artist page arrive in that form; the library's album tab
+      // still uses PL ids and keeps the old path.
+      if (/^MPR[\w-]+$/.test(id)) {
+        const data = await albumPage(id);
+        transaction(() => { for (const t of data.tracks) upsertTrack(t); });
+        const payload = { ...data, albumId: id };
+        cacheSet(key, payload, 10 * 60_000);
+        return payload;
+      }
+      const { title, author, type, tracks } = await playlistTracks(id);
+      transaction(() => { for (const t of tracks) upsertTrack(t); });
+      const payload = { title, author, type, tracks };
+      cacheSet(key, payload, 10 * 60_000);
+      return payload;
+    });
+  } catch (err) {
+    req.log.warn({ id, err: err.message }, 'album page failed');
+    return upstreamFailure(reply, err, 'album or playlist');
   }
-  const { title, author, type, tracks } = await playlistTracks(id);
-  for (const t of tracks) upsertTrack(t);
-  return { title, author, type, tracks };
 });
 
 // ── follows & notifications ─────────────────────────────────────────────
@@ -1490,6 +2719,26 @@ app.get('/api/album/:id', async (req, reply) => {
 /** A channel id, which is the only thing a follow is keyed by. */
 const ARTIST_ID = /^UC[\w-]{20,}$/;
 
+// Manual checks, follow-time reconciliation and the scheduled sweep all read and
+// write the same release baselines. The old timestamp guarded only one user's
+// manual requests, so two accounts (or the interval) could fetch and commit the
+// same artist concurrently. One process-wide owner prevents those out-of-order
+// writes and bounds upstream work; a busy manual caller gets the same quiet
+// throttle shape as its per-user cooldown rather than queueing another poll.
+// A follow-time baseline is the exception: it is not a notification check and
+// must not consume or imitate the user's first manual check. The route waits for
+// that short, already-running prerequisite before acquiring the shared slot.
+let activeFollowJob = null;
+function beginFollowJob(label, work, { detached = false, kind = 'poll' } = {}) {
+  if (closing || activeFollowJob) return null;
+  const job = trackJob(label, work, { detached });
+  job.kind = kind;
+  activeFollowJob = job;
+  const settled = () => { if (activeFollowJob === job) activeFollowJob = null; };
+  job.promise.then(settled, settled);
+  return job;
+}
+
 app.post('/api/artists/:id/follow', async (req, reply) => {
   const user = requireUser(req, reply);
   if (!user) return;
@@ -1500,21 +2749,20 @@ app.post('/api/artists/:id/follow', async (req, reply) => {
 
   followArtist(user.id, { artistId, name, thumb });
 
-  // Baseline immediately, so following never fires a flood of "new album" for
-  // the whole back catalogue. Two rules here: a dead upstream must not fail the
-  // follow (following is a local decision), and the response must not wait on
-  // YouTube. If the check never lands the next sweep baselines instead, because
-  // an empty baseline means "first look" and notifies nothing.
-  const bounded = new Promise((resolve) => {
-    const timer = setTimeout(resolve, 5000);
-    timer.unref?.();
+  // Reconcile immediately through the same notification-aware path as the sweep:
+  // a first look baselines the back catalogue, while releases already known to
+  // other followers are fanned out rather than consumed and discarded. Following
+  // is still a local, nonblocking decision: a dead upstream cannot fail the route
+  // and the response never waits on YouTube. A failed check leaves its baseline
+  // unadvanced, so a later sweep retries the news.
+  const baseline = beginFollowJob(
+    `follow baseline ${artistId}`,
+    () => checkArtist(artistId, { artist: { artistId, name, thumb } }),
+    { detached: true, kind: 'baseline' },
+  );
+  baseline?.promise.catch((err) => {
+    console.warn('[sonora] follow baseline failed for', artistId, err.message);
   });
-  await Promise.race([
-    checkArtist(artistId).catch((err) => {
-      console.warn('[sonora] follow baseline failed for', artistId, err.message);
-    }),
-    bounded,
-  ]);
 
   return { following: true, artistId, name };
 });
@@ -1565,7 +2813,22 @@ app.post('/api/notifications/read-all', async (req, reply) => {
 // The throttle answers instead of erroring, because "nothing new right now" is
 // exactly what the client would show anyway.
 const NOTIFICATION_CHECK_MS = 60_000;
+const NOTIFICATION_CHECK_MAX = 1000;
 const lastNotificationCheck = new Map(); // userId → epoch ms
+
+function markNotificationCheck(userId, nowMs) {
+  // Accounts can be created and deleted independently of this process-local
+  // cooldown. Prune expired stamps, then retain a hard ceiling even under a
+  // continuous stream of distinct accounts; reinsertion keeps age ordering true.
+  lastNotificationCheck.delete(userId);
+  if (lastNotificationCheck.size >= NOTIFICATION_CHECK_MAX) {
+    for (const [id, at] of lastNotificationCheck) {
+      if (nowMs - at >= NOTIFICATION_CHECK_MS) lastNotificationCheck.delete(id);
+    }
+    evictOldestThird(lastNotificationCheck, NOTIFICATION_CHECK_MAX);
+  }
+  lastNotificationCheck.set(userId, nowMs);
+}
 
 app.post('/api/notifications/check', async (req, reply) => {
   const user = requireUser(req, reply);
@@ -1575,13 +2838,41 @@ app.post('/api/notifications/check', async (req, reply) => {
   if (nowMs - last < NOTIFICATION_CHECK_MS) {
     return { created: 0, unread: countUnread(user.id), throttled: true };
   }
-  // Stamped before the poll so two concurrent requests cannot both run it.
-  lastNotificationCheck.set(user.id, nowMs);
-  const { created } = await pollFollows({ limit: 4 });
+  // Following returns before its baseline fetch finishes. If the listener opens
+  // the bell at once, that prerequisite is still occupying the shared slot. Wait
+  // for it rather than misreporting the user's *first* check as a throttled/busy
+  // no-op. Reserve the cooldown while waiting so a second tap cannot queue a
+  // second manual poll; an unsuccessful acquisition releases the reservation.
+  const baseline = activeFollowJob?.kind === 'baseline' ? activeFollowJob : null;
+  if (baseline) {
+    markNotificationCheck(user.id, nowMs);
+    await baseline.promise.catch(() => {});
+  }
+  const job = beginFollowJob(`manual follow poll for user ${user.id}`,
+    () => pollFollows({ limit: 4, userId: user.id }));
+  if (!job) {
+    if (baseline && lastNotificationCheck.get(user.id) === nowMs) {
+      lastNotificationCheck.delete(user.id);
+    }
+    if (closing) return reply.code(503).send({ error: 'The server is shutting down.' });
+    // Do not spend this user's one-minute cooldown on work that never ran.
+    return { created: 0, unread: countUnread(user.id), throttled: true, busy: true };
+  }
+  // Stamped once the process-wide slot is acquired, so two concurrent requests
+  // for this user still cannot both run, even after the first poll settles. A
+  // request that waited behind a baseline already reserved its stamp above.
+  if (!baseline) markNotificationCheck(user.id, nowMs);
+  // Scoped to the caller. dueFollows() merges every account's due rows and only
+  // then slices to four, so a manual "check for news" used to spend all four of
+  // its page fetches on whatever was globally most overdue — often other
+  // people's artists — and answered {created: 0} having not looked at one of
+  // theirs. Indistinguishable, from the bell, from "no new releases".
+  const { created } = await job.promise;
   return { created, unread: countUnread(user.id) };
 });
 
-/** Lyrics for the now-playing sheet. Cached; null is a normal answer. */app.get('/api/lyrics/:videoId', async (req, reply) => {
+/** Lyrics for the now-playing sheet. Cached; null is a normal answer. */
+app.get('/api/lyrics/:videoId', async (req, reply) => {
   if (!requireUser(req, reply)) return;
   const { videoId } = req.params;
   if (!VIDEO_ID.test(videoId)) return reply.code(400).send({ error: 'Bad video id.' });
@@ -1590,7 +2881,12 @@ app.post('/api/notifications/check', async (req, reply) => {
   if (hit) return hit;
   const text = await fetchLyrics(videoId);
   const payload = { text };
-  cacheSet(key, payload, 6 * 60 * 60_000);
+  // A *definite* "no lyrics" is worth six hours; a null from a timeout, a gate
+  // or a 5xx is not. fetchLyrics() collapses every failure into null, so the
+  // only honest reading of null is "unknown" — cache it briefly, so one slow
+  // lookup does not read as "no lyrics" for the rest of the day (the answer is
+  // also in SQLite, so it survived restarts).
+  cacheSet(key, payload, text ? 6 * 60 * 60_000 : 3 * 60_000);
   return payload;
 });
 
@@ -1618,7 +2914,9 @@ app.post('/api/playlists', async (req, reply) => {
 app.get('/api/playlists/:id', async (req, reply) => {
   const user = requireUser(req, reply);
   if (!user) return;
-  const pl = getPlaylist(user.id, Number(req.params.id));
+  const id = positiveSafeId(req.params.id);
+  if (id === null) return reply.code(400).send({ error: 'Bad playlist id.' });
+  const pl = getPlaylist(user.id, id);
   if (!pl) return reply.code(404).send({ error: 'No such playlist.' });
   return { playlist: pl };
 });
@@ -1626,16 +2924,25 @@ app.get('/api/playlists/:id', async (req, reply) => {
 app.post('/api/playlists/:id/tracks', async (req, reply) => {
   const user = requireUser(req, reply);
   if (!user) return;
-  const videoId = String(req.body?.videoId ?? '');
+  const id = positiveSafeId(req.params.id);
+  if (id === null) return reply.code(400).send({ error: 'Bad playlist id.' });
+  const b = req.body ?? {};
+  const videoId = String(b.videoId ?? '');
   if (!VIDEO_ID.test(videoId)) return reply.code(400).send({ error: 'Bad video id.' });
-  const ok = addPlaylistItem(user.id, Number(req.params.id), {
+  if (!optionalDurationValid(b.durationS)) {
+    return reply.code(400).send({ error: 'Duration must be a nonnegative safe integer.' });
+  }
+  // The catalogue row is global. Existing canonical fields survive a playlist
+  // add; only a genuinely new id may be initialised from the client body.
+  const track = getTrack(videoId) ? { videoId } : {
     videoId,
-    title: String(req.body?.title ?? '').slice(0, 300) || null,
-    channel: String(req.body?.channel ?? '').slice(0, 200) || null,
-    channelId: String(req.body?.channelId ?? '').slice(0, 64) || null,
-    durationS: Number.isFinite(req.body?.durationS) ? req.body.durationS : null,
-    thumb: String(req.body?.thumb ?? '').slice(0, 500) || null,
-  });
+    title: String(b.title ?? '').slice(0, 300) || null,
+    channel: String(b.channel ?? '').slice(0, 200) || null,
+    channelId: String(b.channelId ?? '').slice(0, 64) || null,
+    durationS: b.durationS ?? null,
+    thumb: String(b.thumb ?? '').slice(0, 500) || null,
+  };
+  const ok = addPlaylistItem(user.id, id, track);
   if (!ok) return reply.code(404).send({ error: 'No such playlist.' });
   return { ok: true };
 });
@@ -1643,15 +2950,25 @@ app.post('/api/playlists/:id/tracks', async (req, reply) => {
 app.delete('/api/playlists/:id/tracks/:videoId', async (req, reply) => {
   const user = requireUser(req, reply);
   if (!user) return;
-  const ok = removePlaylistItem(user.id, Number(req.params.id), req.params.videoId);
-  if (!ok) return reply.code(404).send({ error: 'No such playlist.' });
+  const id = positiveSafeId(req.params.id);
+  if (id === null) return reply.code(400).send({ error: 'Bad playlist id.' });
+  if (!VIDEO_ID.test(String(req.params.videoId ?? ''))) {
+    return reply.code(400).send({ error: 'Bad video id.' });
+  }
+  if (!SQL.playlistOwned.get(id, user.id)) return reply.code(404).send({ error: 'No such playlist.' });
+  // DELETE is idempotent. In particular, an absent item must not update the
+  // playlist timestamp and make every client's collection look changed.
+  if (!SQL.playlistItem.get(id, req.params.videoId)) return { ok: true };
+  removePlaylistItem(user.id, id, req.params.videoId);
   return { ok: true };
 });
 
 app.delete('/api/playlists/:id', async (req, reply) => {
   const user = requireUser(req, reply);
   if (!user) return;
-  if (!deletePlaylist(user.id, Number(req.params.id))) {
+  const id = positiveSafeId(req.params.id);
+  if (id === null) return reply.code(400).send({ error: 'Bad playlist id.' });
+  if (!deletePlaylist(user.id, id)) {
     return reply.code(404).send({ error: 'No such playlist.' });
   }
   return { ok: true };
@@ -1664,7 +2981,15 @@ app.get('/api/track/:videoId', async (req, reply) => {
   const { videoId } = req.params;
   if (!VIDEO_ID.test(videoId)) return reply.code(400).send({ error: 'Bad video id.' });
   const track = getTrack(videoId);
-  if (!track) return reply.code(404).send({ error: 'Unknown track.' });
+  // A valid id this instance has never seen is not an error: /t/<id> renders a
+  // card for any id and /api/stream/<id> will fetch it, so a shared link used
+  // to refuse to play here ("That link points to a track sonora has not seen
+  // yet") on the one route that could have served it. The player tolerates a
+  // null title/duration, so answer with a minimal synthetic row and let the
+  // stream fill the rest in.
+  if (!track) {
+    return { track: { videoId, title: null, channel: null, thumb: null, durationS: null, unknown: true } };
+  }
   return { track };
 });
 
@@ -1689,7 +3014,7 @@ app.get('/api/likes', async (req, reply) => {
 app.get('/api/now', async (req, reply) => {
   const user = requireUser(req, reply);
   if (!user) return;
-  const row = db.prepare('SELECT state, updated_at FROM player_state WHERE user_id = ?').get(user.id);
+  const row = SQL.playerState.get(user.id);
   if (!row) return { state: null, updatedAt: null };
   try {
     const saved = JSON.parse(row.state);
@@ -1719,27 +3044,40 @@ const DEVICE_ID = /^[A-Za-z0-9_-]{8,64}$/;
  *    user presses play on that device;
  *  - a stale session can be claimed by anyone.
  */
-app.put('/api/now', async (req, reply) => {
+app.put('/api/now', {
+  // A worst-case 60-track queue (300/200/500-char fields) can approach the
+  // global 64 KB limit; this route's own shape allows more than that, so the
+  // limit is raised here instead of letting a long station window 413.
+  config: { bodyLimit: 256 * 1024 },
+}, async (req, reply) => {
   const user = requireUser(req, reply);
   if (!user) return;
   const b = req.body ?? {};
-  const queue = Array.isArray(b.queue) ? b.queue.slice(0, 60) : [];
-  const tracks = queue
-    .filter((t) => VIDEO_ID.test(String(t?.videoId ?? '')))
-    .map((t) => ({
-      videoId: t.videoId,
-      title: String(t.title ?? '').slice(0, 300),
-      channel: String(t.channel ?? '').slice(0, 200),
-      thumb: String(t.thumb ?? '').slice(0, 500),
-      durationS: Number.isFinite(t.durationS) ? Math.max(0, Math.round(t.durationS)) : null,
-    }));
-  const index = Number.isInteger(b.index) ? Math.max(0, Math.min(b.index, Math.max(0, tracks.length - 1))) : 0;
-
+  for (const field of ['takeover', 'station', 'playing']) {
+    if (!optionalBooleanValid(b, field)) {
+      return reply.code(400).send({ error: `${field} must be a boolean.` });
+    }
+  }
+  if (!optionalDurationValid(b.positionMs) || !optionalDurationValid(b.clientSavedAt)) {
+    return reply.code(400).send({ error: 'Playhead times must be nonnegative safe integers.' });
+  }
+  const hasClientOrder = Number.isSafeInteger(b.clientSavedAt) && b.clientSavedAt >= 0;
+  if (b.clientSaveSeq !== undefined && b.clientSaveSeq !== null
+      && (!Number.isSafeInteger(b.clientSaveSeq) || b.clientSaveSeq < 1)) {
+    return reply.code(400).send({ error: 'clientSaveSeq must be a positive safe integer.' });
+  }
+  if (b.clientSaveSeq != null && !hasClientOrder) {
+    return reply.code(400).send({ error: 'clientSaveSeq requires clientSavedAt.' });
+  }
+  if (b.index !== undefined && !Number.isSafeInteger(b.index)) {
+    return reply.code(400).send({ error: 'Queue index must be a safe integer.' });
+  }
+  const clientSaveSeq = hasClientOrder ? (b.clientSaveSeq ?? 0) : null;
   const deviceId = DEVICE_ID.test(String(b.deviceId ?? '')) ? String(b.deviceId) : null;
   const deviceName = String(b.deviceName ?? '').trim().slice(0, 40) || null;
-  const takeover = Boolean(b.takeover);
+  const takeover = b.takeover ?? false;
 
-  const row = db.prepare('SELECT state, updated_at FROM player_state WHERE user_id = ?').get(user.id);
+  const row = SQL.playerState.get(user.id);
   let prev = null;
   if (row) { try { prev = JSON.parse(row.state); } catch {} }
   const prevUpdatedAt = row ? (Date.parse(row.updated_at) || 0) : 0;
@@ -1751,30 +3089,109 @@ app.put('/api/now', async (req, reply) => {
   if (deviceId && prevDeviceId && deviceId !== prevDeviceId && !takeover && !stale) {
     return reply.code(409).send({
       error: 'Another device is playing.',
+      code: 'DEVICE_CONFLICT',
+      // This conflict is the one case where the caller needs the complete queue:
+      // app.js adopts it when another device has taken over playback.
       state: prev,
       updatedAt: prevUpdatedAt,
     });
   }
 
-  const now = Date.now();
+  // Arrival time cannot order two network requests: a delayed older autosave can
+  // arrive after the pause/seek that followed it. New clients therefore stamp a
+  // wall-clock millisecond plus a sequence for saves within that millisecond.
+  // Compare only within the owning device; another device's sequence is private
+  // and belongs to the ownership/takeover rule above. Omitting both fields keeps
+  // the documented legacy last-write-wins behaviour.
+  if (hasClientOrder && deviceId && deviceId === prevDeviceId
+      && Number.isSafeInteger(prev?.clientSavedAt)) {
+    const beforePrevious = b.clientSavedAt < prev.clientSavedAt
+      || (b.clientSavedAt === prev.clientSavedAt
+        && clientSaveSeq <= (Number.isSafeInteger(prev?.clientSaveSeq) ? prev.clientSaveSeq : 0));
+    if (beforePrevious) {
+      return reply.code(409).send({
+        error: 'A newer save from this device has already been applied.',
+        code: 'STALE_SAVE',
+        updatedAt: prevUpdatedAt,
+      });
+    }
+  }
+
+  // The body is allowed to be PARTIAL, and the playhead patch is the reason: a
+  // phone nudging its position every few seconds used to re-upload the whole
+  // queue (58 KB for a full station window) to change three numbers. A body with
+  // no `queue` therefore keeps the stored queue, and every field it does not
+  // mention keeps its stored value — which also means an older client that
+  // always sends the full body behaves exactly as before.
+  const hasQueue = Array.isArray(b.queue);
+  const stored = Array.isArray(prev?.tracks) ? prev.tracks : [];
+  const submitted = hasQueue ? b.queue.slice(0, 60) : [];
+  const indexedTracks = [];
+  for (const [sourceIndex, t] of submitted.entries()) {
+    if (!VIDEO_ID.test(String(t?.videoId ?? ''))) continue;
+    if (!optionalDurationValid(t.durationS)) {
+      return reply.code(400).send({ error: 'Queue durations must be nonnegative safe integers.' });
+    }
+    indexedTracks.push({
+      sourceIndex,
+      track: {
+        videoId: t.videoId,
+        title: String(t.title ?? '').slice(0, 300),
+        channel: String(t.channel ?? '').slice(0, 200),
+        thumb: String(t.thumb ?? '').slice(0, 500),
+        durationS: t.durationS ?? null,
+      },
+    });
+  }
+  const tracks = hasQueue ? indexedTracks.map(({ track }) => track) : stored;
+  const clampIndex = (n) => Math.max(0, Math.min(n, Math.max(0, tracks.length - 1)));
+
+  // Which row the playhead is on. A full body's index refers to the *submitted*
+  // queue, so if invalid ids are filtered, find the surviving entry at that
+  // original position instead of shifting the playhead to the next song.
+  // `videoId` remains the natural key for a patch; an explicit index wins.
+  let index;
+  if (Number.isInteger(b.index) && hasQueue) {
+    const original = Math.max(0, Math.min(b.index, Math.max(0, submitted.length - 1)));
+    const exact = indexedTracks.findIndex((entry) => entry.sourceIndex === original);
+    const following = indexedTracks.findIndex((entry) => entry.sourceIndex >= original);
+    index = exact >= 0 ? exact : following >= 0 ? following : clampIndex(b.index);
+  } else if (Number.isInteger(b.index)) index = clampIndex(b.index);
+  else if (VIDEO_ID.test(String(b.videoId ?? ''))) {
+    const at = tracks.findIndex((t) => t.videoId === b.videoId);
+    index = at >= 0 ? at : clampIndex(Number.isInteger(prev?.index) ? prev.index : 0);
+  } else index = clampIndex(Number.isInteger(prev?.index) && !hasQueue ? prev.index : 0);
+
+  // Absent fields inherit the stored value — but only for a *partial* body. A
+  // full body that omits `station`/`playing`/`source` keeps the old reading
+  // (false/empty), so a client that has always sent the whole queue behaves
+  // exactly as it did; and a playhead patch can never freeze an endless station
+  // into a plain queue by leaving `station` out.
+  const inherit = !hasQueue;
+  const now = Math.max(Date.now(), prevUpdatedAt + 1);
+  const inheritedOrder = deviceId && deviceId === prevDeviceId;
   const state = {
     tracks,
     index,
-    positionMs: Number.isFinite(b.positionMs) ? Math.max(0, Math.round(b.positionMs)) : 0,
-    source: String(b.source ?? '').slice(0, 40),
+    positionMs: b.positionMs ?? (hasQueue ? 0 : Number(prev?.positionMs) || 0),
+    source: String(b.source ?? (inherit ? prev?.source ?? '' : '')).slice(0, 40),
     // Whether what was playing was the endless station. Restoring a station as
     // a plain queue would silently freeze it into the handful of songs that
     // happened to be buffered when the phone locked.
-    station: Boolean(b.station),
+    station: b.station ?? (inherit ? prev?.station === true : false),
     deviceId: deviceId ?? prevDeviceId ?? null,
     deviceName: deviceName ?? prev?.deviceName ?? null,
-    playing: Boolean(b.playing),
+    playing: b.playing ?? (inherit ? prev?.playing === true : false),
+    ...(hasClientOrder ? {
+      clientSavedAt: b.clientSavedAt,
+      clientSaveSeq,
+    } : inheritedOrder ? {
+      clientSavedAt: prev.clientSavedAt ?? null,
+      clientSaveSeq: prev.clientSaveSeq ?? null,
+    } : { clientSavedAt: null, clientSaveSeq: null }),
     updatedAt: now,
   };
-  db.prepare(`
-    INSERT INTO player_state (user_id, state, updated_at) VALUES (?, ?, ?)
-    ON CONFLICT(user_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at
-  `).run(user.id, JSON.stringify(state), new Date(now).toISOString());
+  SQL.savePlayerState.run(user.id, JSON.stringify(state), new Date(now).toISOString());
   return { ok: true, updatedAt: now, deviceId: state.deviceId, deviceName: state.deviceName };
 });
 
@@ -1783,14 +3200,23 @@ app.post('/api/likes', async (req, reply) => {
   if (!user) return;
   const videoId = String(req.body?.videoId ?? '');
   if (!VIDEO_ID.test(videoId)) return reply.code(400).send({ error: 'Bad video id.' });
-  const on = Boolean(req.body?.like);
+  if (typeof req.body?.like !== 'boolean') return reply.code(400).send({ error: 'like must be a boolean.' });
+  if (!optionalDurationValid(req.body?.durationS)) {
+    return reply.code(400).send({ error: 'Duration must be a nonnegative safe integer.' });
+  }
+  const on = req.body.like;
+  // This is an absolute setting, not a "vote again" event. Repeating it must not
+  // manufacture extra station/ranking evidence or invalidate an unchanged queue.
+  if (Boolean(SQL.likePresent.get(user.id, videoId)) === on) return { ok: true, liked: on };
   rememberFromBody(videoId, req.body ?? {});
   toggleLike(user.id, videoId, on);
   // Likes are a station input, so the built queue is now stale.
   invalidateStation(user.id);
   recordPlay({
     userId: user.id, videoId, kind: on ? 'like' : 'unlike',
-    source: String(req.body?.source ?? '') || null,
+    // Clamped like every sibling that writes plays: the body limit lets 64 KB
+    // through, and `source` would otherwise be the one column without a cap.
+    source: String(req.body?.source ?? '').slice(0, 40) || null,
   });
   return { ok: true, liked: on };
 });
@@ -1811,18 +3237,27 @@ app.post('/api/dislikes', async (req, reply) => {
   if (!user) return;
   const videoId = String(req.body?.videoId ?? '');
   if (!VIDEO_ID.test(videoId)) return reply.code(400).send({ error: 'Bad video id.' });
-  const on = Boolean(req.body?.dislike);
+  if (typeof req.body?.dislike !== 'boolean') return reply.code(400).send({ error: 'dislike must be a boolean.' });
+  if (!optionalDurationValid(req.body?.durationS)) {
+    return reply.code(400).send({ error: 'Duration must be a nonnegative safe integer.' });
+  }
+  const on = req.body.dislike;
+  if (Boolean(SQL.dislikePresent.get(user.id, videoId)) === on) return { ok: true, disliked: on };
   rememberFromBody(videoId, req.body ?? {});
   toggleDislike(user.id, videoId, on);
   invalidateStation(user.id);
   recordPlay({
     userId: user.id, videoId, kind: on ? 'dislike' : 'undislike',
-    source: String(req.body?.source ?? '') || null,
+    source: String(req.body?.source ?? '').slice(0, 40) || null,
   });
   return { ok: true, disliked: on };
 });
 
 // ── the taste signal ────────────────────────────────────────────────────
+
+// Every play event kind the client may report. Compiled once: a Set built per
+// request is pure waste on the hottest write path in the app.
+const PLAY_EVENT_KINDS = new Set(['start', 'progress', 'complete', 'skip']);
 
 app.post('/api/events', async (req, reply) => {
   const user = requireUser(req, reply);
@@ -1831,8 +3266,18 @@ app.post('/api/events', async (req, reply) => {
   const videoId = String(b.videoId ?? '');
   if (!VIDEO_ID.test(videoId)) return reply.code(400).send({ error: 'Bad video id.' });
   const kind = String(b.kind ?? '');
-  const allowed = new Set(['start', 'progress', 'complete', 'skip']);
-  if (!allowed.has(kind)) return reply.code(400).send({ error: 'Bad kind.' });
+  if (!PLAY_EVENT_KINDS.has(kind)) return reply.code(400).send({ error: 'Bad kind.' });
+  if (!optionalDurationValid(b.positionMs) || !optionalDurationValid(b.durationMs)
+      || !optionalDurationValid(b.durationS)) {
+    return reply.code(400).send({ error: 'Playback times must be nonnegative safe integers.' });
+  }
+  // Work out the threshold crossing *before* recording this heartbeat. Later
+  // 65%, 70%, … ticks then observe the already-deep history and do not evict the
+  // station again. This also works across restarts and admin history clears;
+  // an in-memory "already invalidated" set would forget or poison those cases.
+  const crossedSeedThreshold = kind === 'progress' && b.durationMs > 0
+    && b.positionMs / b.durationMs >= 0.6
+    && (Number(SQL.stationDepth.get(user.id, videoId)?.deepest) || 0) < 0.6;
   // The station names what it was built from, so a play event from a track the
   // server has never seen must bring its metadata along.
   rememberFromBody(videoId, b);
@@ -1840,26 +3285,22 @@ app.post('/api/events', async (req, reply) => {
     userId: user.id,
     videoId,
     kind,
-    positionMs: Number.isFinite(b.positionMs) ? Math.max(0, Math.round(b.positionMs)) : null,
-    durationMs: Number.isFinite(b.durationMs) ? Math.max(0, Math.round(b.durationMs)) : null,
+    positionMs: b.positionMs ?? null,
+    durationMs: b.durationMs ?? null,
     source: String(b.source ?? '').slice(0, 40) || null,
   });
-  // A track played through becomes a station seed; a skip changes its score.
-  invalidateStation(user.id);
+  // Only events that can change seed evidence drop the cached station. A start
+  // and a shallow heartbeat do not qualify; the first progress tick at 60% does,
+  // while subsequent ticks above it reuse the freshly built page.
+  if (kind === 'complete' || kind === 'skip' || crossedSeedThreshold) invalidateStation(user.id);
   return { ok: true };
 });
 
 app.get('/api/stats', async (req, reply) => {
   const user = requireUser(req, reply);
   if (!user) return;
-  const row = db.prepare(`
-    SELECT
-      COUNT(*) FILTER (WHERE kind = 'start')  AS starts,
-      COUNT(*) FILTER (WHERE kind = 'complete') AS completes,
-      COUNT(*) FILTER (WHERE kind = 'skip')   AS skips
-    FROM plays WHERE user_id = ?
-  `).get(user.id);
-  const likes = db.prepare('SELECT COUNT(*) AS n FROM likes WHERE user_id = ?').get(user.id).n;
+  const row = SQL.stats.get(user.id);
+  const likes = SQL.likeCount.get(user.id).n;
   return { ...row, likes, readyForRanking: (row.starts ?? 0) >= 50 };
 });
 
@@ -1875,14 +3316,40 @@ app.get('/api/stats', async (req, reply) => {
 // explicitly allows a server to return fewer bytes than requested).
 const CHUNK_BYTES = 1024 * 1024;
 
+/**
+ * A single byte range, or the instruction to ignore the header.
+ *
+ * `{ start, end }` is a usable range (206); `null` is a well-formed range that
+ * cannot be satisfied (416, with the real size in `content-range`);
+ * `'full'` is a header that is present but is not one usable byte range, and its
+ * answer is the whole file with a 200.
+ *
+ * `'full'` exists because a malformed or multi-part header used to be answered
+ * with the first chunk as a 206: RFC 9110 §14.2 says a Range the server cannot
+ * use is *ignored*, and a 206 makes a media element believe the file is exactly
+ * that one chunk — it played one window and then reported a truncated stream.
+ * An *absent* header keeps the clamped 206 below: that is what a media element's
+ * first request looks like, and every client of this proxy is a media element
+ * (a 200 there would make it download a whole track to play the first second).
+ */
 function parseRange(header, total) {
-  const m = /^bytes=(\d*)-(\d*)$/.exec(header ?? '');
-  if (!m) return { start: 0, end: Math.min(total - 1, CHUNK_BYTES - 1) };
+  // A zero-byte file has no satisfiable byte range at all.
+  if (!(total > 0)) return null;
+  const raw = typeof header === 'string' ? header.trim() : '';
+  const m = /^bytes=(\d*)-(\d*)$/.exec(raw);
+  if (!m) {
+    if (raw) return 'full';
+    return { start: 0, end: Math.min(total - 1, CHUNK_BYTES - 1) };
+  }
   const [, rawStart, rawEnd] = m;
 
   // suffix form: bytes=-N  (last N bytes)
   if (rawStart === '' && rawEnd !== '') {
     const n = Math.min(Number(rawEnd), CHUNK_BYTES);
+    // bytes=-0 asks for the last zero bytes, which is not a range. Computing it
+    // used to yield start === total, and fs.createReadStream then threw
+    // ERR_OUT_OF_RANGE *after* the 206 headers were on the wire.
+    if (!Number.isFinite(n) || n <= 0) return null;
     return { start: Math.max(0, total - n), end: total - 1 };
   }
 
@@ -1890,6 +3357,10 @@ function parseRange(header, total) {
   const wanted = rawEnd === '' ? Infinity : Number(rawEnd);
   if (!Number.isFinite(start) || start < 0) return null;
   if (start >= total) return null; // 416
+  // A last-byte-pos before the first-byte-pos is not a valid range (RFC 9110
+  // §14.1.1). It used to reach createReadStream, which threw after the headers
+  // had been flushed: a 500 carrying `content-range: bytes 100-50/…`.
+  if (wanted < start) return null;
 
   const end = Math.min(wanted, start + CHUNK_BYTES - 1, total - 1);
   return { start, end };
@@ -1901,32 +3372,96 @@ function parseRange(header, total) {
 // after the user presses next. Measured 2026-10-20: a cold track took 15 s to
 // first byte (and 30 s+ when DNS was slow) versus ~0.17 s from cache — this is
 // the difference between "press play, wait" and "press play".
+// Prefetch is a *budget*, not an open tap. A signed-in client could ask the
+// server to download any YouTube id forever — the guest path is queue-scoped,
+// this one had no bound at all — and every abandoned prefetch queues ahead of a
+// real stream in the download slots. One account gets 40 prefetches a minute; a
+// client that settles on a track (the normal case) uses a tiny fraction of that.
+//
+// The same counter is what /api/stream spends on a cold track (see the handler):
+// a prefetch and a play both cost one yt-dlp download in one of the shared
+// slots, so they belong to one budget. A cache hit costs nothing in either.
+const WARM_MAX_PER_MIN = 40;
+const warmBudget = new Map(); // userId → epoch ms[]
+const warmBudgetOk = (userId) => budgetOk(warmBudget, userId, WARM_MAX_PER_MIN);
+
+// `/api/station/next` is never cached — its whole job is to answer from what the
+// evidence says now — so its only bound was the IP rate limiter. One page is
+// 6-15 upstream calls; see the route for the reasoning behind this ceiling.
+const STATION_NEXT_MAX_PER_MIN = 30;
+const stationNextBudget = new Map();
+const stationNextBudgetOk = (userId) => budgetOk(stationNextBudget, userId, STATION_NEXT_MAX_PER_MIN);
+
+/**
+ * A per-account sliding one-minute window: the shared bookkeeping behind both
+ * budgets above. Returns false when the window is full.
+ *
+ * Keyed by user id, not IP: the point is that one signed-in client cannot spend
+ * a shared resource (yt-dlp slots, YouTube's patience) on behalf of everyone
+ * else, and an IP is exactly the thing a client can change.
+ */
+function budgetOk(map, userId, max) {
+  const now = Date.now();
+  const hits = (map.get(userId) ?? []).filter((t) => now - t < 60_000);
+  if (hits.length >= max) {
+    map.set(userId, hits);
+    return false;
+  }
+  hits.push(now);
+  map.set(userId, hits);
+  // Bound the bookkeeping, not the feature: the oldest account is forgettable
+  // and simply starts a fresh window on its next request.
+  if (map.size > 512) map.delete(map.keys().next().value);
+  return true;
+}
+
 app.post('/api/warm/:videoId', {
   // Prefetching is chatty by nature (one call per track advance); it must not
   // eat into the interactive budget.
   config: { rateLimit: { max: 240, timeWindow: '1 minute' } },
 }, async (req, reply) => {
-  if (!requireUser(req, reply)) return;
+  const user = requireUser(req, reply);
+  if (!user) return;
   const { videoId } = req.params;
   if (!VIDEO_ID.test(videoId)) return reply.code(400).send({ error: 'Bad video id.' });
-
+  // Cache hits never spend a download budget: no process or upstream request is
+  // needed. The old order let repeatedly warming an existing file exhaust the
+  // user's entire cold-playback allowance.
   if (await cachedAudio(videoId)) return { ready: true };
+
+  if (!warmBudgetOk(user.id)) {
+    return reply.code(429).send({ error: 'Too many prefetches. Playback still works; wait a minute.' });
+  }
 
   // Fire and forget: the client never waits on this, and a failure is silent
   // because the real /api/stream request will retry and report it properly.
-  // ensureAudio() dedupes against an in-flight download, so a warm that races
-  // a real play shares one yt-dlp process.
-  ensureAudio(videoId).catch((err) => {
+  // ensureAudio() dedupes against an in-flight download, so a warm that races a
+  // real play shares one yt-dlp process. This signal cancels only the warm's own
+  // subscriber: audio.js keeps the shared producer alive while a listener still
+  // needs it. Shutdown never reaches past that API to kill a shared child.
+  const ac = new AbortController();
+  const warm = trackDetached(`audio prefetch ${videoId}`,
+    () => ensureAudio(videoId, { signal: ac.signal }), { cancel: () => ac.abort() });
+  if (!warm) return reply.code(503).send({ error: 'The server is shutting down.' });
+  warm.promise.catch((err) => {
     req.log.debug({ videoId, err: err.message }, 'prefetch failed');
   });
   return reply.code(202).send({ warming: true });
 });
 
 app.route({
+  // GET and HEAD only. `DELETE` used to be listed here and had no branch, so a
+  // DELETE fell through the handler into the download-and-stream path — the one
+  // method that looks like "stop" doing the most expensive thing the server can
+  // do. The client's only DELETE is the queue stream's own live route (which has
+  // its branch), so nothing loses a method; the explicit `app.delete` below
+  // answers 405 rather than letting Fastify 404 it.
   method: ['GET', 'HEAD'],
   url: '/api/stream/:videoId',
-  // Audio must never be throttled into a 429: the <audio> element treats that
-  // as a decode failure. Keep a ceiling, but well above normal playback.
+  // The *request rate* must never throttle audio: a single track costs several
+  // ranged requests and the <audio> element treats a 429 as a decode failure.
+  // Keep a ceiling, but well above normal playback. (The cold-download budget in
+  // the handler is a different thing and does answer 429 — see below.)
   config: { rateLimit: { max: 6000, timeWindow: '1 minute' } },
   handler: async (req, reply) => {
     const { videoId } = req.params;
@@ -1935,9 +3470,11 @@ app.route({
       // Anonymous listening exists only inside a public room. The guest cookie
       // is room-scoped and the id must be in that room's queue, so this never
       // becomes an open YouTube proxy: it serves exactly what the room is
-      // playing (and has queued), nothing else.
-      const guest = currentGuest(req);
-      if (!guest || !guestStreamAllowed(guest.code, videoId)) {
+      // playing (and has queued), nothing else. A browser may hold a guest
+      // identity for several rooms at once, so any of them may authorise this
+      // id — nothing is served unless one room's queue actually contains it.
+      const guests = guestsFor(req);
+      if (!guests.some((g) => guestStreamAllowed(g.code, videoId))) {
         return reply.code(401).send({ error: 'Not signed in.' });
       }
     }
@@ -1949,6 +3486,33 @@ app.route({
       meta = await cachedAudio(videoId);
       if (!meta) return reply.code(204).header('cache-control', 'no-store').send();
     } else {
+      const onDisk = await cachedAudio(videoId);
+      // Every cold id is a real yt-dlp download, and only `maxDownloads` run at
+      // once — the rest wait in an unbounded queue while their request stays
+      // open. Signed in, nothing bounded how many *new* ids one account could
+      // ask for (the route allows 6000 requests a minute; ranged playback alone
+      // needs a few), so a few hundred distinct ids kept every slot full of
+      // tracks nobody was listening to and a real play waited behind them — and
+      // it is the fastest way to get the whole instance's IP bot-gated. Cache
+      // hits are free and never counted: this is a budget on downloads, not on
+      // playback.
+      const budgetKey = req.user?.id ?? `guest:${req.ip}`;
+      if (!onDisk && !warmBudgetOk(budgetKey)) {
+        // Guests are room/queue-scoped but anonymous. Charge their cold work by
+        // the authenticated client's IP (the socket peer unless the actual proxy
+        // is allowlisted), not by a regenerable guest cookie.
+        reply.header('retry-after', '60');
+        return reply.code(429).send({
+          error: 'Too many new tracks at once. Playback still works; wait a minute.',
+          code: 'BUDGET',
+        });
+      }
+      // A client that navigates away mid-download used to keep its yt-dlp child
+      // running to completion (and hold its slot doing it). The response's
+      // close is the one signal that says the listener is gone, so it aborts the
+      // download and frees the slot for someone who is still listening.
+      const ac = new AbortController();
+      reply.raw.on('close', () => ac.abort());
       try {
         // Live broadcasts cannot be fetched to completion; fail fast instead of
         // letting yt-dlp read a never-ending stream until it times out.
@@ -1957,11 +3521,35 @@ app.route({
         // YouTube round-trip, and a track already on disk is known-good. Paying
         // it unconditionally put ~0.2 s (much more with slow DNS) in front of
         // every cold page load for no benefit.
-        if (!(await cachedAudio(videoId)) && (await isLive(videoId))) {
+        if (!onDisk && (await isLive(videoId))) {
           return reply.code(502).send({ error: 'This is a live stream — not supported yet.' });
         }
-        meta = await ensureAudio(videoId);      } catch (err) {
+        meta = await ensureAudio(videoId, { signal: ac.signal });
+      } catch (err) {
+        if (err.code === 'ABORTED') {
+          // The download was cancelled. When this request is the one that was
+          // cancelled there is nobody left to answer — hijacking keeps Fastify
+          // from writing to a closed socket. When a *shared* download was
+          // aborted by whoever started it, this client is still waiting and gets
+          // a retryable answer instead of a connection that never resolves.
+          //
+          // Not logged as a failure: navigating away mid-download is normal and
+          // would otherwise fill the log with one warning per page change.
+          if (ac.signal.aborted) return reply.hijack();
+          return reply.code(503).send({ error: 'busy, try again', code: 'BUSY' });
+        }
+        if (err.code === 'BUSY') {
+          // Every download slot stayed taken for the whole wait: say so instead
+          // of hanging the request open until the client gives up.
+          return reply.code(503).send({ error: 'busy, try again', code: 'BUSY' });
+        }
         req.log.warn({ videoId, err: err.message }, 'audio fetch failed');
+        if (err.code === 'ENOSPC') {
+          return reply.code(503).send({
+            error: 'The audio cache is on a full disk. Free some space (or clear the cache) and retry.',
+            code: 'ENOSPC',
+          });
+        }
         if (err.code === 'BOT_GATED') {
           botGateAt = Date.now();
           return reply.code(503).send({
@@ -1974,8 +3562,24 @@ app.route({
     }
 
     const range = parseRange(req.headers.range, meta.size);
+    if (range === 'full') {
+      // The Range header was unusable, so it is ignored rather than guessed at:
+      // 200 and the whole file, with the real length. A truncated 206 here made a
+      // player treat one chunk as the entire track (see parseRange).
+      reply
+        .header('content-type', 'audio/mp4')
+        .header('accept-ranges', 'bytes')
+        .header('content-length', String(meta.size))
+        .header('cache-control', 'private, max-age=86400');
+      if (req.method === 'HEAD') return reply.send();
+      return reply.send(fs.createReadStream(meta.file));
+    }
     if (!range) {
-      return reply.code(416).header('content-range', `bytes */${meta.size}`).send();
+      return reply
+        .code(416)
+        .header('accept-ranges', 'bytes')
+        .header('content-range', `bytes */${meta.size}`)
+        .send();
     }
 
     const length = range.end - range.start + 1;
@@ -1989,8 +3593,188 @@ app.route({
 
     if (req.method === 'HEAD') return reply.send();
 
+    // reply.send() of a Readable goes through stream.pipeline, so a cancelled
+    // request destroys this stream (and closes its fd) rather than leaking it.
     return reply.send(fs.createReadStream(meta.file, { start: range.start, end: range.end }));
   },
+});
+
+// The audio proxy is a GET and nothing else. This is not a route that "handles"
+// DELETE — it answers it, so the method is refused instead of 404'd (a client
+// that DELETE'd this path used to run the *download* path, which is the one
+// method-shaped mistake this route can make: "stop" doing the most expensive
+// thing the server does). Fastify does not synthesise 405 on its own.
+app.delete('/api/stream/:videoId', async (req, reply) => reply
+  .code(405)
+  .header('allow', 'GET, HEAD')
+  .send({ error: 'The audio proxy only answers GET and HEAD.' }));
+
+// ── client diagnostics ──────────────────────────────────────────────────
+//
+// A PWA on a locked phone has no remote console, and the hidden-playback path
+// is designed to be invisible: its plan is armed minutes before it is used, and
+// at the moment it matters the page is not running. That makes "it still does
+// not work" unanswerable from the server — the first report after the queue
+// stream shipped could not be told apart from three very different causes. So
+// the client is allowed to *say* what it decided, and the answer lands in the
+// log with everything else.
+//
+// Nothing is stored and nothing is trusted: the body is a bounded, opaque
+// object that is logged at info with the account it came from. Rate-limited so
+// it cannot become a write amplifier.
+const CLIENT_REPORT_MAX_CHARS = 4096;
+app.post('/api/client-report', {
+  config: { rateLimit: { max: 120, timeWindow: '1 minute' } },
+}, async (req, reply) => {
+  const user = requireUser(req, reply);
+  if (!user) return;
+  const body = req.body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return reply.code(400).send({ error: 'A report must be an object.' });
+  }
+  const size = JSON.stringify(body).length;
+  if (size > CLIENT_REPORT_MAX_CHARS) return reply.code(413).send({ error: 'Report too large.' });
+  if (typeof body.event !== 'string' || body.event.length > 40) {
+    return reply.code(400).send({ error: 'A report needs a short event name.' });
+  }
+  // The rest is attacker-controlled JSON, so it does not go into the log as
+  // structured fields: a key here becomes a field in the log line, and a value
+  // with a newline in it forges the next line wherever the log is not JSON. One
+  // compact, single-line, bounded string instead — the event name stays a field
+  // because it is the thing a search greps for, and it is length-checked above.
+  const { event, ...detail } = body;
+  const summary = JSON.stringify(detail)
+    .replace(/[\u0000-\u001f\u007f\u0085\u2028\u2029]+/g, ' ')
+    .slice(0, 2000);
+  req.log.info({ event, report: summary, userId: user.id, size }, 'client report');
+  return reply.code(204).send();
+});
+
+// ── the queue as one continuous stream ──────────────────────────────────
+// The client asks for a plan while it is visible and playing, and points the
+// <audio> element at the stream when the page goes hidden. That is the only
+// shape in which a locked iPhone keeps playing across a track boundary: the
+// media process keeps streaming, the page's script is suspended, and nothing
+// has to run at the boundary. src/queue-stream.js carries the whole argument.
+//
+// The plan is a *player* endpoint: every id must already be in the audio cache
+// (the player filled it), so this cannot be used to fetch a track cold or to
+// browse YouTube through the server.
+app.post('/api/queue-stream/plan', {
+  // One call per track start, plus retries; cheap, but not a hot path.
+  config: { rateLimit: { max: 240, timeWindow: '1 minute' } },
+}, async (req, reply) => {
+  const user = requireUser(req, reply);
+  if (!user) return;
+  const ids = req.body?.ids;
+  if (!Array.isArray(ids)) return reply.code(400).send({ error: 'ids must be an array of video ids.' });
+  if (ids.length > 200) return reply.code(400).send({ error: 'Too many ids.' });
+  const plan = await planQueueStream({ userId: user.id, videoIds: ids });
+  if (!plan.token) {
+    // Nothing cached yet: the caller keeps the per-track player, which is what
+    // it was doing before this endpoint existed.
+    return reply.code(409).send({ error: 'Nothing to stream yet.', code: 'EMPTY' });
+  }
+  return reply.header('cache-control', 'no-store').send(plan);
+});
+
+app.route({
+  method: ['GET', 'HEAD', 'DELETE'],
+  // The URL ends in `.m3u8` because the engines do: Chromium and WebKit both
+  // refuse a playlist served from an extensionless path with a perfect
+  // `application/vnd.apple.mpegurl` content type (measured: same bytes, same
+  // headers, `.m3u8` plays and the bare path is NotSupportedError). The name is
+  // part of the contract, not decoration.
+  url: '/api/queue-stream/:token/live.m3u8',
+  // The media process re-fetches the playlist about every segment (6 s) for as
+  // long as the phone stays locked, and one segment request rides along with
+  // each. Generous, but bounded.
+  config: { rateLimit: { max: 600, timeWindow: '1 minute' } },
+  handler: async (req, reply) => {
+    const user = requireUser(req, reply);
+    if (!user) return;
+    const plan = getPlan(req.params.token, user.id);
+    if (!plan) return reply.code(404).send({ error: 'Unknown or expired stream.', code: 'NO_PLAN' });
+    const atMs = Math.max(0, Math.min(24 * 60 * 60 * 1000, Math.round(Number(req.query?.at) || 0)));
+
+    // The session is created by the first playlist request and lives until the
+    // listener goes quiet: every later request is a file read and a string
+    // build, no ffmpeg.
+    // HEAD is the app's "is this endpoint really there" probe; answering it
+    // must not pay for an ffmpeg process. DELETE is the client saying it is
+    // done: tear the session (and its ffmpeg tail) down now rather than after
+    // the idle timeout, so a listener who skips around does not stack sessions
+    // into the per-user cap.
+    if (req.method === 'HEAD') {
+      return reply.header('content-type', 'application/vnd.apple.mpegurl').send();
+    }
+    if (req.method === 'DELETE') {
+      closeSession(req.params.token, user.id);
+      return reply.code(204).send();
+    }
+    let session = getSession(req.params.token, user.id);
+    if (!session) {
+      try {
+        const opened = await openQueueStream(plan.tracks, atMs, user.id);
+        session = opened.session;
+        attachSession(req.params.token, session);
+      } catch (err) {
+        if (err.code === 'BUSY') {
+          reply.header('retry-after', '30');
+          return reply.code(429).type('application/json')
+            .send({ error: 'Too many open streams. Try again shortly.', code: 'BUSY' });
+        }
+        req.log.warn({ err: err.message }, 'queue stream failed to start');
+        return reply.code(503).send({ error: 'Could not start the stream.' });
+      }
+    }
+    // A new `k` means the client assigned a new `src` (a seek, or a fresh
+    // entry): its `at` repositions the window. Polls carry the same `k` and
+    // ride the consumption clock instead.
+    maybeReposition(session, atMs, req.query?.k ?? null);
+    // The window is whatever the listener is about to need; producing it here
+    // is what makes a cold open or a far seek start within a segment cut
+    // (~0.5 s of encode) rather than waiting for a broadcast to reach it.
+    const seqs = windowSeqs(session, sessionNow(session));
+    await ensureSegments(session, seqs);
+    return reply
+      .header('content-type', 'application/vnd.apple.mpegurl')
+      .header('cache-control', 'no-store')
+      .send(playlistFor(session, seqs));
+  },
+});
+
+// One produced segment. A sequence number is cut exactly once, so unlike the
+// playlist a segment is immutable and may be cached by the client (and by
+// anything in front of it) — which is what lets a locked phone retry a fetch
+// without touching the server twice.
+app.get('/api/queue-stream/:token/seg/:name', {
+  config: { rateLimit: { max: 1200, timeWindow: '1 minute' } },
+}, async (req, reply) => {
+  const user = requireUser(req, reply);
+  if (!user) return;
+  const session = getSession(req.params.token, user.id);
+  if (!session) return reply.code(404).send({ error: 'Unknown or expired stream.', code: 'NO_PLAN' });
+  const match = /^(\d+)\.ts$/.exec(req.params.name ?? '');
+  if (!match) return reply.code(404).send({ error: 'No such segment.' });
+  const seq = Number(match[1]);
+  if (seq > seqAt(session.coverEnd - 1)) return reply.code(404).send({ error: 'Past the end of the stream.' });
+  // Cut on demand: the playlist normally ensures ahead of the listener, but a
+  // direct fetch (a retry, or a seek to a position nothing has produced yet)
+  // must be served too — this is what makes the stream seekable.
+  await ensureSegment(session, seq);
+  const bytes = readSegment(session, seq);
+  if (!bytes) return reply.code(404).send({ error: 'Segment could not be produced.', code: 'PENDING' });
+  noteSegmentFetch(session, seq);
+  // `no-store`, not `immutable`: a segment is immutable in content, but a
+  // caching layer in front (the tunnel) that ever serves a partial copy would
+  // pin that corruption for an hour. Re-fetching a 120 KB file is cheaper than
+  // a locked phone stuck on a bad segment.
+  return reply
+    .header('content-type', 'video/mp2t')
+    .header('cache-control', 'no-store')
+    .header('content-length', String(bytes.length))
+    .send(bytes);
 });
 
 // The API surface this build serves, advertised so a client can tell whether
@@ -2004,6 +3788,15 @@ app.route({
 const API_FEATURES = [
   'auth', 'search', 'radio', 'station', 'station-next', 'dislikes', 'likes', 'playlists',
   'browse-playlists', 'album', 'album-of', 'artist', 'events', 'stream', 'lyrics', 'artwork', 'admin',
+  // Client diagnostics: an authenticated, bounded `POST /api/client-report` that
+  // only writes a log line. A client that reports must know the server takes it.
+  'client-report',
+  // The queue as one continuous stream: a locked iPhone runs no page script, so
+  // the only way the next track plays there is for the *server* to have already
+  // concatenated it. A client that offers that must know the server can (a
+  // stale process would 404 exactly when the phone locks, when nobody can see
+  // the reason).
+  'queue-stream',
   // `GET /api/search` answers songs, artists, albums and playlists in one
   // request and takes `?type=`. The flag lets a client tell a server whose
   // search returns only `{ tracks, artists }` from one that knows the tabs, so
@@ -2023,6 +3816,10 @@ const API_FEATURES = [
   'rooms-stream',
   // Anonymous listening inside a public room (no account required)
   'rooms-guests',
+  // The host can hand the room to another member: PATCH /api/rooms/:code/host.
+  // A stale server would 404 there, and the "host walked away" state would look
+  // like a client bug.
+  'rooms-host',
   // Following an artist and the notification bell. A client that offers either
   // needs the follow routes *and* the sweep that fills the bell; without these
   // flags a stale server would answer 404 to a follow and never notify anyone.
@@ -2030,28 +3827,155 @@ const API_FEATURES = [
   'notifications',
 ];
 
-app.get('/api/health', async () => ({
-  ok: true,
-  ts: new Date().toISOString(),
-  features: API_FEATURES,
-  // Distinguishes "restarted" from "rebuilt": a stale process keeps its old
-  // start time, which is the first thing to check when an endpoint 404s.
-  startedAt: startedAt.toISOString(),
-  pid: process.pid,
-}));
+/**
+ * Is the audio directory (or the nearest directory that would have to be
+ * created for it) writable?
+ *
+ * The directory itself is created lazily by the first download, so "missing" is
+ * not a failure — a *parent that cannot be written to* is, and that is exactly
+ * the state that answers 200 on every API call while playback dies on the first
+ * cold track. Checks the nearest existing ancestor and stops there.
+ */
+function audioDirWritable() {
+  let dir = config.audioDir;
+  for (let hops = 0; hops < 8; hops += 1) {
+    try {
+      fs.accessSync(dir, fs.constants.W_OK);
+      return true;
+    } catch {
+      if (fs.existsSync(dir)) return false; // present but not writable
+      const parent = path.dirname(dir);
+      if (parent === dir) return false;
+      dir = parent;
+    }
+  }
+  return false;
+}
+
+/**
+ * Is this instance actually usable?
+ *
+ * This used to be a literal `{ ok: true }`: the container healthcheck only ever
+ * proved that the process answered HTTP, so `podman ps` reported `(healthy)` on
+ * an instance nobody could sign into (first run with SONORA_PASSPHRASE unset —
+ * bootstrapUser() only warns and keeps serving) and on one whose audio directory
+ * could not be written (every cold track fails, nothing restarts). The checks are
+ * the cheapest ones that distinguish those states: one indexed COUNT on the
+ * users table, and a W_OK on the audio directory. No yt-dlp probe — a healthcheck
+ * is polled every 30 s and must not spawn subprocesses or touch the network.
+ *
+ * The HTTP status stays 200 deliberately: `scripts/healthcheck.js` reads `ok`
+ * from the body and exits non-zero itself, and every test fixture, the client
+ * boot check and any proxy in front of this route treat a 200 as "the server is
+ * answering". An unhealthy *answer* and an unreachable *server* are different
+ * failures and should not be conflated.
+ *
+ * The body is split by who asks. Signed out it carries only the verdict, the
+ * reason and the feature list — what the container healthcheck and the client's
+ * stale-server check read — because this route must answer without a session and
+ * must not describe the host to whoever asks. The account count and the audio
+ * directory's state are added for a signed-in caller.
+ */
+app.get('/api/health', async (req) => {
+  let users = 0;
+  let dbOk = true;
+  try {
+    users = SQL.userCount.get().n;
+  } catch {
+    // A locked or corrupt database is exactly what an operator needs to see.
+    dbOk = false;
+  }
+  const audioOk = audioDirWritable();
+  // No users *and* no passphrase: bootstrapUser() has nothing to create, and
+  // there is no account anybody could sign into. That is not "healthy".
+  const signedInPossible = users > 0 || Boolean(config.bootstrapPass);
+  const reason = closing ? 'shutting-down'
+    : !dbOk ? 'database-unreadable'
+      : !audioOk ? 'audio-dir-not-writable'
+        : !signedInPossible ? 'no-account'
+          : null;
+  const health = {
+    // Keep HTTP 200 (see above): this is the process's own verdict, while the
+    // `ready` field makes the shutting-down state explicit to JSON health probes.
+    // Status-code-only load-balancer readiness remains a separate API decision;
+    // changing this long-standing status would also change every health client.
+    ok: reason === null,
+    ready: reason === null,
+    reason,
+    // The two probes behind `reason`, plus the sign-in verdict — no counts and no
+    // host paths. This route has to be public (the container healthcheck and the
+    // client's stale-server check both call it signed-out), so the body must not
+    // describe the host: an unauthenticated caller could otherwise read how many
+    // accounts an instance has and whether its audio directory is writable —
+    // reconnaissance with no legitimate public use.
+    checks: { server: !closing, db: dbOk, signIn: signedInPossible },
+    ts: new Date().toISOString(),
+    // Not optional: a client uses this list to tell a stale process from a
+    // broken app (see API_FEATURES), and it is the public API surface by design.
+    features: API_FEATURES,
+    // Distinguishes "restarted" from "rebuilt": a stale process keeps its old
+    // start time, which is the first thing to check when an endpoint 404s.
+    startedAt: startedAt.toISOString(),
+    // `pid` stays public: every test fixture in this repository identifies *its
+    // own* server by `health.pid === child.pid` (19 files — it is how a freshly
+    // spawned instance is told apart from a stale one still holding the port),
+    // and a pid is not a secret the host does not already publish. What was worth
+    // hiding — the account count and the audio directory's state — moved to the
+    // authenticated block below.
+    pid: process.pid,
+  };
+  // The rest is for the operator, who is signed in: `req.user` is the same
+  // best-effort session read every request gets (`onRequest` sets it, and an
+  // absent or expired cookie simply leaves it null). No requireUser here — this
+  // route must never answer 401 to the healthcheck.
+  if (req.user) {
+    health.checks.users = users;
+    health.checks.audioDir = audioOk;
+  }
+  return health;
+});
 
 // Playback health, so the UI can explain an external block instead of just
 // failing. YouTube periodically gates whole IPs behind "sign in to confirm you
 // are not a bot"; when that happens every fetch fails identically.
 let botGateAt = null;
+const BOT_GATE_TTL_MS = 30 * 60_000;
+
+/**
+ * One staleness rule for listener, admin and diagnostic reports.
+ *
+ * The old listener status expired the boolean but still exposed the old timestamp,
+ * while every admin/diagnostic response reported the gate forever. Expire the
+ * source value once, here, so no response can disagree with another (or turn a
+ * half-hour-old transient block into a permanent banner).
+ */
+function botGateState(now = Date.now()) {
+  if (botGateAt !== null && now - botGateAt >= BOT_GATE_TTL_MS) botGateAt = null;
+  return {
+    botGated: botGateAt !== null,
+    botGateAt: botGateAt !== null ? new Date(botGateAt).toISOString() : null,
+  };
+}
+
+// Database maintenance in progress, if any (see the vacuum/backup routes).
+//
+// `db` is node:sqlite's DatabaseSync, so VACUUM and VACUUM INTO rewrite the file
+// *on the event loop*: for the whole operation this process answers nothing at
+// all — no JSON route, and no next 1 MiB range for anyone mid-song. Two things
+// follow, and this flag is how both are surfaced: only one such job may run at a
+// time (a second would double the stall and fight for the same lock), and clients
+// and operators can see why everything just froze instead of guessing.
+let maintenance = null; // { job, startedAt }
+
 app.get('/api/status', async (req, reply) => {
   if (!requireUser(req, reply)) return;
   const jar = jarStatus();
   return {
-    botGated: Boolean(botGateAt) && Date.now() - botGateAt < 30 * 60_000,
-    botGateAt: botGateAt ? new Date(botGateAt).toISOString() : null,
+    ...botGateState(),
     cookiesConfigured: jar.connected,
     jar,
+    // Present only while a synchronous compaction is holding the event loop.
+    maintenance,
   };
 });
 
@@ -2073,7 +3997,14 @@ async function probe({ cookiePath = null } = {}) {
     await runProcess(ytdlpBin(), [
       ...(cookiePath ? ['--cookies', cookiePath] : []),
       '--simulate', '--no-warnings', '--no-playlist',
-      '-f', '140/bestaudio[ext=m4a]/bestaudio',
+      '-f', '140/bestaudio[ext=m4a]',
+      // The *same transport* as the downloader (proxy, PO-token provider, JS
+      // runtime). Without it the probe tested a different client than playback:
+      // a working cookies.txt that only works through the configured proxy was
+      // rejected as "not a signed-in session", the app opened the Connect sheet
+      // on every device, and /api/status reported bot-gated for the whole
+      // instance while downloads kept succeeding.
+      ...ytdlpExtraArgs(),
       `https://www.youtube.com/watch?v=${TEST_VIDEO}`,
     ], { timeoutMs: 45_000 });
     return { ok: true, code: 'OK', detail: null };
@@ -2127,12 +4058,29 @@ async function verifyJar(cookiePath) {
   };
 }
 
+// Import/verify each await subprocesses and saveJar/clearJar also await filesystem
+// work. Serialise the whole operations, not just their final writes: otherwise a
+// disconnect can fit inside an import's first save and the old DB writes then
+// resurrect the jar. The tail stays resolved after a failure so a bad import never
+// wedges later cookie administration.
+let cookieOperationTail = Promise.resolve();
+function serialiseCookieOperation(work) {
+  const result = cookieOperationTail.then(work);
+  cookieOperationTail = result.catch(() => {});
+  return result;
+}
+
 app.post('/api/youtube/cookies', {
-  config: { rateLimit: { max: 10, timeWindow: '5 minutes' } },
+  // A real Google/YouTube export exceeds the global 64 KB body limit, so the
+  // framework's opaque "Payload Too Large" won the race against this handler's
+  // own 512 KB check (which could therefore never fire). The limit has to be on
+  // the route, not only in the handler.
+  config: { rateLimit: { max: 10, timeWindow: '5 minutes' }, bodyLimit: 512 * 1024 },
 }, async (req, reply) => {
   // The jar is instance-wide, so replacing it is an admin action. A normal
   // listener can still see the gate status and ask an admin to fix it.
-  if (!requireAdmin(req, reply)) return;
+  const admin = requireAdmin(req, reply);
+  if (!admin) return;
 
   const text = String(req.body?.cookies ?? '');
   if (!text.trim()) return reply.code(400).send({ error: 'Paste your cookies.txt contents first.' });
@@ -2165,45 +4113,73 @@ app.post('/api/youtube/cookies', {
   // Store first, then test. A jar is kept even when the probe is inconclusive:
   // destroying a possibly-good jar because a *test* failed would be worse than
   // leaving it for playback to try.
-  await saveJar(cookies, text);
-  const verdict = await verifyJar(activeCookiesPath());
-  await saveJar(cookies, text, verdict);
+  return serialiseCookieOperation(async () => {
+    await saveJar(cookies, text);
+    const verdict = await verifyJar(activeCookiesPath());
+    await saveJar(cookies, text, verdict);
+    audit(admin, 'youtube.cookies.import', jarStatus().source,
+      `format=${format}; cookies=${info.total}; verdict=${verdict.status}`);
 
-  if (verdict.status === 'rejected') {
-    // Keep it (so the user can replace it) but make the state honest.
-    botGateAt = Date.now();
+    if (verdict.status === 'rejected') {
+      // Keep it (so the user can replace it) but make the state honest.
+      botGateAt = Date.now();
+      resetYT();
+      return reply.code(400).send({ error: verdict.reason, jar: jarStatus(), verdict });
+    }
+
+    botGateAt = null;
     resetYT();
-    return reply.code(400).send({ error: verdict.reason, jar: jarStatus(), verdict });
-  }
-
-  botGateAt = null;
-  resetYT();
-  req.log.info({ cookies: info.total, verdict: verdict.status }, 'youtube session imported');
-  return { ok: true, jar: jarStatus(), verdict };
+    req.log.info({ cookies: info.total, verdict: verdict.status }, 'youtube session imported');
+    return { ok: true, jar: jarStatus(), verdict };
+  });
 });
 
-/** Re-test the stored jar on demand (e.g. after the gate clears). */app.post('/api/youtube/verify', async (req, reply) => {
-  if (!requireAdmin(req, reply)) return;
-  const path = activeCookiesPath();
-  if (!path) return reply.code(400).send({ error: 'No cookies are stored yet.' });
-  const verdict = await verifyJar(path);
-  const blob = dbGet('youtube_cookies');
-  if (blob) {
-    const text = decrypt(blob);
-    const { cookies } = parseAny(text);
-    if (cookies.length) await saveJar(cookies, text, verdict);
-  }
-  if (verdict.status === 'verified') botGateAt = null;
-  resetYT();
-  return { verdict, jar: jarStatus() };
+/** Re-test the stored jar on demand (e.g. after the gate clears). */
+app.post('/api/youtube/verify', {
+  // Two full yt-dlp probes per call; the generic API budget is far too generous
+  // for something that spawns subprocesses.
+  config: { rateLimit: { max: 6, timeWindow: '1 minute' } },
+}, async (req, reply) => {
+  const admin = requireAdmin(req, reply);
+  if (!admin) return;
+  return serialiseCookieOperation(async () => {
+    const cookiePath = activeCookiesPath();
+    if (!cookiePath) return reply.code(400).send({ error: 'No cookies are stored yet.' });
+    const source = jarStatus().source;
+    const verdict = await verifyJar(cookiePath);
+    // Verification observes a jar; it does not re-import one. In particular an
+    // environment fallback's good verdict must never relabel (and reactivate) a
+    // rejected imported jar. The outcome is audited without copying secret text.
+    audit(admin, 'youtube.cookies.verify', source, `verdict=${verdict.status}`);
+    if (verdict.status === 'verified') botGateAt = null;
+    resetYT();
+    return { verdict, jar: jarStatus() };
+  });
 });
 
 /**
  * Staged diagnostic. The point is to say *which* layer is failing instead of a
- * single opaque "playback failed": metadata, extraction, or byte delivery.
+ * single opaque "playback failed".
+ *
+ * Admin-only: one call spawns yt-dlp (up to 45 s) plus several network probes,
+ * and the answer names the deployment's proxy and PO-token endpoints. Any
+ * signed-in listener could run it four times a minute and read back the
+ * infrastructure — a household member has no need for that, and a listener who
+ * cannot play only needs `GET /api/youtube/status` and the bot-gate message the
+ * playback routes already carry. (The client's "Run diagnostics" button on the
+ * listener sheet now needs an admin session — see the report.)
+ *
+ * The URLs are still redacted: a socks5 proxy URL can carry a username and
+ * password, and this answer ends up in a screenshot in a bug report.
  */
-app.get('/api/youtube/diagnose', async (req, reply) => {
-  if (!requireUser(req, reply)) return;
+const redactUrl = (value) => String(value ?? '').replace(/\/\/[^/\s@]+@/g, '//***@');
+
+app.get('/api/youtube/diagnose', {
+  // Rate limit kept: the route now needs an admin, but an admin double-clicking
+  // still must not be able to spawn subprocesses back to back.
+  config: { rateLimit: { max: 4, timeWindow: '1 minute' } },
+}, async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
   const steps = [];
   const add = (name, ok, detail) => steps.push({ name, ok, detail });
 
@@ -2211,9 +4187,9 @@ app.get('/api/youtube/diagnose', async (req, reply) => {
   if (config.potProviderUrl) {
     try {
       const r = await fetch(`${config.potProviderUrl}/ping`, { signal: AbortSignal.timeout(4000) });
-      add('PO token provider', r.ok, r.ok ? config.potProviderUrl : `HTTP ${r.status}`);
+      add('PO token provider', r.ok, r.ok ? redactUrl(config.potProviderUrl) : `HTTP ${r.status}`);
     } catch {
-      add('PO token provider', false, `not reachable at ${config.potProviderUrl} — start the bgutil container`);
+      add('PO token provider', false, `not reachable at ${redactUrl(config.potProviderUrl)} — start the bgutil container`);
     }
   } else {
     add('PO token provider', true, 'disabled');
@@ -2224,7 +4200,7 @@ app.get('/api/youtube/diagnose', async (req, reply) => {
 
   // 3. Proxy configured? This is advisory: everything can work without one.
   add('Proxy', config.ytdlpProxy ? true : null,
-    config.ytdlpProxy || 'none — the server uses its own IP, which YouTube may gate');
+    config.ytdlpProxy ? redactUrl(config.ytdlpProxy) : 'none — the server uses its own IP, which YouTube may gate');
 
   // 4. Metadata via youtubei.js (usually works even when gated)
   try {
@@ -2248,7 +4224,7 @@ app.get('/api/youtube/diagnose', async (req, reply) => {
     ok: steps.every((s) => s.ok !== false),
     steps,
     jar,
-    botGated: Boolean(botGateAt),
+    botGated: botGateState().botGated,
     advice: extraction.ok
       ? 'Everything needed for playback is working.'
       : extraction.code === 'BOT_GATED'
@@ -2262,15 +4238,30 @@ app.get('/api/youtube/diagnose', async (req, reply) => {
 
 app.get('/api/youtube/status', async (req, reply) => {
   if (!requireUser(req, reply)) return;
-  return { jar: jarStatus(), botGated: Boolean(botGateAt) };
+  return { jar: jarStatus(), botGated: botGateState().botGated };
 });
 
 app.delete('/api/youtube/cookies', async (req, reply) => {
-  if (!requireAdmin(req, reply)) return;
-  await clearJar();
-  resetYT();
-  botGateAt = null;
-  return { ok: true, jar: jarStatus() };
+  const admin = requireAdmin(req, reply);
+  if (!admin) return;
+  return serialiseCookieOperation(async () => {
+    const source = jarStatus().source;
+    try {
+      await clearJar();
+    } catch (err) {
+      // clearJar deliberately deletes plaintext first and leaves the encrypted
+      // recovery copy in place when unlink fails. Do not reset YouTube or clear the
+      // gate: a still-present jar may still be active, so success would be a lie.
+      const code = /^[A-Z0-9_]+$/.test(String(err?.code)) ? err.code : 'UNLINK_FAILED';
+      audit(admin, 'youtube.cookies.clear_failed', source, `code=${code}`);
+      req.log.warn({ code }, 'youtube cookie removal failed');
+      return reply.code(500).send({ error: 'Could not remove the cookie jar. No connection state was reset.', code: 'COOKIE_CLEAR_FAILED' });
+    }
+    resetYT();
+    botGateAt = null;
+    audit(admin, 'youtube.cookies.clear', source);
+    return { ok: true, jar: jarStatus() };
+  });
 });
 
 // ── admin ───────────────────────────────────────────────────────────────
@@ -2282,12 +4273,41 @@ app.delete('/api/youtube/cookies', async (req, reply) => {
 // Destructive actions are recorded in admin_audit so a mistake is explainable.
 
 const USERNAME = /^[A-Za-z0-9._-]{1,40}$/;
-const MIN_PASSWORD = 6;
+// Six characters was the whole policy, and the passphrase is the only factor on
+// an instance whose login name is a known constant (SONORA_USER defaults to
+// `toil`). Twelve is the shortest length that makes an offline dictionary pass
+// on the stored scrypt hash impractical rather than trivial, and the scrypt cost
+// is not the defence here: nothing rate-limits a copy of the database file.
+const MIN_PASSWORD = 12;
+
+/**
+ * Why this passphrase is not acceptable, or null when it is.
+ *
+ * Length alone would accept `aaaaaaaaaaaa`, so the four-distinct-character floor
+ * rejects the padding people type to satisfy a length rule. It is a floor, not a
+ * strength meter: guessing entropy cannot be measured from one string, and a
+ * rule that pretends to ("must contain a symbol") produces `Password1!` and
+ * nothing else.
+ */
+function passwordProblem(passphrase) {
+  const pass = String(passphrase ?? '');
+  if (pass.length < MIN_PASSWORD) {
+    return `Passphrase must be at least ${MIN_PASSWORD} characters.`;
+  }
+  if (new Set(pass).size < 4) {
+    return 'Passphrase must use at least four different characters.';
+  }
+  return null;
+}
 
 function audit(actor, action, target = null, detail = null) {
   recordAudit({
     actorId: actor.id, actorName: actor.name, action, target, detail,
   });
+}
+
+function httpError(statusCode, message) {
+  return Object.assign(new Error(message), { statusCode });
 }
 
 function fileBytes(file) {
@@ -2310,7 +4330,7 @@ app.get('/api/admin/overview', async (req, reply) => {
     db: dbBytes(),
     audit: listAudit(12),
     jar: jarStatus(),
-    botGated: Boolean(botGateAt),
+    botGated: botGateState().botGated,
     system: {
       node: process.version,
       uptimeSec: Math.round(process.uptime()),
@@ -2337,13 +4357,15 @@ app.post('/api/admin/users', async (req, reply) => {
   if (!USERNAME.test(name)) {
     return reply.code(400).send({ error: 'Name must be 1–40 characters: letters, numbers, dot, dash or underscore.' });
   }
-  if (passphrase.length < MIN_PASSWORD) {
-    return reply.code(400).send({ error: `Passphrase must be at least ${MIN_PASSWORD} characters.` });
-  }
+  const passProblem = passwordProblem(passphrase);
+  if (passProblem) return reply.code(400).send({ error: passProblem });
   if (findUser(name)) return reply.code(409).send({ error: 'That name is already taken.' });
 
-  const created = createUser(name, passphrase, role);
-  audit(admin, 'user.create', name, `role=${role}`);
+  const created = transaction(() => {
+    const user = createUser(name, passphrase, role);
+    audit(admin, 'user.create', name, `role=${role}`);
+    return user;
+  });
   return reply.code(201).send({ user: publicUser(getUser(created.id)) });
 });
 
@@ -2351,8 +4373,8 @@ app.patch('/api/admin/users/:id', async (req, reply) => {
   const admin = requireAdmin(req, reply);
   if (!admin) return;
 
-  const id = Number(req.params.id);
-  if (!Number.isInteger(id)) return reply.code(400).send({ error: 'Bad user id.' });
+  const id = positiveSafeId(req.params.id);
+  if (id === null) return reply.code(400).send({ error: 'Bad user id.' });
   const target = getUser(id);
   if (!target) return reply.code(404).send({ error: 'No such user.' });
 
@@ -2366,10 +4388,14 @@ app.patch('/api/admin/users/:id', async (req, reply) => {
   if (nextRole !== null && !ROLES.includes(nextRole)) {
     return reply.code(400).send({ error: 'Unknown role.' });
   }
-  const nextDisabled = b.disabled === undefined ? null : Boolean(b.disabled);
+  if (b.disabled !== undefined && typeof b.disabled !== 'boolean') {
+    return reply.code(400).send({ error: 'disabled must be a boolean.' });
+  }
+  const nextDisabled = b.disabled === undefined ? null : b.disabled;
   const nextPassword = b.password === undefined ? null : String(b.password);
-  if (nextPassword !== null && nextPassword.length < MIN_PASSWORD) {
-    return reply.code(400).send({ error: `Passphrase must be at least ${MIN_PASSWORD} characters.` });
+  if (nextPassword !== null) {
+    const passProblem = passwordProblem(nextPassword);
+    if (passProblem) return reply.code(400).send({ error: passProblem });
   }
 
   // Guards that keep an instance from locking itself out. Only an *active*
@@ -2397,33 +4423,53 @@ app.patch('/api/admin/users/:id', async (req, reply) => {
   }
 
   const changed = [];
-  if (nextRole !== null && nextRole !== target.role) {
-    setUserRole(id, nextRole);
-    changed.push(`role=${nextRole}`);
-  }
-  if (nextDisabled !== null && nextDisabled !== Boolean(target.disabled)) {
-    setUserDisabled(id, nextDisabled);
-    // A disabled account must lose its existing stateless sessions and any
-    // remembered device, or "disabled" would only hold until the access cookie
-    // expires.
-    if (nextDisabled) {
+  // One write lock covers the fresh last-admin guard, every revocation and the
+  // audit row. A concurrent CLI/HTTP change therefore cannot fit between the
+  // guard and the mutation, and an acknowledged role change cannot lack its log.
+  transaction(() => {
+    const current = getUser(id);
+    if (!current) throw httpError(404, 'No such user.');
+    if (isSelf && nextRole !== null && nextRole !== current.role && nextRole !== 'admin') {
+      throw httpError(400, 'You cannot remove your own admin role.');
+    }
+    if (isSelf && nextDisabled === true && nextDisabled !== Boolean(current.disabled)) {
+      throw httpError(400, 'You cannot disable your own account.');
+    }
+    const wasActiveAdmin = current.role === 'admin' && !current.disabled;
+    const remainsActiveAdmin = (nextRole ?? current.role) === 'admin'
+      && !(nextDisabled ?? Boolean(current.disabled));
+    if (wasActiveAdmin && !remainsActiveAdmin && countAdmins() <= 1) {
+      throw httpError(400, 'At least one active admin is required.');
+    }
+
+    if (nextRole !== null && nextRole !== current.role) {
+      setUserRole(id, nextRole);
+      changed.push(`role=${nextRole}`);
+    }
+    if (nextDisabled !== null && nextDisabled !== Boolean(current.disabled)) {
+      setUserDisabled(id, nextDisabled);
+      // A disabled account must lose its existing stateless sessions and any
+      // remembered device, or "disabled" would only hold until the access cookie
+      // expires.
+      if (nextDisabled) {
+        bumpSessionVersion(id);
+        revokeAllRefreshTokens(id);
+        deleteAllDevices(id);
+      }
+      changed.push(nextDisabled ? 'disabled' : 'enabled');
+    }
+    if (nextPassword !== null) {
+      setUserPassword(id, nextPassword);
       bumpSessionVersion(id);
+      // A password reset is a revocation event: every remembered device
+      // has to prove itself again with the new passphrase.
       revokeAllRefreshTokens(id);
       deleteAllDevices(id);
+      changed.push('password reset');
     }
-    changed.push(nextDisabled ? 'disabled' : 'enabled');
-  }
-  if (nextPassword !== null) {
-    setUserPassword(id, nextPassword);
-    bumpSessionVersion(id);
-    // A password reset is a revocation event: every remembered device has to
-    // prove itself again with the new passphrase.
-    revokeAllRefreshTokens(id);
-    deleteAllDevices(id);
-    changed.push('password reset');
-  }
+    if (changed.length) audit(admin, 'user.update', current.name, changed.join(', '));
+  });
 
-  if (changed.length) audit(admin, 'user.update', target.name, changed.join(', '));
   return {
     user: publicUser(getUser(id)),
     changed,
@@ -2435,23 +4481,29 @@ app.patch('/api/admin/users/:id', async (req, reply) => {
 app.post('/api/admin/users/:id/signout', async (req, reply) => {
   const admin = requireAdmin(req, reply);
   if (!admin) return;
-  const id = Number(req.params.id);
+  const id = positiveSafeId(req.params.id);
+  if (id === null) return reply.code(400).send({ error: 'Bad user id.' });
   const target = getUser(id);
   if (!target) return reply.code(404).send({ error: 'No such user.' });
-  bumpSessionVersion(id);
-  revokeAllRefreshTokens(id);
-  deleteAllDevices(id);
-  audit(admin, 'user.signout', target.name);
+  transaction(() => {
+    bumpSessionVersion(id);
+    revokeAllRefreshTokens(id);
+    deleteAllDevices(id);
+    audit(admin, 'user.signout', target.name);
+  });
   return { ok: true, self: id === admin.id };
 });
 
 app.post('/api/admin/users/:id/clear-history', async (req, reply) => {
   const admin = requireAdmin(req, reply);
   if (!admin) return;
-  const id = Number(req.params.id);
+  const id = positiveSafeId(req.params.id);
+  if (id === null) return reply.code(400).send({ error: 'Bad user id.' });
   const target = getUser(id);
   if (!target) return reply.code(404).send({ error: 'No such user.' });
   const removed = clearUserHistory(id);
+  // Drops cached pages and invalidates/coordinates builds already in flight.
+  invalidateStation(id);
   audit(admin, 'user.clear-history', target.name, `${removed} play events`);
   return { ok: true, removed };
 });
@@ -2459,17 +4511,21 @@ app.post('/api/admin/users/:id/clear-history', async (req, reply) => {
 app.delete('/api/admin/users/:id', async (req, reply) => {
   const admin = requireAdmin(req, reply);
   if (!admin) return;
-  const id = Number(req.params.id);
+  const id = positiveSafeId(req.params.id);
+  if (id === null) return reply.code(400).send({ error: 'Bad user id.' });
   if (id === admin.id) return reply.code(400).send({ error: 'You cannot delete your own account.' });
 
   const target = getUser(id);
   if (!target) return reply.code(404).send({ error: 'No such user.' });
-  if (target.role === 'admin' && !target.disabled && countAdmins() <= 1) {
-    return reply.code(400).send({ error: 'At least one active admin is required.' });
-  }
-
-  deleteUser(id);
-  audit(admin, 'user.delete', target.name, `role=${target.role}`);
+  transaction(() => {
+    const current = getUser(id);
+    if (!current) throw httpError(404, 'No such user.');
+    if (current.role === 'admin' && !current.disabled && countAdmins() <= 1) {
+      throw httpError(400, 'At least one active admin is required.');
+    }
+    deleteUser(id);
+    audit(admin, 'user.delete', current.name, `role=${current.role}`);
+  });
   return { ok: true };
 });
 
@@ -2477,7 +4533,8 @@ app.get('/api/admin/tracks', async (req, reply) => {
   if (!requireAdmin(req, reply)) return;
   const q = String(req.query?.q ?? '').trim().slice(0, 200);
   const limit = Number(req.query?.limit ?? 100);
-  return { tracks: listTracksForAdmin(q, Number.isFinite(limit) ? limit : 100), q };
+  if (!Number.isSafeInteger(limit)) return reply.code(400).send({ error: 'Limit must be a safe integer.' });
+  return { tracks: listTracksForAdmin(q, limit), q };
 });
 
 app.delete('/api/admin/tracks/:videoId', async (req, reply) => {
@@ -2518,23 +4575,144 @@ app.post('/api/admin/storage/clear', async (req, reply) => {
   return { ...result, cache: await cacheStats() };
 });
 
+// ── database maintenance ────────────────────────────────────────────────
+// Both routes below run a synchronous, whole-file rewrite on the event loop, so
+// they share one guard: refuse when another such job is already running (two
+// VACUUMs double the freeze and fight over the same exclusive lock), and refuse
+// when the free space cannot hold the second copy a VACUUM needs — a disk that
+// fills mid-compaction is the one way this can lose data.
+const MAINTENANCE_STALE_MS = 15 * 60_000;
+
+/** Free bytes on the filesystem holding `dir`, or null when it cannot be read. */
+function freeBytes(dir) {
+  try {
+    const st = fs.statfsSync(dir);
+    return Number(st.bavail) * Number(st.bsize);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Take the maintenance flag, or answer the request and report that it did.
+ *
+ * Returns null on success, or the already-sent reply (409 when another job holds
+ * the flag, 507 when there is not enough free space) — the caller returns it as
+ * its handler result. The flag is cleared in a `finally` by the caller, so a
+ * throw cannot wedge the instance into "always busy"; one older than
+ * MAINTENANCE_STALE_MS is treated as debris from a crash, not a live lock.
+ */
+function beginMaintenance(job, reply, { needBytes = 0, spaceDir = path.dirname(config.dbPath) } = {}) {
+  if (maintenance && Date.now() - Date.parse(maintenance.startedAt) < MAINTENANCE_STALE_MS) {
+    reply.header('retry-after', '60');
+    return reply.code(409).send({
+      error: `A database ${maintenance.job} is already running. Everything, including playback, is paused until it finishes.`,
+      code: 'MAINTENANCE',
+      maintenance,
+    });
+  }
+  const free = freeBytes(spaceDir);
+  if (free !== null && needBytes && free < needBytes) {
+    const mb = (n) => Math.round(n / 1_048_576);
+    return reply.code(507).send({
+      error: `Not enough free space: this needs about ${mb(needBytes)} MB and ${mb(free)} MB is available.`,
+      code: 'NO_SPACE',
+    });
+  }
+  maintenance = { job, startedAt: new Date().toISOString() };
+  return null;
+}
+
+/** Hand the loop back once between the guard and the freeze, so the reply can be shaped. */
+const yieldLoop = () => new Promise((resolve) => setImmediate(resolve));
+
+function isSqliteBusy(err) {
+  const primaryCode = Number(err?.errcode) & 0xff;
+  return primaryCode === 5 || err?.code === 'SQLITE_BUSY'
+    || /SQLITE_BUSY|database is locked/i.test(String(err?.message ?? ''));
+}
+
+function maintenanceFailure(req, reply, err, job) {
+  req.log.warn({ err: err?.message ?? err }, `${job} failed`);
+  if (isSqliteBusy(err)) {
+    return reply.header('retry-after', '5').code(409).send({
+      error: 'Another process is writing to the database. Try again shortly.',
+      code: 'DB_BUSY',
+    });
+  }
+  return reply.code(500).send({
+    error: job === 'backup'
+      ? 'Could not write the backup copy. Check free space and try again.'
+      : 'Could not compact the database. Check the administrator log and try again.',
+  });
+}
+
 app.post('/api/admin/db/vacuum', async (req, reply) => {
   const admin = requireAdmin(req, reply);
   if (!admin) return;
-  db.exec('VACUUM');
-  audit(admin, 'db.vacuum');
-  return { ok: true, db: dbBytes() };
+  const size = dbBytes().bytes;
+  const refused = beginMaintenance('vacuum', reply, { needBytes: size * 2 });
+  if (refused) return refused;
+  try {
+    // The reply is only sent after the compile finishes (Fastify cannot stream
+    // from inside a synchronous handler anyway), so the honest thing to report is
+    // how long the freeze lasted.
+    const started = Date.now();
+    await yieldLoop();
+    db.exec('VACUUM');
+    audit(admin, 'db.vacuum', null, `${Date.now() - started} ms`);
+    return { ok: true, ms: Date.now() - started, db: dbBytes() };
+  } catch (err) {
+    return maintenanceFailure(req, reply, err, 'vacuum');
+  } finally {
+    maintenance = null;
+  }
 });
 
-/** A consistent snapshot: VACUUM INTO copies the live database atomically. */
-app.get('/api/admin/backup', async (req, reply) => {
+/**
+ * A consistent snapshot: VACUUM INTO copies the live database atomically.
+ *
+ * Same freeze as the vacuum above, plus a full second copy on disk, so it goes
+ * through the same guard and the same 2×-the-database space check. The temp
+ * directory is removed on every path now, including a failing VACUUM — it used to
+ * leak a full copy of the database into /tmp every time the download errored.
+ */
+app.get('/api/admin/backup', {
+  // A `.db` download must be the bytes of the database: `@fastify/compress` would
+  // gzip `application/octet-stream` (mime-db marks it compressible) and the file
+  // an operator saves would be a gzip stream with a `.db` name.
+  compress: false,
+}, async (req, reply) => {
   const admin = requireAdmin(req, reply);
   if (!admin) return;
 
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sonora-backup-'));
+  const size = dbBytes().bytes;
+  const refused = beginMaintenance('backup', reply, { needBytes: size * 2, spaceDir: os.tmpdir() });
+  if (refused) return refused;
+
+  let dir;
+  try {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sonora-backup-'));
+  } catch (err) {
+    maintenance = null;
+    req.log.warn({ err: err?.message ?? err }, 'backup temp dir failed');
+    return reply.code(500).send({ error: 'Could not create a temporary directory for the backup.' });
+  }
   const target = path.join(dir, 'sonora.db');
-  db.exec(`VACUUM INTO '${target.replace(/'/g, "''")}'`);
-  audit(admin, 'db.backup');
+
+  try {
+    // One turn of the loop between taking the flag and freezing it: the 409 for
+    // a concurrent job must be able to get out, and a queued keep-alive frame is
+    // cheaper than a client timing out just before the freeze.
+    await yieldLoop();
+    db.exec(`VACUUM INTO '${target.replace(/'/g, "''")}'`);
+    audit(admin, 'db.backup', null, `${size} bytes`);
+  } catch (err) {
+    fs.rm(dir, { recursive: true, force: true }, () => {});
+    return maintenanceFailure(req, reply, err, 'backup');
+  } finally {
+    maintenance = null;
+  }
 
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const stream = fs.createReadStream(target);
@@ -2551,7 +4729,8 @@ app.get('/api/admin/backup', async (req, reply) => {
 app.get('/api/admin/audit', async (req, reply) => {
   if (!requireAdmin(req, reply)) return;
   const limit = Number(req.query?.limit ?? 50);
-  return { entries: listAudit(Number.isFinite(limit) ? limit : 50) };
+  if (!Number.isSafeInteger(limit)) return reply.code(400).send({ error: 'Limit must be a safe integer.' });
+  return { entries: listAudit(limit) };
 });
 
 app.get('/api/admin/system', async (req, reply) => {
@@ -2582,7 +4761,7 @@ app.get('/api/admin/system', async (req, reply) => {
       jsRuntime: config.jsRuntime || null,
     },
     jar: jarStatus(),
-    botGated: Boolean(botGateAt),
+    botGated: botGateState().botGated,
   };
 });
 
@@ -2590,20 +4769,233 @@ app.get('/api/admin/system', async (req, reply) => {
 // Thumbnails are served same-origin rather than hot-linked to i.ytimg.com:
 // it keeps the client's IP and referrer off Google's CDN for every row in
 // every list, and it makes the UI independent of third-party image gating.
-const IMG_HOSTS = new Set(['i.ytimg.com', 'img.youtube.com', 'lh3.googleusercontent.com', 'yt3.ggpht.com']);
-// cacheKey -> { body, type, at } on a hit, or { miss: true, at } after a failure.
+//
+// This list is the *only* gate now: public/media-session.js rewrites every
+// https artwork URL onto /api/img?u=, so a host that is missing here renders as
+// a broken cover instead of quietly hot-linking (which is what used to happen).
+// Google shards the same art across numbered hosts (lh3-lh6.googleusercontent,
+// yt1-yt5.ggpht) and adds new ones without notice, so the families are matched by
+// suffix rather than enumerated; the leading dot keeps a lookalike such as
+// evilgoogleusercontent.com out. Exact entries stay for hosts that do not live
+// under those two domains.
+const IMG_HOSTS = new Set(['i.ytimg.com', 'img.youtube.com']);
+const IMG_HOST_FAMILIES = ['.googleusercontent.com', '.ggpht.com', '.ytimg.com'];
+
+function imageHostAllowed(hostname) {
+  const host = String(hostname ?? '').toLowerCase();
+  if (IMG_HOSTS.has(host)) return true;
+  return IMG_HOST_FAMILIES.some((suffix) => host.endsWith(suffix) && host.length > suffix.length);
+}
+// Host the id-based cover routes fetch from. Overridable (with an optional
+// scheme) so a test can pin the upstream to a local plain-HTTP fixture and
+// reason about the proxy's own behaviour — caching, limiting — without
+// YouTube, DNS or TLS on the path.
+const IMG_UPSTREAM = /^https?:\/\//.test(process.env.SONORA_YTIMG_HOST ?? '')
+  ? process.env.SONORA_YTIMG_HOST.replace(/\/+$/, '')
+  : `https://${process.env.SONORA_YTIMG_HOST || 'i.ytimg.com'}`;
+// cacheKey -> { body, type, at } on a hit, or { miss: true, at } after proved absence.
 const imgCache = new Map();
+const imgInFlight = new Map();
+let imgCacheBytes = 0;
+const IMG_CACHE_MAX = 3000;
+const IMG_CACHE_MAX_BYTES = 64 * 1024 * 1024;
 const IMG_TTL = 6 * 60 * 60_000;
-// A thumbnail that failed is usually a deleted upload or a dead CDN host, and
-// it will fail again. Remember the miss briefly: every list render asks for the
-// same covers, and without this each repaint re-paid a full upstream timeout.
+
+/**
+ * Bound the artwork cache without throwing all of it away.
+ *
+ * Clearing the whole map at the ceiling turned the next render of a long list
+ * into a stampede of upstream fetches — exactly what the cache exists to avoid.
+ * Evict oldest-first only until both the entry and byte budgets fit, keeping hot
+ * covers warm; Map iterates in insertion order, so "oldest" costs nothing to find.
+ */
+function imgCacheDelete(key) {
+  const old = imgCache.get(key);
+  if (!old) return;
+  imgCache.delete(key);
+  imgCacheBytes -= old.body?.length ?? 0;
+}
+
+function imgCacheSet(key, value) {
+  imgCacheDelete(key);
+  const bytes = value.body?.length ?? 0;
+  // A future limit change must not let one value defeat the byte ceiling after
+  // emptying every other entry. Today IMG_MAX_BYTES is lower, but the cache must
+  // enforce its own invariant rather than relying on that unrelated constant.
+  if (bytes > IMG_CACHE_MAX_BYTES) return;
+  while (imgCache.size >= IMG_CACHE_MAX || imgCacheBytes + bytes > IMG_CACHE_MAX_BYTES) {
+    const oldest = imgCache.keys().next().value;
+    if (oldest === undefined) break;
+    imgCacheDelete(oldest);
+  }
+  imgCache.set(key, value);
+  imgCacheBytes += bytes;
+}
+// A thumbnail for a deleted upload will stay absent. Remember only that proved
+// absence briefly: every list render asks for the same covers, and without this
+// each repaint re-paid the full fallback chain. Transport failures never enter it.
 const IMG_MISS_TTL = 2 * 60_000;
 // Was 8 s. Nothing legitimate takes that long once DNS answers promptly, and a
 // hung upstream must not hold a phone's whole grid hostage.
 const IMG_TIMEOUT_MS = 5000;
+/**
+ * The largest image the artwork proxy accepts. Real covers (mqdefault 320x180
+ * to maxresdefault 1280x720 JPEGs) are tens to a few hundred KB; anything
+ * bigger is an upstream malfunction, not a cover. The art routes are public, so
+ * this is a byte limit on the entire buffered read, not merely a cache hint:
+ * oversized responses are cancelled rather than allocated or relayed.
+ */
+const IMG_MAX_BYTES = 512 * 1024;
 
 function sendMiss(reply) {
   return reply.code(404).header('cache-control', 'no-store').send({ error: 'No artwork.' });
+}
+
+// Only inert raster formats. Correctly declared text/html is active content,
+// and nosniff does not make it safe; SVG can carry active content too.
+const SAFE_IMAGE_TYPE = /^image\/(?:jpeg|png|webp|avif|gif)(?:;|\s*$)/i;
+
+function imageRequestAborted() {
+  const err = new Error('Artwork request was cancelled.');
+  err.code = 'IMG_ABORTED';
+  return err;
+}
+
+/** Same custom fixture origin, or an actual allowlisted HTTPS CDN endpoint. */
+function imageEndpointAllowed(raw, originalOrigin) {
+  try {
+    const url = new URL(raw);
+    if (url.origin === originalOrigin) return true;
+    return url.protocol === 'https:' && (!url.port || url.port === '443')
+      && imageHostAllowed(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Read one image candidate through redirects, headers and the *whole body*.
+ * Any oversized/invalid answer is cancelled and frees the connection. A failed
+ * candidate returns kind=failure; an actual 404/410 returns kind=missing.
+ */
+async function readImageCandidate(upstream, jobSignal) {
+  if (jobSignal.aborted) throw imageRequestAborted();
+  const ac = new AbortController();
+  const onAbort = () => ac.abort();
+  jobSignal.addEventListener('abort', onAbort, { once: true });
+  // Close the registration race as well as the already-aborted fast path above.
+  if (jobSignal.aborted) ac.abort();
+  const timer = setTimeout(() => ac.abort(), IMG_TIMEOUT_MS);
+  timer.unref?.();
+  try {
+    const originalOrigin = new URL(upstream).origin;
+    let url = upstream;
+    for (let hop = 0; hop < 4; hop += 1) {
+      const res = await fetch(url, { signal: ac.signal, redirect: 'manual' });
+      if ([301, 302, 303, 307, 308].includes(res.status) && res.headers.has('location')) {
+        await res.body?.cancel().catch(() => {});
+        if (hop === 3) return { kind: 'failure' };
+        const next = new URL(res.headers.get('location'), url).href;
+        // A redirect is a new trust decision, not an escape from the allowlist.
+        if (!imageEndpointAllowed(next, originalOrigin)) return { kind: 'failure' };
+        url = next;
+        continue;
+      }
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => {});
+        return { kind: res.status === 404 || res.status === 410 ? 'missing' : 'failure' };
+      }
+      const type = res.headers.get('content-type') ?? '';
+      const declared = Number(res.headers.get('content-length'));
+      if (!SAFE_IMAGE_TYPE.test(type) || (Number.isFinite(declared) && declared > IMG_MAX_BYTES)) {
+        await res.body?.cancel().catch(() => {});
+        return { kind: 'failure' };
+      }
+      if (!res.body) return { kind: 'failure' };
+      const reader = res.body.getReader();
+      const chunks = [];
+      let total = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > IMG_MAX_BYTES) {
+          await reader.cancel().catch(() => {});
+          return { kind: 'failure' };
+        }
+        chunks.push(Buffer.from(value));
+      }
+      return { kind: 'image', body: Buffer.concat(chunks, total), type };
+    }
+    return { kind: 'failure' };
+  } catch (err) {
+    if (jobSignal.aborted) throw imageRequestAborted();
+    return { kind: 'failure' };
+  } finally {
+    clearTimeout(timer);
+    jobSignal.removeEventListener('abort', onAbort);
+  }
+}
+
+/** One read per cache key, with a private controller for subscriber cancellation. */
+function imageJob(cacheKey, upstream, fallbacks) {
+  let entry = imgInFlight.get(cacheKey);
+  // The last leaving subscriber aborts its producer. A request arriving in the
+  // small window before that promise settles needs fresh work, not an already-
+  // aborted fetch which could never answer it.
+  if (entry && !entry.controller.signal.aborted) return entry;
+  entry = { controller: new AbortController(), pending: 0, promise: null };
+  imgInFlight.set(cacheKey, entry);
+  entry.promise = (async () => {
+    let missing = false;
+    let failed = false;
+    for (const url of [upstream, ...fallbacks]) {
+      const result = await readImageCandidate(url, entry.controller.signal);
+      if (result.kind === 'image') {
+        // The single producer populates the cache; joined responses never write
+        // it again or allocate a second copy of the body.
+        imgCacheSet(cacheKey, { body: result.body, type: result.type, at: Date.now() });
+        return result;
+      }
+      if (result.kind === 'missing') missing = true;
+      else failed = true;
+    }
+    // Network failures, 5xx and invalid bodies are not facts about the image.
+    // Only an unambiguous chain of definitive absences earns a negative entry.
+    if (missing && !failed) imgCacheSet(cacheKey, { miss: true, at: Date.now() });
+    return null;
+  })();
+  const settled = () => { if (imgInFlight.get(cacheKey) === entry) imgInFlight.delete(cacheKey); };
+  entry.promise.then(settled, settled);
+  return entry;
+}
+
+/** Observe one job without letting one closed response strand every other tab. */
+function joinImageJob(entry, reply) {
+  return new Promise((resolve, reject) => {
+    entry.pending += 1;
+    let done = false;
+    const cleanup = () => {
+      if (done) return;
+      done = true;
+      entry.pending = Math.max(0, entry.pending - 1);
+      reply.raw.off('close', onClose);
+    };
+    const onClose = () => {
+      cleanup();
+      const err = imageRequestAborted();
+      // Keep the producer's rejection observed even when its last observer left.
+      entry.promise.catch(() => {});
+      if (!entry.pending) entry.controller.abort();
+      reject(err);
+    };
+    reply.raw.once('close', onClose);
+    entry.promise.then(
+      (value) => { cleanup(); resolve(value); },
+      (err) => { cleanup(); reject(err); },
+    );
+    if (reply.raw.destroyed) onClose();
+  });
 }
 
 async function proxyImage(cacheKey, upstream, reply, fallbacks = [], cacheControl = 'private, max-age=86400') {
@@ -2615,43 +5007,26 @@ async function proxyImage(cacheKey, upstream, reply, fallbacks = [], cacheContro
       return reply.code(200).header('content-type', hit.type)
         .header('cache-control', cacheControl).send(hit.body);
     }
-    imgCache.delete(cacheKey);
+    imgCacheDelete(cacheKey);
   }
-  const abort = new AbortController();
-  const timer = setTimeout(() => abort.abort(), IMG_TIMEOUT_MS);
-  timer.unref?.();
-  const miss = () => {
-    if (imgCache.size > 3000) imgCache.clear();
-    imgCache.set(cacheKey, { miss: true, at: Date.now() });
-    return sendMiss(reply);
-  };
+
+  let result;
   try {
-    // Try each candidate in order (a high-resolution crop first, the always-
-    // present one last) and cache whichever answered.
-    let res = null;
-    for (const url of [upstream, ...fallbacks]) {
-      res = await fetch(url, { signal: abort.signal });
-      if (res.ok) break;
-    }
-    if (!res?.ok) return miss();
-    const body = Buffer.from(await res.arrayBuffer());
-    const type = res.headers.get('content-type') ?? 'image/jpeg';
-    if (imgCache.size > 3000) imgCache.clear();
-    imgCache.set(cacheKey, { body, type, at: Date.now() });
-    return reply.code(200).header('content-type', type)
-      .header('cache-control', cacheControl).send(body);
-  } catch {
-    return miss();
-  } finally {
-    clearTimeout(timer);
+    result = await joinImageJob(imageJob(cacheKey, upstream, fallbacks), reply);
+  } catch (err) {
+    if (err.code === 'IMG_ABORTED' || reply.raw.destroyed) return reply.hijack();
+    throw err;
   }
+  if (!result) return sendMiss(reply);
+  return reply.code(200).header('content-type', result.type)
+    .header('cache-control', cacheControl).send(result.body);
 }
 
 app.get('/api/img/:videoId', async (req, reply) => {
   if (!requireUser(req, reply)) return;
   const { videoId } = req.params;
   if (!VIDEO_ID.test(videoId)) return reply.code(400).send({ error: 'Bad video id.' });
-  const base = `https://i.ytimg.com/vi/${videoId}`;
+  const base = `${IMG_UPSTREAM}/vi/${videoId}`;
   // Every YouTube still is 16:9 EXCEPT hqdefault, which is a 4:3 canvas with
   // the 16:9 frame letterboxed inside baked-in black bars. Serving hqdefault
   // put a black band across every square crop in the app (station cards, rail
@@ -2674,7 +5049,9 @@ app.get('/api/img', async (req, reply) => {
   const raw = String(req.query?.u ?? '');
   let u;
   try { u = new URL(raw); } catch { return reply.code(400).send({ error: 'Bad image url.' }); }
-  if (u.protocol !== 'https:' || !IMG_HOSTS.has(u.hostname)) {
+  // https on the default port only: a host allowlist should not also become a
+  // way to probe arbitrary ports on Google's CDN.
+  if (u.protocol !== 'https:' || (u.port && u.port !== '443') || !imageHostAllowed(u.hostname)) {
     return reply.code(400).send({ error: 'Host not allowed.' });
   }
   return proxyImage(`u:${u.href}`, u.href, reply);
@@ -2707,13 +5084,89 @@ const roomRoute = (fn) => async (req, reply, ...rest) => {
 // its queue's audio, and nothing else (see the guest branch of /api/stream).
 // It is domain-separated from the session token, so neither can stand in for
 // the other.
+//
+// One cookie holds a *map* of room code → signed token. There used to be one
+// cookie holding one room's token, so opening a second room's listener page
+// overwrote the first: the open SSE stream kept working (auth happens at
+// connect) but every poll answered 403 NO_GUEST and the next track's audio
+// answered 401 — listening to room A died because a link to room B was opened
+// in another tab. A map keeps one browser-wide cookie (so "no guest cookie"
+// stays a single, meaningful state) without letting rooms evict each other.
 const GUEST_COOKIE = 'sonora_guest';
 const GUEST_TTL_MS = 6 * 60 * 60_000;
+// Each token is ~80 encoded bytes; a browser that has opened more rooms than
+// this is browsing, not listening. Bounded so the cookie cannot approach the
+// 4 KB per-cookie ceiling.
+const GUEST_ROOMS_MAX = 6;
 
-function currentGuest(req) {
-  const payload = readGuest(req.cookies?.[GUEST_COOKIE]);
+function guestFromToken(token) {
+  const payload = readGuest(token);
   if (!payload) return null;
-  return { id: `g:${payload.g}`, name: 'Guest', guest: true, code: payload.c };
+  return { id: `g:${payload.g}`, name: 'Guest', guest: true, code: payload.c, exp: payload.exp };
+}
+
+/** The room-code → token map this browser holds (invalid JSON is "no guests"). */
+function guestTokens(req) {
+  const raw = req.cookies?.[GUEST_COOKIE];
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const out = {};
+    for (const [code, token] of Object.entries(parsed)) {
+      if (ROOM_CODE.test(code) && typeof token === 'string') out[code] = token;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+/** Every guest identity this browser currently holds, one per room. */
+function guestsFor(req) {
+  const out = [];
+  for (const [code, token] of Object.entries(guestTokens(req))) {
+    const guest = guestFromToken(token);
+    // The token is signed for a room; a mismatch means a stale/forged entry.
+    if (guest && guest.code === code) out.push(guest);
+  }
+  return out;
+}
+
+function currentGuest(req, code) {
+  const guests = guestsFor(req);
+  if (!guests.length) return null;
+  if (code) return guests.find((g) => g.code === code) ?? null;
+  return guests[0];
+}
+
+/**
+ * Mint (or refresh) this browser's guest token for one room.
+ *
+ * The map is rewritten with the room added, dropping expired/invalid entries
+ * first and then the oldest rooms past GUEST_ROOMS_MAX, so a long-lived browser
+ * cannot grow the cookie without bound.
+ */
+function mintGuest(req, reply, code) {
+  const tokens = guestTokens(req);
+  const now = Date.now();
+  const kept = {};
+  for (const [entryCode, token] of Object.entries(tokens)) {
+    const guest = guestFromToken(token);
+    if (guest && guest.code === entryCode && guest.exp > now) kept[entryCode] = token;
+  }
+  kept[code] = signGuest({
+    c: code,
+    g: crypto.randomBytes(9).toString('base64url'),
+    exp: now + GUEST_TTL_MS,
+  });
+  const codes = Object.keys(kept);
+  for (const stale of codes.slice(0, Math.max(0, codes.length - GUEST_ROOMS_MAX))) delete kept[stale];
+  reply.setCookie(GUEST_COOKIE, JSON.stringify(kept), {
+    httpOnly: true, sameSite: 'lax', secure: cookieSecure(req), path: '/',
+    maxAge: Math.floor(GUEST_TTL_MS / 1000),
+  });
+  return guestFromToken(kept[code]);
 }
 
 const publicRoute = (fn) => async (req, reply) => {
@@ -2726,7 +5179,7 @@ const publicRoute = (fn) => async (req, reply) => {
 };
 
 function guestFor(req, code) {
-  const guest = currentGuest(req);
+  const guest = currentGuest(req, code);
   if (!guest || guest.code !== code) {
     throw new RoomError(403, 'NO_GUEST', 'Open this room to listen.');
   }
@@ -2752,7 +5205,18 @@ app.get('/api/rooms', roomRoute(async (req, reply, user) => ({
 })));
 
 app.get('/api/rooms/:code', roomRoute(async (req, reply, user) => viewRoom(req.params.code, user)));
-app.get('/api/rooms/:code/state', roomRoute(async (req, reply, user) => viewRoom(req.params.code, user)));
+app.get('/api/rooms/:code/state', roomRoute(async (req, reply, user) => {
+  // A snapshot is also the polling fallback's whole job, so it counts as presence:
+  // housekeeping reaps a room whose `updated_at` is old when nobody is on the SSE
+  // stream, and without this a group listening through a proxy that blocks
+  // streaming (or a browser without EventSource) had a room that was invisible to
+  // housekeeping — it could be deleted while they were actively following it, and
+  // the next poll answered 404. Only after viewRoom() has authorised the caller,
+  // so a stranger probing codes cannot keep someone else's room alive.
+  const snapshot = viewRoom(req.params.code, user);
+  touchRoomPresence(req.params.code);
+  return snapshot;
+}));
 
 app.post('/api/rooms/:code/join', roomRoute(async (req, reply, user) => {
   const snapshot = joinRoom(req.params.code, user);
@@ -2761,16 +5225,50 @@ app.post('/api/rooms/:code/join', roomRoute(async (req, reply, user) => {
 
 app.post('/api/rooms/:code/leave', roomRoute(async (req, reply, user) => leaveRoom(req.params.code, user)));
 app.delete('/api/rooms/:code', roomRoute(async (req, reply, user) => endRoom(req.params.code, user)));
-app.patch('/api/rooms/:code', roomRoute(async (req, reply, user) => updateRoom(req.params.code, user, req.body ?? {})));
+app.patch('/api/rooms/:code', roomRoute(async (req, reply, user) => ({
+  ...updateRoom(req.params.code, user, req.body ?? {}),
+  // Every snapshot the client applies carries the roster; the command and PATCH
+  // responses were the two that did not, so the client kept the stale member
+  // list until the next SSE frame.
+  members: memberRoster(req.params.code),
+})));
 
-app.post('/api/rooms/:code/command', roomRoute(async (req, reply, user) => (
-  applyCommand(req.params.code, user, req.body ?? {})
-)));
+app.post('/api/rooms/:code/command', roomRoute(async (req, reply, user) => ({
+  ...applyCommand(req.params.code, user, req.body ?? {}),
+  members: memberRoster(req.params.code),
+})));
+
+// Handing the room over.
+//
+// A `control: 'host'` room whose host walks away used to be unskippable,
+// unpausable and unendable: `rooms.host_id` is written only by createRoomRow, and
+// endRoom is host-only, so the group watched it loop the queue until housekeeping
+// deleted the room hours later. The host is the only one who can give the seat
+// away — otherwise any member could seize it — and the answer is the same shape
+// every other snapshot-carrying room route returns, roster included, so a client
+// applies it exactly like a PATCH.
+app.patch('/api/rooms/:code/host', roomRoute(async (req, reply, user) => {
+  const newHostId = Number(req.body?.userId);
+  if (!Number.isInteger(newHostId) || newHostId <= 0) {
+    throw new RoomError(400, 'BAD_USER', 'Pick the person to hand the room to.');
+  }
+  return {
+    ...transferHost(req.params.code, user, newHostId),
+    members: memberRoster(req.params.code),
+  };
+}));
 
 // A clock probe. Three of these per join (and once a minute after) is enough to
 // estimate the offset with a round-trip correction; one-way event timestamps
 // would bias it forward by the whole transit delay.
-app.get('/api/rooms/:code/time', roomRoute(async () => ({ now: Date.now() })));
+//
+// The view is still checked: this was the one room route without one, so clock
+// calibration succeeded against rooms that had ended and rooms the caller was
+// not allowed to see.
+app.get('/api/rooms/:code/time', roomRoute(async (req, reply, user) => {
+  viewRoom(req.params.code, user);
+  return { now: Date.now() };
+}));
 
 app.get('/api/rooms/:code/people', roomRoute(async (req, reply, user) => ({
   people: peopleFor(req.params.code, user, String(req.query?.q ?? '')),
@@ -2817,34 +5315,45 @@ app.post('/api/public/rooms/:code/guest', {
 }, publicRoute(async (req, reply) => {
   const code = req.params.code;
   const snapshot = publicSnapshot(code);
-  const token = signGuest({
-    c: code,
-    g: crypto.randomBytes(9).toString('base64url'),
-    exp: Date.now() + GUEST_TTL_MS,
-  });
-  reply.setCookie(GUEST_COOKIE, token, {
-    httpOnly: true, sameSite: 'lax', secure: !config.isDev, path: '/',
-    maxAge: Math.floor(GUEST_TTL_MS / 1000),
-  });
+  mintGuest(req, reply, code);
   return snapshot;
 }));
 
-app.get('/api/public/rooms/:code', publicRoute(async (req, reply) => {
+app.get('/api/public/rooms/:code', {
+  config: { rateLimit: { max: 60, timeWindow: '1 minute' } },
+}, publicRoute(async (req, reply) => {
   guestFor(req, req.params.code);
   return publicSnapshot(req.params.code);
 }));
 
-app.get('/api/public/rooms/:code/state', publicRoute(async (req, reply) => {
+app.get('/api/public/rooms/:code/state', {
+  config: { rateLimit: { max: 60, timeWindow: '1 minute' } },
+}, publicRoute(async (req, reply) => {
   guestFor(req, req.params.code);
-  return publicSnapshot(req.params.code);
+  const snapshot = publicSnapshot(req.params.code);
+  // The guest polling fallback is a heartbeat too. Presence is normally the SSE
+  // stream, so an anonymous listener whose proxy blocks streaming was invisible
+  // to housekeeping and their room could be deleted while they were following
+  // it. After publicSnapshot() has authorised them, not before: a stranger
+  // probing codes must not keep someone else's room alive.
+  touchRoomPresence(req.params.code);
+  return snapshot;
 }));
 
-app.get('/api/public/rooms/:code/time', publicRoute(async (req) => {
+app.get('/api/public/rooms/:code/time', {
+  config: { rateLimit: { max: 60, timeWindow: '1 minute' } },
+}, publicRoute(async (req) => {
   guestFor(req, req.params.code);
+  // Same public-room gate as /state above: a clock probe says nothing about a
+  // room (and leaks nothing), but it also has no business answering for a
+  // private room once its guests are revoked.
+  publicSnapshot(req.params.code); // 403 PRIVATE / 410 ENDED
   return { now: Date.now() };
 }));
 
-app.get('/api/public/rooms/:code/events', publicRoute(async (req, reply) => {
+app.get('/api/public/rooms/:code/events', {
+  config: { rateLimit: { max: 60, timeWindow: '1 minute' } },
+}, publicRoute(async (req, reply) => {
   const code = req.params.code;
   const guest = guestFor(req, code);
   publicSnapshot(code); // 403 PRIVATE / 410 ENDED before the socket is hijacked
@@ -2867,24 +5376,50 @@ app.get('/api/public/rooms/:code/events', publicRoute(async (req, reply) => {
 // never sees a `#fragment`. It is server-rendered and public because a crawler
 // carries no session — but a private room's track is never part of it.
 
-function roomLandingHtml({ base, code, preview }) {
+/**
+ * A room preview's host is a name.
+ *
+ * roomPreview() hands back the host as a string while a member snapshot hands
+ * back an object (`{id,name}`); the two shapes reached the same page templates,
+ * so one of them rendered `[object Object] is listening`. Accept both here
+ * until the engine settles on one (see the note in the room contract).
+ */
+function hostNameOf(value) {
+  if (!value) return null;
+  if (typeof value === 'string') return value;
+  return typeof value.name === 'string' ? value.name : null;
+}
+
+function roomLandingHtml({ base, code, preview, gone = false }) {
   const open = `${base}/#/room/${encodeURIComponent(code)}`;
   const url = `${base}/l/${encodeURIComponent(code)}`;
   const isPrivate = preview ? preview.visibility === 'private' : false;
+  // A gone room is not an invitation: the link used to render the same cheerful
+  // "join the room" card with a 404, so a dead link looked like a live one.
+  const isGone = gone || !preview;
   // A public room has a listener page that needs no account at all. The app
   // link stays for people who do have one (they can control playback there).
-  const liveUrl = preview && !isPrivate ? `${base}/l/${encodeURIComponent(code)}/live` : null;
+  const liveUrl = preview && !isPrivate && !isGone ? `${base}/l/${encodeURIComponent(code)}/live` : null;
   const primary = liveUrl ?? open;
   const track = preview?.track ?? null;
   const meta = track ? cardMetadata(track) : null;
-  const title = isPrivate ? 'A private listening room' : (meta?.title || 'Listen together on sonora');
-  const artist = !isPrivate ? (meta?.artist ?? '') : '';
-  const host = preview?.host ? `${preview.host} is listening.` : 'Listen together on sonora.';
-  const description = isPrivate
-    ? 'Ask the host for an invite.'
-    : [artist, host].filter(Boolean).join(' \u00b7 ');
+  const title = isGone
+    ? 'This room has ended'
+    : isPrivate ? 'A private listening room' : (meta?.title || 'Listen together on sonora');
+  const artist = !isPrivate && !isGone ? (meta?.artist ?? '') : '';
+  // A private room's host name is not public information: the landing page is
+  // reachable with no session and used to print "<name> is listening".
+  const hostName = isPrivate || isGone ? null : hostNameOf(preview?.host);
+  const host = hostName ? `${hostName} is listening.` : (isGone ? 'This room is closed.' : 'Listen together on sonora.');
+  const description = isGone
+    ? 'The room this link pointed to has ended, or the code is not a room.'
+    : isPrivate
+      ? 'Ask the host for an invite.'
+      : [artist, host].filter(Boolean).join(' \u00b7 ');
   const art = track ? `${base}/t/${encodeURIComponent(track.videoId)}/art.jpg` : `${base}${SHARE_FALLBACK_ART}`;
-  const listeners = preview ? Math.max(1, preview.listeners ?? ((preview.members ?? 0) + (preview.guests ?? 0))) : 0;
+  const listeners = preview && !isGone
+    ? Math.max(1, preview.listeners ?? ((preview.members ?? 0) + (preview.guests ?? 0)))
+    : 0;
 
   return `<!doctype html>
 <html lang="en">
@@ -2941,26 +5476,39 @@ h1{margin:24px 0 0;font-size:clamp(21px,5.6vw,27px);line-height:1.18;letter-spac
 <h1>${htmlEsc(title)}</h1>
 ${artist ? `<p class="artist">${htmlEsc(artist)}</p>` : ''}
 <p class="host">${htmlEsc(host)}</p>
-${isPrivate ? '' : `<p class="listeners"><b>${listeners}</b> listening now</p>`}
-<a class="play" href="${htmlEsc(primary)}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg>${liveUrl ? 'Listen live' : isPrivate ? 'Open sonora' : 'Join the room'}</a>
+${isPrivate || isGone ? '' : `<p class="listeners"><b>${listeners}</b> listening now</p>`}
+${isGone
+    ? `<a class="play" href="${htmlEsc(`${base}/`)}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg>Open sonora</a>`
+    : `<a class="play" href="${htmlEsc(primary)}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg>${liveUrl ? 'Listen live' : isPrivate ? 'Open sonora' : 'Join the room'}</a>`}
 ${liveUrl ? `<p class="alt-link"><a href="${htmlEsc(open)}">Sign in to sonora to control playback</a></p>` : ''}
-<p class="note">${isPrivate
-    ? 'This is a private room. Sign in, then ask the host to invite you.'
-    : 'No account is needed to listen — the link is the invitation. Playback stays in sync with everyone else in the room.'}</p>
+<p class="note">${isGone
+    ? 'The room this link pointed to has ended, or the code is not a room. Open sonora to start your own.'
+    : isPrivate
+      ? 'This is a private room. Sign in, then ask the host to invite you.'
+      : 'No account is needed to listen — the link is the invitation. Playback stays in sync with everyone else in the room.'}</p>
 </main>
 </body>
 </html>`;
 }
 
-app.get('/l/:code', async (req, reply) => {
+app.get('/l/:code', {
+  // Public and session-less like the share card and the artwork proxy, which is
+  // exactly why it needs its own per-IP limit: the global limiter exempts
+  // everything outside /api/, and this route both reads a room and renders a
+  // page. The global allowList is merged into every route's params, so it has to
+  // be cleared here for the limit to bite at all.
+  config: { rateLimit: { max: 120, timeWindow: '1 minute', allowList: null } },
+}, async (req, reply) => {
   const { code } = req.params;
   const preview = ROOM_CODE.test(code) ? roomPreview(code) : null;
   if (!preview) return reply.code(404).type('text/html; charset=utf-8')
     .header('cache-control', 'no-store')
-    .send(roomLandingHtml({ base: publicBase(req), code, preview: null }));
+    .send(roomLandingHtml({ base: publicBase(req), code, preview: null, gone: true }));
   return reply.type('text/html; charset=utf-8')
-    // Short: a room's listener count and track change while it lives.
-    .header('cache-control', 'public, max-age=60')
+    // Public metadata becomes private immediately when the host changes the
+    // room. A shared-cache max-age would keep serving its track and host after
+    // that transition, so this landing page (not only /live) is never stored.
+    .header('cache-control', 'no-store')
     .send(roomLandingHtml({ base: publicBase(req), code, preview }));
 });
 
@@ -3026,7 +5574,7 @@ function listenRowHtml(track, index, state) {
  */
 function listenHtml({ base, code, preview }) {
   const open = `${base}/#/room/${encodeURIComponent(code)}`;
-  const host = preview?.host ?? 'Someone';
+  const host = hostNameOf(preview?.host) ?? 'Someone';
   const hostInitial = String(host).trim().charAt(0).toUpperCase() || '?';
   const track = preview?.track ?? null;
   const meta = track ? cardMetadata(track) : null;
@@ -3277,13 +5825,29 @@ body[data-view="venue"] .mini{display:none}
   radial-gradient(46% 34% at 66% 32%,hsl(var(--hue) 90% 60% / .14),transparent 74%),
   radial-gradient(80% 50% at 50% 100%,rgba(0,0,0,.42),transparent 70%)}
 .v-art-svg{position:absolute;inset:0;width:100%;height:100%;display:block}
-.v-screen-glow{filter:drop-shadow(0 0 18px hsl(var(--hue) 90% 60% / .55))}
+.v-screen-glow{stroke:hsl(var(--hue) 85% 65% / .5);filter:drop-shadow(0 0 18px hsl(var(--hue) 90% 60% / .55))}
+/* Anything in the scene that must follow the record's colour is styled here:
+   CSS custom properties are not substituted inside SVG presentation attributes. */
+.v-screen-fill{fill:hsl(var(--hue) 90% 74%)}
+.v-neon-line{stroke:hsl(var(--hue) 96% 76%)}
+.v-neon-halo{stroke:hsl(var(--hue) 96% 68% / .22);filter:blur(6px)}
+.v-led{fill:hsl(var(--hue) 90% 66%)}
+.v-lamp-glow{fill:hsl(var(--hue) 90% 66% / .5)}
 /* The projector's caption lives in the SVG, so it scales with the room. */
 .v-screen-title{font:750 26px/1 Inter,system-ui,sans-serif;fill:#fff;letter-spacing:-.3px}
 .v-screen-sub{font:500 17px/1 Inter,system-ui,sans-serif;fill:rgba(255,255,255,.74)}
 .v-screen-elapsed,.v-screen-total{font:600 15px/1 Inter,system-ui,sans-serif;fill:rgba(255,255,255,.66);font-variant-numeric:tabular-nums}
 /* The people: illustrated figures drawn inside the scene, so they stand on the
    furniture rather than floating in front of it. Only the idle sway animates. */
+/* The gate: the player's "listen live" overlay, redrawn on the stage because the
+   venue hides the column the overlay lives in. */
+.v-gate{position:absolute;inset:0;z-index:4;display:grid;place-items:center;align-content:center;gap:12px;background:rgba(6,7,10,.52);backdrop-filter:blur(3px);text-align:center;padding:20px}
+.v-gate-btn{display:inline-flex;align-items:center;gap:10px;min-height:52px;padding:0 26px;border-radius:999px;background:var(--accent);color:var(--accent-ink);font-size:15px;font-weight:750;box-shadow:0 12px 34px rgba(233,130,97,.38);transition:transform var(--dur-1) var(--ease-out),background var(--dur-1) var(--ease-out)}
+.v-gate-btn:hover{background:var(--accent-2)}
+.v-gate-btn:active{transform:scale(.96)}
+.v-gate-btn:disabled{opacity:.65;cursor:progress}
+.v-gate-btn svg{width:16px;height:16px;fill:currentColor}
+.v-gate-note{margin:0;font-size:11.5px;line-height:1.5;color:var(--text-2);max-width:34ch}
 .v-people{pointer-events:none}
 .v-figure .v-pose{transform-box:fill-box;transform-origin:50% 100%;animation:v-sway 7s ease-in-out infinite;animation-delay:var(--d)}
 .v-figure[data-pose="dance"] .v-pose{animation:v-dance 2.6s ease-in-out infinite;animation-delay:var(--d)}
@@ -3293,8 +5857,8 @@ body[data-view="venue"] .mini{display:none}
 .v-tag{font:750 15px/1 Inter,system-ui,sans-serif;fill:#fff;paint-order:stroke;stroke:rgba(8,9,12,.85);stroke-width:4px;stroke-linejoin:round}
 .v-more text{font:700 15px/1 Inter,system-ui,sans-serif;fill:#d7d5da}
 .v-bubble{overflow:visible;animation:v-pop .4s var(--ease-out) both}
-.v-bubble>div{display:inline-block;padding:7px 12px;border-radius:13px 13px 13px 4px;background:rgba(250,247,242,.97);color:#191a1f;font:600 15px/1.3 Inter,system-ui,sans-serif;white-space:nowrap;box-shadow:0 10px 26px rgba(0,0,0,.5)}
-.v-figure.is-host .v-bubble>div{border-radius:13px 13px 4px 13px;background:hsl(var(--hue) 60% 88%)}
+.v-bubble>div{display:inline-block;padding:6px 11px;border-radius:12px 12px 12px 4px;background:rgba(250,247,242,.97);color:#191a1f;font:600 13px/1.3 Inter,system-ui,sans-serif;white-space:nowrap;box-shadow:0 8px 22px rgba(0,0,0,.5)}
+.v-bubble.is-host>div{border-radius:13px 13px 13px 4px;background:hsl(var(--hue) 62% 90%)}
 @keyframes v-pop{from{opacity:0;transform:translateY(6px) scale(.94)}}
 /* The cards over the room: now playing, the queue drawer, the transport. */
 .v-now{position:absolute;left:2.6%;top:8%;z-index:4;max-width:min(19%,260px);padding:10px 13px 11px;border:1px solid hsl(var(--hue) 60% 60% / .3);border-radius:14px;background:rgba(10,11,14,.74);backdrop-filter:blur(12px);box-shadow:0 16px 40px rgba(0,0,0,.5)}
@@ -3372,19 +5936,19 @@ body[data-view="venue"] .mini{display:none}
   /* The stacked layout is taller than the viewport, so the page scrolls rather
      than the room leaving a dead area under its own cards. */
   body[data-view="venue"]{height:auto;min-height:100dvh;overflow-y:auto}
-  body[data-view="venue"] .shell{height:auto;min-height:calc(100dvh - 32px)}
+  /* The shell hugs its content: a stacked venue is shorter than the viewport,
+     and stretching it would leave the room's own background below the cards. */
+  body[data-view="venue"] .shell{height:auto;min-height:0}
   body[data-view="venue"] .venue-host{flex:none}
   .venue{display:flex;flex-direction:column;flex:none;border-radius:16px}
   .v-scene{position:relative;flex:none;aspect-ratio:16/10;inset:auto}
   .v-now,.v-tools,.v-deck{position:static;max-width:none;width:auto;left:auto;right:auto;top:auto;bottom:auto}
-  .v-now{margin:10px 10px 0;padding:9px 11px;border-radius:14px;order:1}
-  .v-now-eyebrow{display:block}
-  .v-now-title{font-size:13px}
-  .v-now-sub{font-size:10.5px}
-  .v-now-meta{margin-top:6px;font-size:9.5px}
-  /* The title and artist are already in this card, so the listener count does
-     not need to appear twice in it. */
-  .v-now-meta .v-now-people{display:none}
+  /* The projector right above already carries the sleeve, the title and the
+     artist at a readable size, so this card keeps only what the screen does not
+     say: how many are listening, and whether this device is following. */
+  .v-now{margin:8px 10px 0;padding:7px 11px;border-radius:999px;order:1;display:flex;align-items:center;gap:8px}
+  .v-now-eyebrow,.v-now-title,.v-now-sub{display:none}
+  .v-now-meta{margin-top:0;font-size:10px;gap:8px}
   .v-tools{order:2;margin:8px 10px 0;justify-content:flex-start;flex-wrap:wrap;gap:6px;overflow:visible}
   .v-themes,.v-light,.v-exit{flex:none}
   .v-light{padding:0 2px 0 7px}
@@ -3393,7 +5957,16 @@ body[data-view="venue"] .mini{display:none}
   .v-deck-btn{align-self:flex-start}
   .v-deck-queue{max-height:min(34vh,240px)}
   .v-transport{width:100%}
-  .v-bubble>div{font-size:11px;padding:5px 9px}
+  /* The scene is one 1600-unit drawing scaled to ~390px, so text inside it is
+     ~4x smaller on screen than in the design. Labels get their size back in
+     user units, or they are unreadable at exactly the size where the room is
+     the only thing on screen. */
+  .v-tag{font-size:34px;stroke-width:7px}
+  .v-bubble>div{font-size:38px;padding:12px 20px;border-radius:26px 26px 26px 8px}
+  .v-more text{font-size:32px}
+  .v-screen-title{font-size:38px}
+  .v-screen-sub{font-size:26px}
+  .v-screen-elapsed,.v-screen-total{font-size:24px}
 }
 @media (prefers-reduced-motion:reduce){
   .v-figure{animation:none}
@@ -3417,10 +5990,13 @@ body[data-view="venue"] .mini{display:none}
   .copy-text{display:none}
   .icon-btn{padding:0 11px}
   .ghost-btn{display:none}
-  /* The switch has to survive a 390px header: icons only, labels read by the
-     accessible name (aria-label is added by the page). */
-  .view-btn{padding:0 9px}
-  .view-btn span{display:none}
+  /* The switch keeps its words: a hamburger and a house do not say "player" and
+     "venue". It gets its own row under the brand, and the room code grows to
+     fill what is left so the copy button never wraps onto a third line. */
+  .topbar-actions{width:100%;gap:6px}
+  .view-switch{flex:none}
+  .view-btn{padding:0 10px;font-size:11px}
+  .room-code{flex:1;justify-content:center;min-width:0}
   h1{font-size:clamp(23px,7vw,30px)}
   .stage{border-radius:16px}
   .controls{gap:8px}
@@ -3545,7 +6121,7 @@ body[data-view="venue"] .mini{display:none}
   <div class="mini-copy"><strong id="listen-mini-title">${htmlEsc(title)}</strong><span id="listen-mini-time">0:00 / –:––</span></div>
   <button class="mini-btn" id="listen-mini-mute" type="button" aria-label="Mute" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4z"/><path id="listen-mini-vol-wave" d="M16.5 8.5a5 5 0 0 1 0 7"/></svg></button>
 </div>
-<audio id="listen-audio" preload="none"></audio>
+<audio id="listen-audio" preload="auto"></audio>
 <script type="module" src="/listen.js"></script>
 </body>
 </html>`;
@@ -3573,7 +6149,15 @@ a{display:inline-flex;align-items:center;min-height:46px;padding:0 24px;border-r
 <a href="${htmlEsc(open)}">Open sonora</a></main></body></html>`;
 }
 
-app.get('/l/:code/live', async (req, reply) => {
+app.get('/l/:code/live', {
+  // The one un-throttled route that *writes*: every request runs roomPreview, an
+  // HMAC sign and a Set-Cookie. It sat behind the global allowList (which exempts
+  // everything outside /api/), so an anonymous loop could mint guest identities
+  // and drive upstream room reads without limit. Its own small per-IP budget, with
+  // the global allowList cleared so it applies; a household sharing one IP still
+  // has room for the one request per tab it actually makes.
+  config: { rateLimit: { max: 60, timeWindow: '1 minute', allowList: null } },
+}, async (req, reply) => {
   const { code } = req.params;
   const base = publicBase(req);
   const preview = ROOM_CODE.test(code) ? roomPreview(code) : null;
@@ -3593,14 +6177,7 @@ app.get('/l/:code/live', async (req, reply) => {
   // source while the visitor reads the track name — so the one gesture they do
   // make is a plain play() on a ready source, which no browser refuses, and a
   // refresh resumes from where the room is instead of from scratch.
-  reply.setCookie(GUEST_COOKIE, signGuest({
-    c: code,
-    g: crypto.randomBytes(9).toString('base64url'),
-    exp: Date.now() + GUEST_TTL_MS,
-  }), {
-    httpOnly: true, sameSite: 'lax', secure: !config.isDev, path: '/',
-    maxAge: Math.floor(GUEST_TTL_MS / 1000),
-  });
+  mintGuest(req, reply, code);
   return reply.type('text/html; charset=utf-8')
     // A live room changes every few seconds; never let a proxy pin this page.
     .header('cache-control', 'no-store')
@@ -3646,9 +6223,9 @@ const SHARE_FALLBACK_ART = '/icons/icon-512.png';
  */
 function publicBase(req) {
   if (config.publicUrl) return config.publicUrl;
-  const host = String(req.headers.host ?? '');
-  if (/^[A-Za-z0-9.-]+(?::\d{1,5})?$/.test(host)) return `${req.protocol}://${host}`;
-  return `http://127.0.0.1:${config.port}`;
+  // req.host/req.protocol include forwarded values only for an authenticated
+  // proxy peer. Do not read X-Forwarded-* here: direct clients can forge them.
+  return requestOrigin(req) ?? `http://127.0.0.1:${config.port}`;
 }
 
 const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
@@ -3743,7 +6320,11 @@ ${duration ? `<p class="dur">${htmlEsc(duration)}</p>` : ''}
 }
 
 /** The shareable page. Public by necessity: a crawler has no session. */
-app.get('/t/:videoId', async (req, reply) => {
+app.get('/t/:videoId', {
+  // It performs a public database lookup, so it must not inherit the static
+  // shell's global allowList exemption. Match the other public card routes.
+  config: { rateLimit: { max: 120, timeWindow: '1 minute', allowList: null } },
+}, async (req, reply) => {
   const { videoId } = req.params;
   if (!VIDEO_ID.test(videoId)) {
     return reply.code(404).type('text/html; charset=utf-8')
@@ -3764,10 +6345,18 @@ app.get('/t/:videoId', async (req, reply) => {
  * `public` rather than `private`, because the consumer here is a crawler or a
  * CDN and neither carries the viewer's cookie.
  */
-app.get('/t/:videoId/art.jpg', async (req, reply) => {
+app.get('/t/:videoId/art.jpg', {
+  // Public and session-less, like the share page below — which is exactly why
+  // it needs its own per-IP limit: the global limiter exempts everything
+  // outside /api/, and each unseen id is an upstream fetch. 120/min keeps a
+  // legitimate crawler fed while capping the anonymous fetch-amplification.
+  // The global allowList is merged into every route's params, so it has to be
+  // cleared here for the limit to bite at all.
+  config: { rateLimit: { max: 120, timeWindow: '1 minute', allowList: null } },
+}, async (req, reply) => {
   const { videoId } = req.params;
   if (!VIDEO_ID.test(videoId)) return reply.code(404).send({ error: 'Bad video id.' });
-  const base = `https://i.ytimg.com/vi/${videoId}`;
+  const base = `${IMG_UPSTREAM}/vi/${videoId}`;
   return proxyImage(`v:${videoId}:hi`, `${base}/maxresdefault.jpg`, reply,
     [`${base}/hq720.jpg`, `${base}/mqdefault.jpg`, `${base}/hqdefault.jpg`],
     'public, max-age=86400');
@@ -3775,47 +6364,130 @@ app.get('/t/:videoId/art.jpg', async (req, reply) => {
 
 /**
  * oEmbed discovery. Discord ignores it; Slack, Notion and most unfurl tools do
- * not, and it costs one route.
+ * not, and it costs one route. It is public like the share page and the
+ * artwork, so it carries the same modest per-IP limit (unfurls are cheap here —
+ * the route never fetches upstream — but it must not be the one public route a
+ * client can hammer without limit).
  */
-app.get('/oembed.json', async (req, reply) => {
-  const match = /\/t\/([A-Za-z0-9_-]{11})\/?$/.exec(String(req.query?.url ?? ''));
-  const videoId = match?.[1] ?? null;
-  const track = videoId ? getTrack(videoId) : null;
-  const meta = track ? cardMetadata(track) : null;
+app.get('/oembed.json', {
+  // Same public-exposure reasoning as the artwork route above: own per-IP
+  // limit, and the global allowList cleared so it applies.
+  config: { rateLimit: { max: 120, timeWindow: '1 minute', allowList: null } },
+}, async (req, reply) => {
+  // oEmbed is read by the consumer's own page, including its validation errors.
+  reply.header('access-control-allow-origin', '*');
+  const invalid = (message = 'Expected the canonical /t/<track-id> URL.') => reply.code(400)
+    .header('cache-control', 'no-store').send({ error: message });
+
+  const raw = req.query?.url;
+  if (typeof raw !== 'string' || raw.length > 2048) return invalid();
+  let target;
+  try { target = new URL(raw); } catch { return invalid(); }
+
   const base = publicBase(req);
+  // This provider only describes its own canonical track cards. A regex suffix
+  // match would otherwise bless evil.example/t/<id>, credentials, extra paths,
+  // query strings and fragments, making this provider vouch for another resource.
+  if (target.origin !== base || target.username || target.password) {
+    return invalid('Only a canonical same-origin track URL is supported.');
+  }
+  const match = /^\/t\/([A-Za-z0-9_-]{11})$/.exec(target.pathname);
+  const videoId = match?.[1];
+  const canonical = videoId ? `${base}/t/${videoId}` : null;
+  if (!videoId || target.href !== canonical || target.search || target.hash) return invalid();
+
+  const track = getTrack(videoId);
+  if (!track) {
+    return reply.code(404).header('cache-control', 'no-store')
+      .send({ error: 'Track not found.' });
+  }
+  const meta = cardMetadata(track);
   return reply
-    // oEmbed is read by the consumer's own page, so it has to be CORS-open.
-    .header('access-control-allow-origin', '*')
     .header('cache-control', 'public, max-age=300')
     .send({
       version: '1.0',
-      type: 'rich',
+      // This is a link card, not an HTML embed. Declaring `rich` without its
+      // required html/width/height fields produced a schema-invalid oEmbed reply.
+      type: 'link',
+      url: canonical,
       provider_name: 'sonora',
       provider_url: base,
-      title: meta ? [meta.title, meta.artist].filter(Boolean).join(' \u2014 ') : 'sonora',
-      ...(meta?.artist ? { author_name: meta.artist } : {}),
-      ...(videoId ? {
-        thumbnail_url: `${base}/t/${videoId}/art.jpg`,
-        thumbnail_width: 1280,
-        thumbnail_height: 720,
-      } : {}),
+      title: [meta.title || 'A track on sonora', meta.artist].filter(Boolean).join(' \u2014 '),
+      ...(meta.artist ? { author_name: meta.artist } : {}),
+      thumbnail_url: `${base}/t/${videoId}/art.jpg`,
+      thumbnail_width: 1280,
+      thumbnail_height: 720,
     });
 });
 
 // ── error handling ──────────────────────────────────────────────────────
 
+// Unlike static files, an unmatched path answers no representation at all. Make
+// that negative answer uncacheable for GET/HEAD (and harmlessly for other
+// methods); the global onRequest hook supplies the baseline security headers.
+app.setNotFoundHandler((req, reply) => {
+  reply.code(404).header('cache-control', 'no-store').send({ error: 'Not found.' });
+});
+
 app.setErrorHandler((err, req, reply) => {
-  req.log.error(err);
+  // Expected malformed input and rate limits are normal traffic, not server
+  // faults. Keep their status and request id in logs without printing a full
+  // stack for every 400/413/429; reserve error level and the error object for 5xx.
+  const status = Number(err.statusCode) || 500;
+  if (status >= 400 && status < 500) req.log.info({ status, code: err.code }, 'request rejected');
+  else req.log.error(err);
+  // A hijacked SSE stream (or a reply that has already flushed its headers)
+  // cannot be answered: writing a JSON error into a text/event-stream corrupts
+  // it, and Fastify throws FST_ERR_REP_ALREADY_SENT, which re-enters this
+  // handler. Drop the connection instead — the client treats that as a
+  // disconnect it can retry.
+  if (reply.sent || reply.raw.headersSent) {
+    try { reply.raw.destroy(); } catch {}
+    return;
+  }
   const code = err.statusCode && err.statusCode < 500 ? err.statusCode : 500;
   reply.code(code).send({ error: code === 500 ? 'Internal error.' : err.message });
 });
 
-const close = async () => {
-  await app.close();
+const close = async (exitCode = 0) => {
+  if (closing) return;
+  closing = true;
+  stopSchedulers();
+  // server.close() waits for every open connection, and a room's SSE stream
+  // never ends on its own: without this, SIGTERM hung until the supervisor's
+  // kill timeout (measured: still alive after 8 s with one client connected)
+  // and every restart became a hard kill mid-request.
+  const force = setTimeout(() => {
+    try { app.server.closeAllConnections?.(); } catch {}
+  }, 5000);
+  force.unref?.();
+  // No timer can enqueue another poll after this point. Detached audio work is
+  // cancelled through ensureAudio's subscriber signal, and every registered job
+  // gets a chance to finish its SQLite/filesystem cleanup before db.close().
+  await drainJobs();
+  try {
+    await app.close();
+  } catch (err) {
+    console.warn('[sonora] shutdown:', err?.message ?? err);
+  }
+  clearTimeout(force);
   try { db.close(); } catch {}
-  process.exit(0);
+  process.exit(exitCode);
 };
-for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, close);
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => close(0));
+
+// Process-level backstops. A rejected promise nobody awaited (a stray upstream
+// call, a stream callback) used to take the whole server down mid-song on Node
+// 22's default; log it instead so one bad request cannot silence the house.
+process.on('unhandledRejection', (err) => {
+  console.error('[sonora] unhandled rejection:', err?.stack ?? err);
+});
+process.on('uncaughtException', (err) => {
+  // State is unknown after an uncaught throw, so this one still shuts down —
+  // gracefully, and with a non-zero code so a supervisor notices.
+  console.error('[sonora] uncaught exception:', err?.stack ?? err);
+  close(1);
+});
 
 await app.listen({ port: config.port, host: config.host });
 console.log(`[sonora] http://${config.host}:${config.port} (pid ${process.pid}, ${API_FEATURES.length} api features)`);
@@ -3823,48 +6495,111 @@ await pruneCache();
 // Session housekeeping: expired refresh tokens and stale WebAuthn ceremonies are
 // dead weight, and a device unseen for two months is a device the user has long
 // since replaced. Cheap to run once at boot; nothing here is on a hot path.
-try {
-  const tokens = deleteExpiredRefreshTokens();
-  const ceremonies = deleteExpiredChallenges();
-  const devices = pruneStaleDevices(60);
-  const roomsGone = expireRooms();
-  if (tokens || ceremonies || devices || roomsGone) {
-    console.log(`[sonora] pruned ${tokens} refresh token(s), ${ceremonies} ceremony(s), ${devices} stale device(s), ${roomsGone} room(s)`);
+function sweepExpired() {
+  try {
+    const tokens = deleteExpiredRefreshTokens();
+    const ceremonies = deleteExpiredChallenges();
+    const devices = pruneStaleDevices(60);
+    const roomsGone = expireRooms();
+    // upstream_cache only deletes an expired row when something reads that exact
+    // key, so rows nobody asks for again (a `?fresh=1` station draw, a one-off
+    // search) lived forever. That was swept at boot only, which on a long-lived
+    // container means "once, months ago".
+    const cacheRows = pruneExpiredCache();
+    // A deleted account's station blobs have no foreign key to cascade from, and
+    // SQLite reuses the highest rowid, so a new user could inherit them.
+    const orphanRows = pruneOrphanCache();
+    // Keep this on the hourly path as well as boot: notifications are an events
+    // feed, not permanent storage. The bell's retention was previously promised
+    // by a comment but only ran once per process lifetime.
+    pruneNotifications(60);
+    // `plays` had no retention at all, while two hot paths aggregate it: the
+    // station's candidate query and /api/stats, whose LIMIT applies *after* the
+    // aggregate. Most of what grows the table is write-only — a `progress`
+    // heartbeat every few seconds of playback, plus the unlike/dislike markers
+    // older builds wrote and nothing reads — so those are what prunePlays()
+    // retires (90 days; the start/complete/skip rows that *are* the listening
+    // history are kept, see db.js). An old heartbeat contributes nothing to any
+    // answer: a track's depth is the deepest fraction heard, and that is either
+    // recent or already lost.
+    const oldPlays = prunePlays();
+    if (tokens || ceremonies || devices || roomsGone || cacheRows || orphanRows || oldPlays) {
+      console.log(`[sonora] pruned ${tokens} refresh token(s), ${ceremonies} ceremony(s), ${devices} stale device(s), ${roomsGone} room(s), ${cacheRows} cache row(s), ${orphanRows} orphan cache row(s), ${oldPlays} old play(s)`);
+    }
+  } catch (err) {
+    console.warn('[sonora] session housekeeping failed:', err.message);
   }
-} catch (err) {
-  console.warn('[sonora] session housekeeping failed:', err.message);
 }
-// Rooms have their own clock: a room is idle for hours, not minutes. The timer
-// skips rooms with a live stream, so this cannot end a group mid-song.
-setInterval(() => {
-  try { expireRooms(); } catch (err) { console.warn('[sonora] room housekeeping failed:', err.message); }
-}, 60 * 60_000).unref?.();
+sweepExpired();
+// Hourly: the audio cache ceiling is enforced where bytes are added (see
+// ensureAudio), but a cache that is only pruned at boot and from the admin
+// button grows again between restarts and can fill the disk — which fails
+// playback *and* SQLite's writes. The same tick sweeps the expired rows above,
+// rooms included; their former second hourly timer only expired the same rows
+// twice. Long async prunes are skipped, never overlapped or queued by each tick.
+let cachePruneJob = null;
+function scheduleCachePrune() {
+  if (closing || cachePruneJob) return;
+  const job = trackDetached('hourly cache prune', () => pruneCache());
+  cachePruneJob = job;
+  const settled = () => { if (cachePruneJob === job) cachePruneJob = null; };
+  job.promise.then(settled, settled);
+  job.promise.catch((err) => console.warn('[sonora] cache prune failed:', err.message));
+}
+schedulePeriodic(() => {
+  scheduleCachePrune();
+  sweepExpired();
+}, 60 * 60_000);
 // Release checks have their own, much slower clock. A new album is not urgent,
 // and every followed artist costs one catalogue page fetch, so twenty minutes is
 // often enough to feel current and rare enough that a dozen follows are a
 // handful of requests an hour. Only artists somebody actually follows are ever
 // touched: the sweep reads the follow table, it never walks the catalogue.
-setInterval(() => {
-  pollFollows().catch((err) => console.warn('[sonora] follow sweep failed:', err.message));
-}, 20 * 60_000).unref?.();
-// The bell is a recent-events feed, so old rows are dropped at boot (see
-// pruneNotifications): cheap, and it keeps the table from growing with every
-// release of every artist anyone ever followed.
-try { pruneNotifications(60); } catch (err) {
-  console.warn('[sonora] notification housekeeping failed:', err.message);
-}
+schedulePeriodic(() => {
+  const job = beginFollowJob('scheduled follow poll', () => pollFollows(), { detached: true });
+  // A slow previous/manual poll owns the slot. Skip this tick; the next one is
+  // soon enough, and adding a queued poll behind it only repeats stale work.
+  job?.promise.catch((err) => console.warn('[sonora] follow sweep failed:', err.message));
+}, 20 * 60_000);
 // Build the shared Innertube session now rather than inside the first search.
 // Measured 2026-10-20: session creation costs ~5 s (it fetches the player and
 // config), and paying that on the first user search reads as "search is slow".
 // Failure is harmless: getYT() clears its cache and the next call retries.
-getYT().catch((err) => console.warn('[sonora] youtube session warm-up failed:', err.message));
+trackDetached('youtube session warm-up', () => getYT())?.promise
+  .catch((err) => console.warn('[sonora] youtube session warm-up failed:', err.message));
 // The station's genre lane votes with YouTube's genre pages (~14 shelves). It
 // is warmed here rather than at boot *before* the session exists, because 14
 // parallel page fetches on a cold client made the first station request slower
 // (11 s) than paying for them lazily (2.6 s). Failures are harmless: the vote
 // falls back to the other lanes.
-getYT()
-  .then(() => new Promise((resolve) => setImmediate(resolve)))
-  .then(() => genreShelves())
-  .catch((err) => console.warn('[sonora] genre shelf warm-up failed:', err.message));
+trackDetached('genre shelf warm-up', async () => {
+  await getYT();
+  await new Promise((resolve) => setImmediate(resolve));
+  return genreShelves();
+})?.promise.catch((err) => console.warn('[sonora] genre shelf warm-up failed:', err.message));
 if (config.isDev) console.warn('[sonora] SONORA_SECRET unset — sessions reset on restart');
+
+// The bootstrap passphrase is the one credential nothing else validates: it is
+// read from the environment at boot and hashed straight into the only admin
+// account. Saying so once is the whole remedy — refusing to boot would strand an
+// existing install whose passphrase predates this floor, and rewriting it is not
+// this process's business.
+if (config.bootstrapPass) {
+  const weak = passwordProblem(config.bootstrapPass);
+  if (weak) {
+    console.warn(`[sonora] SONORA_PASSPHRASE is weak (${weak}) and it protects the admin account — change it.`);
+  }
+}
+
+// A blank-but-present RP pair is the shipped-template footgun: config treats it
+// as unset now, so say so once at boot instead of leaving the operator to
+// discover it from a "passkeys need a real domain" message.
+if (process.env.SONORA_RP_ID !== undefined && !config.rpId) {
+  console.warn('[sonora] SONORA_RP_ID is set but blank — treated as unset (the request host is used). Remove it or give it a domain.');
+}
+if (process.env.SONORA_ORIGIN !== undefined && !config.origin) {
+  console.warn('[sonora] SONORA_ORIGIN is set but blank — treated as unset (the request origin is used). Remove it or give it a URL.');
+}
+if (!config.rpId && !config.origin) {
+  console.log('[sonora] passkeys use the request host as RP ID/origin; behind a tunnel set SONORA_RP_ID and SONORA_ORIGIN');
+}

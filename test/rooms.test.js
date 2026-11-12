@@ -1,8 +1,8 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { freePort } from './helpers/cdp.js';
 import fs from 'node:fs';
-import { writeWav } from './helpers/wav.js';
 
 // Listen Together, over the same HTTP surface a browser uses.
 //
@@ -15,8 +15,8 @@ import { writeWav } from './helpers/wav.js';
 // Plus the two access rules: private means invited, and host-only means the
 // host is the only transport.
 
-const PORT = 8152;
-const BASE = `http://127.0.0.1:${PORT}`;
+let PORT = 0;
+let BASE = '';
 const DB = new URL(`./.tmp/rooms-${Date.now()}.db`, import.meta.url).pathname;
 const AUDIO = new URL(`./.tmp/roomsaudio-${Date.now()}`, import.meta.url).pathname;
 
@@ -73,6 +73,8 @@ const TRACK = (videoId, title, durationS = 214) => ({
 let toil; let ana; let ben; let carl;
 
 before(async () => {
+  PORT = await freePort();
+  BASE = `http://127.0.0.1:${PORT}`;
   fs.mkdirSync(new URL('./.tmp', import.meta.url).pathname, { recursive: true });
   proc = spawn(process.execPath, ['--no-warnings', 'src/server.js'], {
     cwd: new URL('..', import.meta.url).pathname,
@@ -102,12 +104,12 @@ before(async () => {
   // Accounts other than the bootstrap one are created through the admin API,
   // exactly as an owner would.
   for (const name of ['ana', 'ben', 'carl']) {
-    const r = await req('/api/admin/users', { jar: toil, method: 'POST', body: { name, passphrase: `${name}-pass`, role: 'user' } });
+    const r = await req('/api/admin/users', { jar: toil, method: 'POST', body: { name, passphrase: `${name}-passphrase`, role: 'user' } });
     assert.ok(r.status < 300, `create ${name}: ${r.status} ${JSON.stringify(r.body)}`);
   }
-  ana = await login('ana', 'ana-pass');
-  ben = await login('ben', 'ben-pass');
-  carl = await login('carl', 'carl-pass');
+  ana = await login('ana', 'ana-passphrase');
+  ben = await login('ben', 'ben-passphrase');
+  carl = await login('carl', 'carl-passphrase');
   // Remember two tracks so share links and room snapshots have metadata; the
   // engine never fabricates a title for an id it has not been told about.
   await req('/api/events', {
@@ -118,10 +120,37 @@ before(async () => {
     jar: ana, method: 'POST',
     body: { ...TRACK('9bZkp7q19f0', 'Room Two'), kind: 'start' },
   });
-  // Real (if silent) audio for the three ids the tests use, so the stream route
-  // answers 206 instead of trying to fetch from YouTube.
-  for (const [i, id] of ['dQw4w9WgXcQ', '9bZkp7q19f0', 'kJQP7kiw5Fk'].entries()) {
-    writeWav(`${AUDIO}/${id}.m4a`, { seconds: 40, freq: 300 + i * 100 });
+  // Forty seconds of deterministic silent AAC in a real MP4/M4A container.
+  // The cache correctly rejects the WAV-under-.m4a fixture this replaced.
+  // Embedded to keep this offline suite independent of ffmpeg and YouTube.
+  const roomAudio = Buffer.from(`
+AAAAHGZ0eXBNNEEgAAACAE00QSBpc29taXNvMgAAAtZtb292AAAAbG12aGQAAAAAAAAAAAAAAAAAAAPoAACcQAABAAABAAAAAAAAAAAAAAAAAQAAAAAAAAAA
+AAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAACJXRyYWsAAABcdGtoZAAAAAMAAAAAAAAAAAAAAAEAAAAA
+AACcQAAAAAAAAAAAAAAAAQEAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAACRlZHRzAAAAHGVsc3QAAAAAAAAAAQAA
+nEAAAAQAAAEAAAAAAZ1tZGlhAAAAIG1kaGQAAAAAAAAAAAAAAAAAAB9AAATmAFXEAAAAAAAtaGRscgAAAAAAAAAAc291bgAAAAAAAAAAAAAAAFNvdW5kSGFu
+ZGxlcgAAAAFIbWluZgAAABBzbWhkAAAAAAAAAAAAAAAkZGluZgAAABxkcmVmAAAAAAAAAAEAAAAMdXJsIAAAAAEAAAEMc3RibAAAAGpzdHNkAAAAAAAAAAEA
+AABabXA0YQAAAAAAAAABAAAAAAAAAAAAAQAQAAAAAB9AAAAAAAA2ZXNkcwAAAAADgICAJQABAASAgIAXQBUAAAAAAD6AAAAA+gWAgIAFFYhW5QAGgICAAQIA
+AAAgc3R0cwAAAAAAAAACAAABOQAABAAAAAABAAACAAAAABxzdHNjAAAAAAAAAAEAAAABAAABOgAAAAEAAAAUc3RzegAAAAAAAAAEAAABOgAAABRzdGNvAAAA
+AAAAAAEAAAMCAAAAGnNncGQBAAAAcm9sbAAAAAIAAAAB//8AAAAcc2JncAAAAAByb2xsAAAAAQAAAToAAAABAAAAPXVkdGEAAAA1bWV0YQAAAAAAAAAhaGRs
+cgAAAAAAAAAAbWRpcmFwcGwAAAAAAAAAAAAAAAAIaWxzdAAAAAhmcmVlAAAE8G1kYXQBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAH
+ARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEY
+IAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAH
+ARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEY
+IAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAH
+ARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEY
+IAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAH
+ARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEY
+IAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAH
+ARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEY
+IAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAH
+ARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEY
+IAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAH
+ARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEY
+IAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBwEYIAcBGCAHARggBw==
+`, 'base64');
+  fs.mkdirSync(AUDIO, { recursive: true });
+  for (const id of ['dQw4w9WgXcQ', '9bZkp7q19f0', 'kJQP7kiw5Fk']) {
+    fs.writeFileSync(`${AUDIO}/${id}.m4a`, roomAudio);
   }
 });
 
@@ -251,6 +280,105 @@ test('any member may continue a track that ended; nobody may skip one that has n
 
 // ── commands and revision conflicts ────────────────────────────────────
 
+// A device that is a few milliseconds ahead of the server reaches the end of
+// its own file before the server's derived end. Refusing that one advance used
+// to wedge a room whose host was asleep: the client remembered the refusal and
+// the room never moved again. The rule therefore gets a small tolerance, and it
+// has to stay far too small to be usable as a skip.
+test('an auto advance at the boundary is a continuation, not a skip', async () => {
+  const short = () => [TRACK('dQw4w9WgXcQ', 'Ten Seconds', 10), TRACK('9bZkp7q19f0', 'Next', 200)];
+
+  // 400 ms before the derived end: allowed, because that is exactly the drift
+  // a correct client has.
+  const near = await create(ana, { queue: short(), positionMs: 9_600, playing: false });
+  const nearJoin = await req(`/api/rooms/${near.body.code}/join`, { jar: ben, method: 'POST' });
+  const nearNext = await req(`/api/rooms/${near.body.code}/command`, {
+    jar: ben, method: 'POST', body: { type: 'next', auto: true, rev: nearJoin.body.rev },
+  });
+  assert.equal(nearNext.status, 200, 'a boundary-adjacent auto advance is not a skip');
+  assert.equal(nearNext.body.index, 1);
+
+  // Five seconds early is a skip, and it obeys the policy.
+  const early = await create(ana, { queue: short(), positionMs: 5_000, playing: false });
+  const earlyJoin = await req(`/api/rooms/${early.body.code}/join`, { jar: ben, method: 'POST' });
+  const earlyNext = await req(`/api/rooms/${early.body.code}/command`, {
+    jar: ben, method: 'POST', body: { type: 'next', auto: true, rev: earlyJoin.body.rev },
+  });
+  assert.equal(earlyNext.status, 403);
+  assert.equal(earlyNext.body.code, 'NOT_ENDED');
+
+  // Under host-only control the ended-track exemption has to come before the
+  // policy gate, or a room freezes at the end of every track once the host's
+  // phone sleeps — the one case the exemption exists for.
+  const hosted = await create(ana, { queue: short(), positionMs: 10_000, playing: false, control: 'host' });
+  const hostedJoin = await req(`/api/rooms/${hosted.body.code}/join`, { jar: ben, method: 'POST' });
+  const hostedNext = await req(`/api/rooms/${hosted.body.code}/command`, {
+    jar: ben, method: 'POST', body: { type: 'next', auto: true, rev: hostedJoin.body.rev },
+  });
+  assert.equal(hostedNext.status, 200, 'a non-host may continue a track that ended, whatever the policy');
+  assert.equal(hostedNext.body.index, 1);
+
+  // ... but a non-host still cannot skip under the same policy.
+  const hostedEarly = await create(ana, { queue: short(), positionMs: 5_000, playing: false, control: 'host' });
+  const hostedEarlyJoin = await req(`/api/rooms/${hostedEarly.body.code}/join`, { jar: ben, method: 'POST' });
+  const hostedSkip = await req(`/api/rooms/${hostedEarly.body.code}/command`, {
+    jar: ben, method: 'POST', body: { type: 'next', auto: true, rev: hostedEarlyJoin.body.rev },
+  });
+  assert.equal(hostedSkip.status, 403);
+  assert.equal(hostedSkip.body.code, 'HOST_ONLY');
+});
+
+test('auto prev is never a host-only natural-continuation exemption', async () => {
+  // Reproduced at both the tolerance boundary and the real end: `auto` used to
+  // exempt prev exactly like next, allowing a member to move 1 -> 0 in a room
+  // whose transport was explicitly host-only.
+  for (const positionMs of [9_600, 10_000]) {
+    const { body: room } = await create(ana, {
+      control: 'host', index: 1, positionMs, playing: false,
+      queue: [TRACK('dQw4w9WgXcQ', 'Previous', 10), TRACK('9bZkp7q19f0', 'Current', 10)],
+    });
+    const joined = await req(`/api/rooms/${room.code}/join`, { jar: ben, method: 'POST' });
+    const previous = await req(`/api/rooms/${room.code}/command`, {
+      jar: ben, method: 'POST', body: { type: 'prev', auto: true, rev: joined.body.rev },
+    });
+    assert.equal(previous.status, 403, `prev at ${positionMs} ms remains host-only`);
+    assert.equal(previous.body.code, 'HOST_ONLY');
+    const unchanged = await req(`/api/rooms/${room.code}/state`, { jar: ana });
+    assert.equal(unchanged.body.index, 1);
+    assert.equal(unchanged.body.rev, room.rev);
+  }
+});
+
+// The revision check is what makes "two people pressing next advance once"
+// true, so a relative command without an integer revision must not silently
+// degrade to "always matches".
+test('a relative command must carry the integer revision it was formed on', async () => {
+  const { body: room } = await create(ana);
+  const missing = await req(`/api/rooms/${room.code}/command`, {
+    jar: ana, method: 'POST', body: { type: 'next' },
+  });
+  assert.equal(missing.status, 400);
+  assert.equal(missing.body.code, 'BAD_INPUT');
+
+  const stringly = await req(`/api/rooms/${room.code}/command`, {
+    jar: ana, method: 'POST', body: { type: 'next', rev: String(room.rev) },
+  });
+  assert.equal(stringly.status, 400, 'a string rev is not a revision');
+
+  const stale = await req(`/api/rooms/${room.code}/command`, {
+    jar: ana, method: 'POST', body: { type: 'next', rev: room.rev - 1 },
+  });
+  assert.equal(stale.status, 409);
+  assert.equal(stale.body.code, 'STALE');
+  assert.equal(stale.body.state.rev, room.rev, 'the loser is handed the state to follow');
+
+  const fresh = await req(`/api/rooms/${room.code}/command`, {
+    jar: ana, method: 'POST', body: { type: 'next', rev: room.rev },
+  });
+  assert.equal(fresh.status, 200);
+  assert.equal(fresh.body.index, 1);
+});
+
 test('two people pressing next on the same revision advance the room once', async () => {
   const { body: room } = await create(ana);
   await req(`/api/rooms/${room.code}/join`, { jar: ben, method: 'POST' });
@@ -302,17 +430,49 @@ test('the queue accepts a suggestion, refuses a duplicate, and never drops the c
   assert.equal(dupe.status, 409);
   assert.equal(dupe.body.code, 'IN_QUEUE');
 
+  // The playing track cannot be removed by index, and an index-only removal
+  // without the revision it was formed on is refused outright: "index 2" means
+  // nothing once the queue has shifted.
   const current = await req(`/api/rooms/${room.code}/command`, {
-    jar: ana, method: 'POST', body: { type: 'queue-remove', index: 0 },
+    jar: ana, method: 'POST', body: { type: 'queue-remove', videoId: 'dQw4w9WgXcQ' },
   });
   assert.equal(current.status, 400);
   assert.equal(current.body.code, 'CURRENT');
 
-  const removed = await req(`/api/rooms/${room.code}/command`, {
+  const blind = await req(`/api/rooms/${room.code}/command`, {
     jar: ana, method: 'POST', body: { type: 'queue-remove', index: 2 },
+  });
+  assert.equal(blind.status, 400);
+  assert.equal(blind.body.code, 'BAD_INPUT', 'an index-only removal must name its revision');
+
+  // Naming the track is the primary form, and it is idempotent: a retried
+  // removal must not eat a neighbour because the queue moved underneath it.
+  const removed = await req(`/api/rooms/${room.code}/command`, {
+    jar: ana, method: 'POST', body: { type: 'queue-remove', videoId: 'kJQP7kiw5Fk' },
   });
   assert.equal(removed.status, 200);
   assert.equal(removed.body.queue.length, 2);
+  assert.ok(!removed.body.queue.some((t) => t.videoId === 'kJQP7kiw5Fk'));
+  const again = await req(`/api/rooms/${room.code}/command`, {
+    jar: ana, method: 'POST', body: { type: 'queue-remove', videoId: 'kJQP7kiw5Fk' },
+  });
+  assert.equal(again.status, 200, 'removing an already-removed track is a no-op, not an error');
+  assert.equal(again.body.rev, removed.body.rev, 'and it does not move the room');
+  assert.equal(again.body.queue.length, 2);
+
+  // A stale index (the queue shifted since the client looked) is refused with
+  // the current state to follow, instead of deleting whatever now sits there.
+  const stale = await req(`/api/rooms/${room.code}/command`, {
+    jar: ana, method: 'POST', body: { type: 'queue-remove', index: 1, rev: removed.body.rev - 1 },
+  });
+  assert.equal(stale.status, 409);
+  assert.equal(stale.body.code, 'STALE');
+  assert.equal(stale.body.state.queue.length, 2);
+  const byIndex = await req(`/api/rooms/${room.code}/command`, {
+    jar: ana, method: 'POST', body: { type: 'queue-remove', index: 1, rev: removed.body.rev },
+  });
+  assert.equal(byIndex.status, 200);
+  assert.equal(byIndex.body.queue.length, 1);
 });
 
 test('a non-member can read a public room but cannot join the transport or the stream', async () => {
@@ -397,6 +557,63 @@ test('queue-set is a play intent: it validates, clamps and respects host-only co
   });
   assert.equal(junk.status, 200);
   assert.equal(junk.body.queue.length, 1, 'unusable entries are dropped, not fatal');
+});
+
+test('create and queue-set normalise duplicate ids without weakening queue-add rejection', async () => {
+  const first = TRACK('kJQP7kiw5Fk', 'First copy');
+  const second = TRACK('aBcDeFgHiJk', 'Second id');
+  const created = await create(ana, {
+    queue: [first, { ...first, title: 'Duplicate copy' }, second, first],
+    index: 0, playing: false,
+  });
+  assert.equal(created.status, 200);
+  assert.deepEqual(created.body.queue.map((track) => track.videoId), [first.videoId, second.videoId]);
+  assert.equal(created.body.queue[0].title, 'First copy');
+
+  const replaced = await req(`/api/rooms/${created.body.code}/command`, {
+    jar: ana, method: 'POST', body: {
+      type: 'queue-set', queue: [second, { ...second, title: 'Duplicate again' }, first], index: 0,
+    },
+  });
+  assert.equal(replaced.status, 200);
+  assert.deepEqual(replaced.body.queue.map((track) => track.videoId), [second.videoId, first.videoId]);
+  assert.equal(replaced.body.queue[0].title, 'Second id');
+
+  const duplicateAdd = await req(`/api/rooms/${created.body.code}/command`, {
+    jar: ana, method: 'POST', body: { type: 'queue-add', track: { ...first, title: 'Still rejected' } },
+  });
+  assert.equal(duplicateAdd.status, 409, 'the single-track command keeps its existing duplicate contract');
+  assert.equal(duplicateAdd.body.code, 'IN_QUEUE');
+  const unchanged = await req(`/api/rooms/${created.body.code}/state`, { jar: ana });
+  assert.equal(unchanged.body.rev, replaced.body.rev);
+});
+
+test('rejected queue commands cannot create or alter catalogue tracks', async () => {
+  const existing = TRACK('RejectAdd01', 'Canonical title');
+  const { body: room } = await create(ana, { queue: [existing], playing: false });
+  const duplicate = await req(`/api/rooms/${room.code}/command`, {
+    jar: ana, method: 'POST', body: {
+      type: 'queue-add', track: { ...existing, title: 'Poisoned by a rejected retry' },
+    },
+  });
+  assert.equal(duplicate.status, 409);
+  assert.equal(duplicate.body.code, 'IN_QUEUE');
+  const canonical = await req(`/api/track/${existing.videoId}`, { jar: ana });
+  assert.equal(canonical.body.track.title, 'Canonical title',
+    'the duplicate check runs before the metadata upsert');
+
+  const rejected = TRACK('RejectSet01', 'Must not be catalogued');
+  const before = await req(`/api/track/${rejected.videoId}`, { jar: ana });
+  assert.equal(before.body.track.unknown, true);
+  const badIndex = await req(`/api/rooms/${room.code}/command`, {
+    jar: ana, method: 'POST', body: { type: 'queue-set', queue: [rejected], index: 4 },
+  });
+  assert.equal(badIndex.status, 400);
+  assert.equal(badIndex.body.code, 'BAD_INPUT');
+  const after = await req(`/api/track/${rejected.videoId}`, { jar: ana });
+  assert.equal(after.body.track.unknown, true,
+    'a rejected index cannot insert otherwise valid track metadata');
+  assert.equal(after.body.track.title, null);
 });
 
 // ── private rooms and invites ──────────────────────────────────────────
@@ -498,6 +715,25 @@ test('leaving removes the membership and the live stream', async () => {
   assert.ok(!view.body.members.some((m) => m.name === 'ben'));
 });
 
+// Leaving is not ending. The host owns `rooms.host_id` whether or not a
+// membership row exists, so dropping their row only made the room 403 its own
+// host — and under host-only control nobody else could move the playhead.
+test('the host leaving keeps their seat, so the room can still move', async () => {
+  const { body: room } = await create(ana, { control: 'host' });
+  const leave = await req(`/api/rooms/${room.code}/leave`, { jar: ana, method: 'POST' });
+  assert.equal(leave.status, 200);
+  assert.equal(leave.body.host, true, 'a host leave is not a plain membership drop');
+  const state = await req(`/api/rooms/${room.code}/state`, { jar: ana });
+  assert.equal(state.status, 200);
+  assert.equal(state.body.joined, true, 'their own room still knows them');
+  assert.ok(state.body.members.some((m) => m.name === 'ana'), 'and they are still in the roster');
+  const pause = await req(`/api/rooms/${room.code}/command`, {
+    jar: ana, method: 'POST', body: { type: 'pause', rev: state.body.rev, positionMs: 1000 },
+  });
+  assert.equal(pause.status, 200, 'so their next command is not 403 NOT_MEMBER');
+  assert.ok(Array.isArray(pause.body.members), 'a command response carries the roster the client renders');
+});
+
 // ── the live stream ────────────────────────────────────────────────────
 
 /** Read SSE chunks until `needle` appears or the budget runs out. */
@@ -548,6 +784,31 @@ test('the stream opens with a snapshot and pushes every accepted command', async
   ac.abort();
 });
 
+test('a track that reaches its end without a command is broadcast as ended', async () => {
+  // `ended` is derived from the duration, so no command is needed to reach it —
+  // but nothing used to *say* so. Clients kept their last `playing: true`
+  // snapshot and their target position walked past the end forever, which made
+  // an un-advanced room restart and jump once a second while the badge still
+  // said "Live". A two-second track nobody touches is the whole test.
+  const { body: room } = await create(ana, {
+    queue: [TRACK('kJQP7kiw5Fk', 'Very Short', 2)], positionMs: 0, playing: true,
+  });
+  const res = await fetch(`${BASE}/api/rooms/${room.code}/events`, { headers: { cookie: ana.header() } });
+  assert.equal(res.status, 200);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const state = { buf: '' };
+  assert.ok(await readUntil(reader, decoder, state, 'event: snapshot'), 'opens with a snapshot');
+  assert.ok(await readUntil(reader, decoder, state, 'event: state', 8000), 'the derived end is pushed');
+  const ended = [...state.buf.matchAll(/event: state\ndata: (.+)\n/g)]
+    .map((m) => JSON.parse(m[1])).at(-1);
+  assert.ok(ended, 'the frame carries JSON');
+  assert.equal(ended.ended, true, 'and says the track ended');
+  assert.equal(ended.playing, false, 'the playhead is not still running');
+  assert.equal(ended.positionMs, 2000, 'the position is the duration, not 202s of arithmetic');
+  await reader.cancel().catch(() => {});
+});
+
 test('ending a room stops it for everyone and closes the stream', async () => {
   const { body: room } = await create(ana);
   await req(`/api/rooms/${room.code}/join`, { jar: ben, method: 'POST' });
@@ -587,10 +848,24 @@ test('the share page is public and does not leak a private room\u2019s track', a
   const { body: pub } = await create(ana, { visibility: 'public' });
   const publicPage = await req(`/l/${pub.code}`);
   assert.equal(publicPage.status, 200);
+  assert.equal(publicPage.res.headers.get('cache-control'), 'no-store');
   assert.match(publicPage.body, /property="og:title"/);
   assert.ok(publicPage.body.includes('Room One'), 'a public room names what is playing');
   assert.ok(publicPage.body.includes(`/#/room/${pub.code}`), 'the page hands the visitor to the app');
   assert.doesNotMatch(publicPage.body, /<script[\s>]/i, 'the landing page must work without JavaScript');
+
+  // This transition must be visible to the very next shared-cache lookup. The
+  // previous public,max-age=60 landing page could keep naming the track after it
+  // became private, even though /l/<code>/live already answered 403.
+  const madePrivate = await req(`/api/rooms/${pub.code}`, {
+    jar: ana, method: 'PATCH', body: { visibility: 'private' },
+  });
+  assert.equal(madePrivate.status, 200);
+  const afterPrivate = await req(`/l/${pub.code}`);
+  assert.equal(afterPrivate.status, 200);
+  assert.equal(afterPrivate.res.headers.get('cache-control'), 'no-store');
+  assert.match(afterPrivate.body, /private listening room/i);
+  assert.ok(!afterPrivate.body.includes('Room One'), 'privacy takes effect without a 60-second cache window');
 
   const { body: priv } = await create(ana, { visibility: 'private' });
   const privatePage = await req(`/l/${priv.code}`);
@@ -690,6 +965,29 @@ test('a public room lets anyone with the link listen, with no account', async ()
   assert.match(time.res.headers.get('set-cookie') ?? 'HttpOnly', /HttpOnly/);
 });
 
+test('same-origin guests retain body-less join support and guest cookies reject cross-site reuse', async () => {
+  const { body: room } = await create(ana, { visibility: 'public' });
+  const jar = new Jar();
+  const joined = await req(`/api/public/rooms/${room.code}/guest`, {
+    jar,
+    method: 'POST',
+    headers: { origin: BASE, 'sec-fetch-site': 'same-origin', 'content-type': 'text/plain' },
+  });
+  assert.equal(joined.status, 200, JSON.stringify(joined.body));
+  assert.ok(jar.header().includes('sonora_guest='));
+
+  const forged = await req(`/api/public/rooms/${room.code}/guest`, {
+    jar,
+    method: 'POST',
+    headers: { origin: 'https://attacker.invalid', 'sec-fetch-site': 'cross-site' },
+  });
+  assert.equal(forged.status, 403);
+  assert.equal(forged.res.headers.get('cache-control'), 'no-store');
+  const state = await req(`/api/public/rooms/${room.code}/state`, { jar });
+  assert.equal(state.status, 200, 'the rejected cross-site mint does not replace the existing guest identity');
+  assert.equal(state.body.joined, true);
+});
+
 test('guest audio is confined to the room’s queue', async () => {
   const { body: room } = await create(ana, { visibility: 'public' });
   const { jar } = await guestJoin(room.code);
@@ -729,6 +1027,10 @@ test('a guest stream carries no roster, and follows the host', async () => {
   const first = JSON.parse(state.buf.match(/event: snapshot\ndata: (.+)\n/)[1]);
   assert.deepEqual(first.members, [], 'no names reach a guest');
   assert.ok(first.listeners >= 1, 'but the guest is counted');
+  // `updatedBy` names the account that last moved the playhead. A guest page
+  // never renders it, so it must not be sent: names are not a public-room
+  // resource, and this one leaked to everyone with a link.
+  assert.ok(!('updatedBy' in first), 'a guest snapshot does not name the last controller');
 
   const moved = await req(`/api/rooms/${room.code}/command`, {
     jar: ana, method: 'POST', body: { type: 'seek', positionMs: 21_000 },
@@ -737,6 +1039,7 @@ test('a guest stream carries no roster, and follows the host', async () => {
   assert.ok(await readUntil(reader, decoder, state, 'event: state'), 'the change is pushed');
   const pushed = [...state.buf.matchAll(/event: state\ndata: (.+)\n/g)].map((m) => JSON.parse(m[1])).at(-1);
   assert.ok(pushed.positionMs >= 21_000 && pushed.positionMs < 21_200, `as of now (${pushed.positionMs})`);
+  assert.ok(!('updatedBy' in pushed), 'a guest state frame does not name the last controller either');
 
   assert.ok(await readUntil(reader, decoder, state, 'event: members'), 'presence arrives');
   const presence = [...state.buf.matchAll(/event: members\ndata: (.+)\n/g)].map((m) => JSON.parse(m[1])).at(-1);
@@ -773,6 +1076,9 @@ test('making a room private revokes its guests’ streams and audio', async () =
   const state = { buf: '' };
   await readUntil(reader, decoder, state, 'event: snapshot');
   assert.ok(served(await streamStatus(jar, 'dQw4w9WgXcQ')), 'audio before the change');
+  // Draw the line after the opening snapshot: anything the guest receives from
+  // here on is what the flip itself sent.
+  state.buf = '';
 
   const flipped = await req(`/api/rooms/${room.code}`, {
     jar: ana, method: 'PATCH', body: { visibility: 'private' },
@@ -780,10 +1086,18 @@ test('making a room private revokes its guests’ streams and audio', async () =
   assert.equal(flipped.status, 200);
   assert.ok(await readUntil(reader, decoder, state, 'event: room'), 'the guest is told');
   assert.match(state.buf, /"removed":true/);
+  // The eviction must come first. A guest used to receive one last full `state`
+  // frame — queue, track and playhead — on the same tick the room stopped
+  // sharing them, and only then the eviction.
+  assert.ok(!/event: state\n/.test(state.buf), 'and gets no last snapshot of what just became private');
 
   const after = await req(`/api/public/rooms/${room.code}/state`, { jar });
   assert.equal(after.status, 403);
   assert.equal(await streamStatus(jar, 'dQw4w9WgXcQ'), 401, 'and the audio stops');
+  // Even the clock probe is shut: a private room is nobody's business, and a
+  // probe would confirm the room exists and is live.
+  const clock = await req(`/api/public/rooms/${room.code}/time`, { jar });
+  assert.equal(clock.status, 403);
   ac.abort();
 });
 
@@ -843,4 +1157,171 @@ test('a private room’s listener page never exists, so its queue never leaks', 
   assert.equal(landing.status, 200);
   assert.ok(!landing.body.includes('Room One'), 'the landing is a wall too');
   assert.match(landing.body, /private/i);
+});
+
+// ── state frames are per-subscriber ────────────────────────────────────
+// A published `state` frame is a snapshot, and a snapshot is shaped for the
+// viewer who reads it. The command response is the commander's own snapshot;
+// the broadcast used to reuse that object verbatim, so a guest received a
+// member-shaped frame (no guest flag, a `joined` that belongs to someone else)
+// and members received the commander's per-viewer flags. Clients treat `state`
+// exactly like the initial snapshot of their own stream, so the broadcast has
+// to be built per subscriber the same way.
+
+test('a command delivers each subscriber their own shaped state frame', async () => {
+  const { body: room } = await create(ana);
+  await req(`/api/rooms/${room.code}/join`, { jar: ben, method: 'POST' });
+  const joined = await guestJoin(room.code);
+  assert.equal(joined.status, 200);
+
+  // ben (a member) and a guest hold streams; ana commands from the API only.
+  // A background pump keeps draining each stream into a buffer, so nothing the
+  // server sends while the test is busy elsewhere is ever lost.
+  const pump = (res) => {
+    const state = { ac: new AbortController(), buf: '' };
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    (async () => {
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          state.buf += decoder.decode(value, { stream: true });
+          if (state.buf.length > 200_000) state.buf = state.buf.slice(-100_000);
+        }
+      } catch { /* aborted */ }
+    })();
+    return state;
+  };
+  const member = pump(await fetch(`${BASE}/api/rooms/${room.code}/events`, {
+    headers: { cookie: ben.header() }, signal: new AbortController().signal,
+  }));
+  const guest = pump(await fetch(`${BASE}/api/public/rooms/${room.code}/events`, {
+    headers: { cookie: joined.jar.header() }, signal: new AbortController().signal,
+  }));
+  assert.ok(member.buf !== null && guest.buf !== null);
+
+  const waitFor = async (state, needle, ms = 4000) => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline && !state.buf.includes(needle)) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return state.buf.includes(needle);
+  };
+  assert.ok(await waitFor(member, 'event: snapshot'), 'the member stream opens with a snapshot');
+  assert.ok(await waitFor(guest, 'event: snapshot'), 'the guest stream opens with a snapshot');
+  // Discard the pre-command buffer so the frames asserted below can only be
+  // the ones the command produced.
+  member.buf = ''; guest.buf = '';
+
+  const command = await req(`/api/rooms/${room.code}/command`, {
+    jar: ana, method: 'POST', body: { type: 'seek', positionMs: 33_000 },
+  });
+  assert.equal(command.status, 200);
+  // The commander's own response stays exactly the per-viewer snapshot.
+  assert.equal(command.body.joined, true);
+
+  assert.ok(await waitFor(member, 'event: state'), 'the member received the state frame');
+  assert.ok(await waitFor(guest, 'event: state'), 'the guest received the state frame');
+
+  const memberFrame = [...member.buf.matchAll(/event: state\ndata: (.+)\n/g)]
+    .map((m) => JSON.parse(m[1])).at(-1);
+  const guestFrame = [...guest.buf.matchAll(/event: state\ndata: (.+)\n/g)]
+    .map((m) => JSON.parse(m[1])).at(-1);
+  assert.ok(memberFrame && guestFrame, 'both frames carry JSON');
+
+  // The member's frame is a member snapshot: joined for *this* viewer, the
+  // playhead the command set, and no guest marker.
+  assert.equal(memberFrame.joined, true, 'a member is joined in their own frame');
+  assert.equal(memberFrame.guest, undefined, 'a member frame is not guest-shaped');
+  assert.ok(memberFrame.positionMs >= 33_000 && memberFrame.positionMs < 33_400,
+    `the member frame carries the new playhead (${memberFrame.positionMs})`);
+
+  // The guest's frame matches the guest snapshot shape: guest:true, an empty
+  // roster and no roster internals anywhere in the frame.
+  assert.equal(guestFrame.guest, true, 'the guest frame is guest-shaped');
+  assert.deepEqual(guestFrame.members, [], 'no roster reaches a guest state frame');
+  assert.equal(guestFrame.joined, true);
+  assert.ok(guestFrame.positionMs >= 33_000 && guestFrame.positionMs < 33_400,
+    `the guest frame carries the new playhead (${guestFrame.positionMs})`);
+  assert.ok(!JSON.stringify(guestFrame).includes('"role":'), 'no roster internals');
+
+  member.ac.abort();
+  guest.ac.abort();
+});
+
+test('going private evicts the guests with a single roster broadcast', async () => {
+  const { body: room } = await create(ana, { visibility: 'public' });
+  await req(`/api/rooms/${room.code}/join`, { jar: ben, method: 'POST' });
+
+  // A member watches the roster; three guests hold streams. Each connect
+  // broadcasts `members` once — that is correct and expected; what must not
+  // happen is a further N frames when the flip evicts all three guests.
+  const res = await fetch(`${BASE}/api/rooms/${room.code}/events`, {
+    headers: { cookie: ben.header() },
+  });
+  assert.equal(res.status, 200);
+  const member = { buf: '' };
+  {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    (async () => {
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          member.buf += decoder.decode(value, { stream: true });
+          if (member.buf.length > 200_000) member.buf = member.buf.slice(-100_000);
+        }
+      } catch { /* closed */ }
+    })();
+  }
+
+  const guests = [];
+  for (let i = 0; i < 3; i++) {
+    const { jar } = await guestJoin(room.code);
+    const gRes = await fetch(`${BASE}/api/public/rooms/${room.code}/events`, {
+      headers: { cookie: jar.header() },
+    });
+    assert.equal(gRes.status, 200);
+    const state = { buf: '' };
+    const reader = gRes.body.getReader();
+    const decoder = new TextDecoder();
+    (async () => {
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          state.buf += decoder.decode(value, { stream: true });
+        }
+      } catch { /* closed */ }
+    })();
+    guests.push(state);
+  }
+  // Let the connect-time presence frames land, then draw the line.
+  await new Promise((r) => setTimeout(r, 600));
+  member.buf = '';
+
+  const flipped = await req(`/api/rooms/${room.code}`, {
+    jar: ana, method: 'PATCH', body: { visibility: 'private' },
+  });
+  assert.equal(flipped.status, 200);
+
+  // Wait for the eviction to settle, then count roster broadcasts.
+  await new Promise((r) => setTimeout(r, 800));
+  const rosterFrames = (member.buf.match(/event: members/g) ?? []).length;
+  assert.equal(rosterFrames, 1, 'the eviction broadcasts the roster exactly once');
+  const presence = [...member.buf.matchAll(/event: members\ndata: (.+)\n/g)]
+    .map((m) => JSON.parse(m[1])).at(-1);
+  assert.ok(presence, 'the roster frame carries JSON');
+  assert.equal(presence.guests, 0, 'and reports the guests as gone');
+
+  // Every guest is told they were removed, and their streams close.
+  for (const g of guests) {
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline && !g.buf.includes('"removed":true')) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.ok(g.buf.includes('"removed":true'), 'each guest is told they were removed');
+  }
 });

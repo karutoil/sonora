@@ -91,9 +91,50 @@ export function createAudioSession({
     }
   }
 
+  /**
+   * The recovery from a platform interruption (a call, Siri, Maps taking the
+   * audio output) that *ends while the app is still in the background*.
+   *
+   * Returning to the page is not the only way an interruption ends: the call is
+   * hung up or the prompt finishes while the listener is still in the other app.
+   * Nothing the page can see fires then — no `visibilitychange`, no `playing`,
+   * no resume — so an interruption used to leave the player paused until the tab
+   * was opened again, and a paused background tab never auto-advances.
+   *
+   * `statechange` is the one event that reports it. The browser resumes audible
+   * media elements by itself on the way back to `active`, but this player's
+   * element is a looping one and its handoff is driven by events; asking it to
+   * resume explicitly is what makes the recovery independent of that.
+   *
+   * Returns whether the callback was wired; false on every browser without the
+   * API or without the event.
+   */
+  function onResume(fn) {
+    if (!session?.addEventListener || typeof fn !== 'function') return false;
+    let interrupted = false;
+    try {
+      interrupted = session.state === 'interrupted';
+      session.addEventListener('statechange', () => {
+        // Track the edge, not the level: `state` is already 'active' by the time
+        // this fires, so the only way to tell an interruption *ending* from any
+        // other transition ('inactive' while a track is between sources) is to
+        // remember that one had begun.
+        const now = session.state;
+        if (now === 'interrupted') { interrupted = true; return; }
+        if (!interrupted || now !== 'active') return;
+        interrupted = false;
+        fn();
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   return {
     claim,
     repair,
+    onResume,
     /** False on every browser that does not implement the Audio Session API. */
     get supported() { return Boolean(session); },
   };

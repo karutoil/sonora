@@ -2,6 +2,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { CHROME, freePort, launch } from './helpers/cdp.js';
 import { ROOT, VIEW, INIT_SCRIPT, startServer, withPage } from './helpers/ux.js';
 
@@ -83,15 +84,22 @@ function notifInit(config) {
     calls: { list: 0, read: [], readAll: 0, check: 0 },
     shown: [],
     permissionRequests: 0,
+    refreshes: 0,
     errors: [],
   };
   window.__notif = rec;
 
-  // The preferences the module reads, and a clean "never announced anything"
-  // bookmark, so the first poll always baselines.
+  // The preferences the module reads, and normally a clean "never announced
+  // anything" cursor, so the first poll baselines. The cursor is per account,
+  // so every key that starts with the prefix has to go. The retention test opts
+  // out to exercise real persistence across its document reloads.
   try {
     localStorage.setItem('sonora.prefs', JSON.stringify(config.prefs ?? {}));
-    localStorage.removeItem('sonora.notifSeen');
+    if (!config.preserveSeen) {
+      for (const key of Object.keys(localStorage)) {
+        if (key === 'sonora.notifSeen' || key.startsWith('sonora.notifSeen:')) localStorage.removeItem(key);
+      }
+    }
   } catch {}
 
   // The signed-out boot: the feed answers 401 (an expired or revoked session),
@@ -155,6 +163,7 @@ function notifInit(config) {
 
     if (p === '/api/notifications' && method === 'GET') {
       rec.calls.list += 1;
+      if (config.realFeed) return inner(input, init);
       if (rec.unauthorized) return json({ error: 'Sign in first.' }, 401);
       return json({ items: rec.items, unread: rec.unread });
     }
@@ -175,6 +184,15 @@ function notifInit(config) {
     if (p === '/api/notifications/check' && method === 'POST') {
       rec.calls.check += 1;
       return json({ created: 0, unread: rec.unread, throttled: true });
+    }
+    // The silent rotation the app (and now the bell) uses for an expired access
+    // cookie. With `refreshWorks` the fixture renews the session; otherwise it
+    // fails, which is what "really signed out" looks like.
+    if (p === '/api/auth/refresh' && method === 'POST') {
+      rec.refreshes += 1;
+      if (!config.refreshWorks) return json({ error: 'Not signed in.' }, 401);
+      rec.unauthorized = false;
+      return json({ ok: true });
     }
     if (p === '/api/follows' && method === 'GET') {
       return json({ items: config.follows ?? [] });
@@ -242,9 +260,16 @@ async function openPanel() {
 /** One poll, then let the (async) alert path settle. */
 const pollAndSettle = `(async () => {
   await window.__sonoraNotifications.refresh();
-  await new Promise((resolve) => setTimeout(resolve, 120));
+  await new Promise((resolve) => setTimeout(resolve, 250));
   return window.__notif.shown.length;
 })()`;
+
+/** The per-account bookmark the module is supposed to be using. */
+const seenKey = () => browser.eval(`(async () => {
+  const me = await fetch('/api/me').then((r) => (r.ok ? r.json() : null)).catch(() => null);
+  const id = me?.user?.id;
+  return id != null ? 'sonora.notifSeen:' + id : 'sonora.notifSeen';
+})()`);
 
 // ── the bell ──────────────────────────────────────────────────────────────
 
@@ -469,15 +494,28 @@ test('with desktop alerts off, a new row never reaches the OS', async (t) => {
       window.__notif.items = ${JSON.stringify([NEW_ITEM, ...ITEMS])};
       window.__notif.unread = 3;
       const shown = await (${pollAndSettle});
-      return { shown, polls: window.__notif.calls.list, seen: localStorage.getItem('sonora.notifSeen') };
+      const keys = Object.keys(localStorage).filter((k) => k.startsWith('sonora.notifSeen'));
+      return {
+        shown,
+        polls: window.__notif.calls.list,
+        keys,
+        seen: keys.length === 1 ? JSON.parse(localStorage.getItem(keys[0])) : null,
+      };
     })()`);
 
     assert.ok(result.polls >= 2, `the poll must have run again (polls=${result.polls})`);
     assert.equal(result.shown, 0,
       'a new row must not become an OS notification while the preference is off');
     // The bookmark still moves: turning alerts on later must not replay history.
-    assert.equal(result.seen, String(NEW_ITEM.id),
-      `the highest seen id must advance regardless of the preference, got ${JSON.stringify(result.seen)}`);
+    assert.equal(result.seen?.v, 2);
+    assert.equal(result.seen?.id, NEW_ITEM.id);
+    assert.equal(result.seen?.maxId, NEW_ITEM.id);
+    assert.equal(result.seen?.at, Date.parse(NEW_ITEM.createdAt),
+      `the event cursor must advance regardless of the preference, got ${JSON.stringify(result.seen)}`);
+    // NF-08: two accounts in one browser must not share a watermark.
+    const key = await seenKey();
+    assert.deepEqual(result.keys, [key],
+      `the watermark must live under the account's own key (${key}), got ${JSON.stringify(result.keys)}`);
   });
 });
 
@@ -511,6 +549,129 @@ test('with desktop alerts on, a new row alerts exactly once', async (t) => {
   });
 });
 
+test('a legacy id bookmark upgrades without replaying the existing feed', async (t) => {
+  await boot(t, { items: ITEMS, unread: 2, prefs: { desktopAlerts: true }, permission: 'granted' }, async () => {
+    const key = await seenKey();
+    await browser.waitFor(`localStorage.getItem(${JSON.stringify(key)}) !== null`, 6000);
+    const migrated = await browser.eval(`(async () => {
+      localStorage.setItem(${JSON.stringify(key)}, String(${ITEM_A.id}));
+      const shown = await (${pollAndSettle});
+      return {
+        shown,
+        cursor: JSON.parse(localStorage.getItem(${JSON.stringify(key)})),
+      };
+    })()`);
+    assert.equal(migrated.shown, 0, 'upgrading an existing numeric bookmark must not replay its feed');
+    assert.equal(migrated.cursor.v, 2);
+    assert.equal(migrated.cursor.id, ITEM_A.id);
+    assert.equal(migrated.cursor.maxId, ITEM_A.id);
+    assert.equal(migrated.cursor.at, Date.parse(ITEM_A.createdAt));
+
+    const next = await browser.eval(`(async () => {
+      window.__notif.items = ${JSON.stringify([NEW_ITEM, ...ITEMS])};
+      window.__notif.unread = 3;
+      return ${pollAndSettle};
+    })()`);
+    assert.equal(next, 1, 'the legacy id-only fresh-row behavior must survive the upgrade');
+  });
+});
+
+test('a fresh row still alerts after retention reuses SQLite ids and the page reloads', async (t) => {
+  if (!needBrowser(t)) return;
+
+  // Seed rows old enough for the real retention predicate to remove all of
+  // them. Without AUTOINCREMENT, the next insert into the empty table reuses an
+  // id at or below the browser's saved highest id.
+  let previousHighest;
+  const seeded = new DatabaseSync(path.join(server.dir, 'ux.db'));
+  try {
+    seeded.exec('PRAGMA busy_timeout = 5000');
+    const uid = seeded.prepare("SELECT id FROM users WHERE name = 'toil'").get().id;
+    const insert = seeded.prepare(`
+      INSERT INTO notifications
+        (user_id, kind, title, body, thumb, url, artist_id, artist_name, video_id, dedupe, created_at, read_at)
+      VALUES (?, 'release', ?, 'Retention fixture', NULL, '#/c/aMPRuxRetention', NULL, 'Fixture Artist', NULL, ?, ?, NULL)
+    `);
+    insert.run(uid, 'Pruned Album One', 'retention-fixture-1', iso(121 * 86_400_000));
+    const info = insert.run(uid, 'Pruned Album Two', 'retention-fixture-2', iso(122 * 86_400_000));
+    previousHighest = Number(info.lastInsertRowid);
+  } finally {
+    seeded.close();
+  }
+
+  // This test deliberately preserves the real localStorage cursor across its
+  // document loads; clear cursors left by earlier tests before installing the
+  // preserving init script.
+  await browser.eval(`(() => {
+    for (const key of Object.keys(localStorage)) {
+      if (key === 'sonora.notifSeen' || key.startsWith('sonora.notifSeen:')) localStorage.removeItem(key);
+    }
+  })()`);
+
+  await boot(t, {
+    realFeed: true,
+    preserveSeen: true,
+    prefs: { desktopAlerts: true },
+    permission: 'granted',
+  }, async () => {
+    const key = await seenKey();
+    await browser.waitFor(`window.__notif.calls.list > 0 && localStorage.getItem(${JSON.stringify(key)}) !== null`, 6000);
+    assert.equal(await browser.eval(pollAndSettle), 0, 'the first real feed is only a baseline');
+
+    // This is the db.js pruneNotifications predicate, run against the live test
+    // server's SQLite file rather than a mocked notification sequence.
+    const pruned = new DatabaseSync(path.join(server.dir, 'ux.db'));
+    let reusedId;
+    const createdAt = new Date().toISOString();
+    try {
+      pruned.exec('PRAGMA busy_timeout = 5000');
+      const uid = pruned.prepare("SELECT id FROM users WHERE name = 'toil'").get().id;
+      const readCutoff = new Date(Date.now() - 60 * 86_400_000).toISOString();
+      const unreadCutoff = new Date(Date.now() - 120 * 86_400_000).toISOString();
+      const removed = pruned.prepare(`
+        DELETE FROM notifications
+        WHERE created_at < ? AND (read_at IS NOT NULL OR created_at < ?)
+      `).run(readCutoff, unreadCutoff).changes;
+      assert.equal(removed, 2, 'the retention predicate really pruned the baseline rows');
+      const info = pruned.prepare(`
+        INSERT INTO notifications
+          (user_id, kind, title, body, thumb, url, artist_id, artist_name, video_id, dedupe, created_at, read_at)
+        VALUES (?, 'release', 'Fresh After Prune', 'A reused id is still a new event', NULL,
+          '#/c/aMPRuxFreshAfterPrune', NULL, 'Fixture Artist', NULL, 'retention-fresh', ?, NULL)
+      `).run(uid, createdAt);
+      reusedId = Number(info.lastInsertRowid);
+    } finally {
+      pruned.close();
+    }
+    assert.ok(reusedId <= previousHighest,
+      `SQLite must reproduce reuse (${reusedId} <= ${previousHighest})`);
+
+    // A real navigation destroys every JS variable in notifications.js. Only
+    // localStorage survives, exactly as in a PWA/browser restart.
+    await browser.goto(`${BASE}/?notifications-retention=${Date.now()}`);
+    await browser.waitFor(`window.__notif.calls.list > 0 && !!window.__sonoraNotifications`, 6000);
+    await browser.waitFor(`window.__notif.shown.length === 1`, 4000);
+    const alerted = await browser.eval(`({
+      calls: window.__notif.shown.slice(),
+      seen: localStorage.getItem(${JSON.stringify(key)}),
+    })`);
+    assert.equal(alerted.calls[0].title, 'Fresh After Prune');
+    assert.equal(alerted.calls[0].via, 'serviceWorker');
+    const cursor = JSON.parse(alerted.seen);
+    assert.equal(cursor.v, 2);
+    assert.equal(cursor.at, Date.parse(createdAt));
+    assert.equal(cursor.id, reusedId);
+    assert.equal(cursor.maxId, previousHighest,
+      'the legacy numeric floor must not regress when SQLite reuses a lower id');
+
+    // Reloading the same real feed must not announce the reused id again.
+    await browser.goto(`${BASE}/?notifications-retention-repeat=${Date.now()}`);
+    await browser.waitFor(`window.__notif.calls.list > 0 && !!window.__sonoraNotifications`, 6000);
+    assert.equal(await browser.eval(pollAndSettle), 0,
+      'the same createdAt+id event must stay suppressed after another reload');
+  });
+});
+
 test('permission is only requested from the settings event, never on boot', async (t) => {
   await boot(t, { items: ITEMS, unread: 2, prefs: { desktopAlerts: false }, permission: 'default' }, async () => {
     await browser.waitFor(`!document.querySelector('.notification-dot').hidden`, 6000);
@@ -534,6 +695,38 @@ test('permission is only requested from the settings event, never on boot', asyn
   });
 });
 
+test('enabling alerts from the panel shows up in the settings sheet', async (t) => {
+  // notifications.js owns the "Enable alerts" gesture and writes its preference
+  // straight to localStorage, announcing it with `sonora:pref-change`. app.js
+  // reads `state.prefs` to paint the settings sheet — without mirroring the
+  // event, the sheet renders a stale, unchecked toggle after the user just
+  // turned it on from the bell.
+  await boot(t, { items: ITEMS, unread: 2, prefs: { desktopAlerts: false }, permission: 'default' }, async () => {
+    await browser.waitFor(`!document.querySelector('.notification-dot').hidden`, 6000);
+
+    // The gesture is the panel's own button, not the settings toggle.
+    await openPanel();
+    await browser.eval(`document.querySelector('#notif-panel [data-notif="enable-alerts"]').click()`);
+    await browser.waitFor(`window.__notif.permissionRequests > 0`, 4000);
+    // Close the panel so the settings sheet is the top layer.
+    await browser.eval(`document.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'Escape', bubbles: true, cancelable: true }))`);
+    await browser.waitFor(PANEL_CLOSED, 4000);
+
+    // Open the real settings sheet the way a listener does.
+    await browser.eval(`document.querySelector('[data-action="settings"]').click()`);
+    await browser.waitFor(`!!document.querySelector('#form-content [data-pref="desktopAlerts"]')`, 4000);
+
+    const sheet = await browser.eval(`(() => ({
+      checked: document.querySelector('#form-content [data-pref="desktopAlerts"]').checked,
+      stored: JSON.parse(localStorage.getItem('sonora.prefs') || '{}').desktopAlerts,
+    }))()`);
+    assert.equal(sheet.checked, true,
+      'the settings sheet must reflect the value the bell panel just wrote');
+    assert.equal(sheet.stored, true, 'the panel wrote localStorage; nothing here should rewrite it');
+  });
+});
+
 test('a denied permission is explained in the panel instead of failing silently', async (t) => {
   await boot(t, { items: ITEMS, unread: 2, prefs: { desktopAlerts: true }, permission: 'denied' }, async () => {
     await browser.waitFor(`!document.querySelector('.notification-dot').hidden`, 6000);
@@ -546,18 +739,23 @@ test('a denied permission is explained in the panel instead of failing silently'
   });
 });
 
-test('a 401 stops the polling quietly, and the tab picks the feed up again', async (t) => {
-  await boot(t, { items: ITEMS, unread: 2, unauthorized: true }, async () => {
+test('a 401 rotates the session once, then stops quietly', async (t) => {
+  // The refresh fixture fails here, which is what a really-signed-out tab looks
+  // like. One list request and one rotation attempt — no retry loop.
+  await boot(t, { items: ITEMS, unread: 2, unauthorized: true, refreshWorks: false }, async () => {
     await browser.waitFor(`window.__notif.calls.list > 0`, 6000);
     // Give the module a beat: a 401 must not be retried in a loop.
     await browser.eval(`new Promise((r) => setTimeout(r, 500))`);
 
     const before = await browser.eval(`({
       polls: window.__notif.calls.list,
+      refreshes: window.__notif.refreshes,
       dotHidden: document.querySelector('.notification-dot').hidden,
       badgeHidden: document.querySelector('.notif-badge').hidden,
       errors: window.__notif.errors.slice(),
     })`);
+    assert.equal(before.refreshes, 1,
+      `an expired session must be given exactly one silent rotation (${before.refreshes})`);
     assert.equal(before.polls, 1,
       `an unauthenticated feed must be asked for once, not retried (${before.polls} requests)`);
     assert.equal(before.dotHidden, true, 'a tab that cannot read the feed must not claim unread rows');
@@ -579,6 +777,164 @@ test('a 401 stops the polling quietly, and the tab picks the feed up again', asy
     assert.ok(after.polls > before.polls, 'returning to the tab must re-poll');
     assert.equal(after.badge, '2', 'and it must show what it found');
     assert.match(after.label ?? '', /2 unread/);
+  });
+});
+
+test('an expired access cookie is renewed instead of losing the feed', async (t) => {
+  // NF-07: the bell latched "signed out" on the first 401 and stopped its own
+  // timer, so an overnight tab showed nothing until it was hidden and shown
+  // again. The app's own rule is one silent refresh, then a retry.
+  await boot(t, { items: ITEMS, unread: 2, unauthorized: true, refreshWorks: true }, async () => {
+    await browser.waitFor(`!document.querySelector('.notification-dot').hidden`, 8000);
+
+    const after = await browser.eval(`({
+      refreshes: window.__notif.refreshes,
+      polls: window.__notif.calls.list,
+      badge: document.querySelector('.notif-badge').textContent.trim(),
+      rows: document.querySelectorAll('#notif-panel .notif-item').length,
+      errors: window.__notif.errors.slice(),
+    })`);
+    assert.equal(after.refreshes, 1, 'exactly one silent rotation, shared with the app');
+    assert.ok(after.polls >= 2, `the feed must be re-requested after the rotation (${after.polls})`);
+    assert.equal(after.badge, '2', `the bell must show what it found, got ${JSON.stringify(after.badge)}`);
+    assert.deepEqual(after.errors, [], `the recovery must stay quiet:\n${after.errors.join('\n')}`);
+  });
+});
+
+// ── a feed that is not quite the shape the client expects ────────────────
+
+test('a malformed feed row cannot break the panel', async (t) => {
+  // A release with no title, a video without a thumb, an older server's row, a
+  // literal null in the array: all of it used to be a render-time throw (or an
+  // "[object Object]" title).
+  const junk = [
+    null,
+    'not a row',
+    42,
+    { id: null, title: 'No id' },
+    { id: 'not-a-number', title: { object: true }, body: 7, thumb: { bad: true }, createdAt: 'yesterday' },
+    ITEM_A,
+  ];
+  await boot(t, { items: junk, unread: 4 }, async () => {
+    await browser.waitFor(`window.__notif.calls.list > 0`, 6000);
+    await openPanel();
+    await browser.eval(`new Promise((r) => setTimeout(r, 120))`);
+
+    const panel = await browser.eval(`(() => {
+      const rows = [...document.querySelectorAll('#notif-panel .notif-item')];
+      return {
+        rows: rows.length,
+        text: rows.map((r) => r.innerText.replace(/\\s+/g, ' ').trim()),
+        errors: window.__notif.errors.slice(),
+      };
+    })()`);
+    assert.ok(panel.rows >= 1, 'the readable row must still render');
+    assert.ok(panel.text.some((t) => /Fixture Album One/.test(t)),
+      `the good row must be intact, got ${JSON.stringify(panel.text)}`);
+    assert.ok(!panel.text.some((t) => /\[object Object\]/.test(t)),
+      `a malformed title must never be stringified into the row: ${JSON.stringify(panel.text)}`);
+    assert.deepEqual(panel.errors, [], `a junk row must not log an error:\n${panel.errors.join('\n')}`);
+  });
+});
+
+// ── two tabs, one feed ───────────────────────────────────────────────────
+
+test('reading a row in another tab updates the dot and the rows here', async (t) => {
+  // NF-10: read state is server-side but each tab renders its own copy until
+  // its next poll. A BroadcastChannel message from the tab that did the reading
+  // has to reconcile this one immediately.
+  await boot(t, { items: ITEMS, unread: 2 }, async () => {
+    await browser.waitFor(`!document.querySelector('.notification-dot').hidden`, 6000);
+    await openPanel();
+
+    // A second tab read one row. Every cross-tab message is stamped with the
+    // account it belongs to (two people can be signed in on one origin), so a
+    // realistic peer message has to carry that id — an unstamped one is ignored
+    // on purpose, which is the cross-account fix.
+    await browser.eval(`(async () => {
+      const me = await fetch('/api/me').then((r) => (r.ok ? r.json() : null)).catch(() => null);
+      const c = new BroadcastChannel('sonora-notifications');
+      c.postMessage({
+        type: 'read',
+        account: String(me?.user?.id ?? ''),
+        ids: [${ITEM_A.id}],
+        unread: 1,
+      });
+      // The channel must stay open long enough for the peer to receive the
+      // message; closing in the same task drops it.
+      await new Promise((r) => setTimeout(r, 400));
+      c.close();
+    })()`);
+    await browser.waitFor(`document.querySelectorAll('#notif-panel .notif-item.is-unread').length === 1`, 4000);
+
+    const after = await browser.eval(`({
+      badge: document.querySelector('.notif-badge').textContent.trim(),
+      unreadRows: document.querySelectorAll('#notif-panel .notif-item.is-unread').length,
+      errors: window.__notif.errors.slice(),
+    })`);
+    assert.equal(after.badge, '1', 'the badge must follow the other tab');
+    assert.equal(after.unreadRows, 1, 'the row the peer read must lose its accent');
+    assert.deepEqual(after.errors, []);
+
+    // …and a second tab\'s "Mark all read" clears the rest here too.
+    await browser.eval(`(async () => {
+      const me = await fetch('/api/me').then((r) => (r.ok ? r.json() : null)).catch(() => null);
+      const c = new BroadcastChannel('sonora-notifications');
+      c.postMessage({ type: 'read-all', account: String(me?.user?.id ?? ''), unread: 0 });
+      await new Promise((r) => setTimeout(r, 400));
+      c.close();
+    })()`);
+    await browser.waitFor(`document.querySelector('.notification-dot').hidden`, 4000);
+    const second = await browser.eval(`({
+      badgeHidden: document.querySelector('.notif-badge').hidden,
+      unreadRows: document.querySelectorAll('#notif-panel .notif-item.is-unread').length,
+    })`);
+    assert.equal(second.badgeHidden, true, 'no unread rows, no badge');
+    assert.equal(second.unreadRows, 0);
+  });
+});
+
+test('the desktop popover lets Tab leave, and the phone sheet traps it', async (t) => {
+  // WCAG 2.1.2. The popover is `aria-modal="false"`, so wrapping Tab around its
+  // controls was a keyboard trap: a keyboard-only user who did not guess Escape
+  // could not reach the page behind it. Only the sheet — which really is modal,
+  // covers the page and has a backdrop — keeps the loop.
+  //
+  // Alerts on + granted permission keeps the "Enable alerts" row out of the
+  // head, so the focus stops are exactly the three controls plus one per row.
+  await boot(t, { items: ITEMS, unread: 2, viewport: VIEW.desktop, prefs: { desktopAlerts: true }, permission: 'granted' }, async () => {
+    await browser.waitFor(`!document.querySelector('.notification-dot').hidden`, 6000);
+    await openPanel();
+
+    const result = await browser.eval(`(() => {
+      const p = document.getElementById('notif-panel');
+      const list = [...p.querySelectorAll('a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])')]
+        .filter((el) => el.tabIndex >= 0 && el.getClientRects().length > 0);
+      list.at(-1).focus();
+      const forward = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true });
+      document.dispatchEvent(forward);
+      const wrappedForward = document.activeElement === list[0];
+      const preventedForward = forward.defaultPrevented;
+      list[0].focus();
+      const back = new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true, cancelable: true });
+      document.dispatchEvent(back);
+      return {
+        wrappedForward,
+        preventedForward,
+        preventedBack: back.defaultPrevented,
+        modal: p.getAttribute('aria-modal'),
+        stops: list.length,
+      };
+    })()`);
+    assert.equal(result.modal, 'false', 'the popover stays non-modal for assistive tech');
+    // A non-modal panel must not claim the Tab key: preventing the default is
+    // what makes it a trap.
+    assert.equal(result.preventedForward, false, `Tab must not be swallowed on desktop (${JSON.stringify(result)})`);
+    assert.equal(result.preventedBack, false, 'Shift+Tab must not be swallowed on desktop');
+    assert.equal(result.wrappedForward, false, 'Tab from the last control must be free to leave the popover');
+    // Three head controls plus one per row: the SVG <use> sprite must not be a
+    // focus stop.
+    assert.equal(result.stops, 3 + ITEMS.length, `focus stops: ${result.stops}`);
   });
 });
 
@@ -644,7 +1000,12 @@ test('the shell precaches the notification module and is versioned past v6', () 
       `PRECACHE lists ${url}, which does not exist — the install would fail`);
   }
   const version = SW.match(/const VERSION = '([^']+)';/)?.[1];
-  assert.equal(version, 'v7', `the shell list changed, so VERSION must move to v7 (got ${version})`);
+  // The exact number is not the point (it moves whenever the shell changes);
+  // what matters is that the list above is newer than the v6 shell that did not
+  // precache the notification module.
+  const major = Number(/^v(\d+)$/.exec(version ?? '')?.[1] ?? 0);
+  assert.ok(major >= 9,
+    `the shell list changed, so VERSION must be at least v9 (got ${JSON.stringify(version)})`);
 });
 
 test('index.html loads the notification module and its stylesheet', () => {

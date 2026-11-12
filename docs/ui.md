@@ -103,8 +103,9 @@ and both are answered from the Music catalogue, never guessed:
 
 - **An artist is a page** (`#/artist/…`, `artistView()` in `app.js`). It is
   reached from the artist chips above search results, the library's Artists tab,
-  the `Go to artist` row-menu item, and the Artist line of the now-playing
-  About tab. It shows the same shelves YouTube Music does — popular songs,
+  the `Go to artist` row-menu item, the artist name under the title in the player
+  bar and the now-playing rail, the byline on the sheet's front side, and the
+  Artist line of the now-playing About tab. It shows the same shelves YouTube Music does — popular songs,
   Albums, Singles & EPs, Videos, and "Fans also like" — with Play / Shuffle /
   Station actions. `:id` may be a channel id (`UC…`) or a plain name; the server
   resolves a name through the ranked artist search, so a library entry that only
@@ -422,7 +423,10 @@ the server is the source of truth.
   persistence, mobile hero layout, offline boot, share links.
 - `test/pwa.test.js` — manifest/icons, service worker strategies, offline
   navigation, install/update chrome (phone card, desktop notice, iOS sheet).
-- `test/lockscreen.test.js` — Media Session behaviour that must not regress.
+- `test/lockscreen.test.js` — Media Session behaviour that must not regress:
+  artwork, the seek bar, the loop wrap, and a locked phone keeping previous/next
+  instead of ±seek (`test/media-session.test.js` covers the same keep-alive in
+  isolation, and its node half runs without a browser).
 - `test/auth.test.js` — login, remember-me, refresh rotation and replay,
   per-device revocation, passkey challenge single-use.
 - `test/passkey.test.js` — a real passkey round trip in Chromium's virtual

@@ -1,13 +1,14 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { freePort } from './helpers/cdp.js';
 import { readFileSync } from 'node:fs';
 
 // Boots the real server and exercises the library/playlist/artwork surface.
 // Live YouTube is only touched for search, lyrics and artwork.
 
-const PORT = 8142;
-const BASE = `http://127.0.0.1:${PORT}`;
+let PORT = 0;
+let BASE = '';
 const DB = new URL(`./.tmp/lib-${Date.now()}.db`, import.meta.url).pathname;
 const AUDIO = new URL(`./.tmp/libaudio-${Date.now()}`, import.meta.url).pathname;
 
@@ -30,6 +31,8 @@ const jfetch = async (path, opts = {}) => {
 };
 
 before(async () => {
+  PORT = await freePort();
+  BASE = `http://127.0.0.1:${PORT}`;
   proc = spawn(process.execPath, ['--no-warnings', 'src/server.js'], {
     cwd: new URL('..', import.meta.url).pathname,
     env: {
@@ -559,4 +562,57 @@ test('the design shell is served with the mock\'s own markup', async () => {
   assert.match(css, /--accent:#ff997b/, 'accent token preserved');
   assert.match(css, /grid-template-columns:235px/, 'desktop grid preserved');
   assert.match(css, /max-width:650px/, 'mobile breakpoint preserved');
+});
+
+test('likes and dislikes clamp the source string they persist', async () => {
+  // `source` is the one plays column a request could fatten: every sibling
+  // clamps to 40 chars, and the body limit would let a 10 KB string through
+  // into a row written on every like. No API echoes the column back, so this
+  // asserts on the database the run owns.
+  const { DatabaseSync } = await import('node:sqlite');
+  const big = 'x'.repeat(10_240);
+  const like = await jfetch('/api/likes', {
+    method: 'POST',
+    body: JSON.stringify({ videoId: '2tOutF8B3f8', like: true, source: big }),
+  });
+  assert.equal(like.res.status, 200);
+  // The like is read before the dislike, because a dislike is exclusive with a
+  // like and therefore withdraws it — including the `kind='like'` evidence row
+  // the taste model counts (see toggleLike in src/db.js). Reading "the last two
+  // rows" afterwards would now see the dislike and an older dislike from a
+  // previous test, not the two signals this test is about.
+  //
+  // WAL means the reader may trail the writer by nothing here (the request
+  // above is already acknowledged), but the connection must be read-only
+  // against the same file the server writes, not a copy.
+  const db = new DatabaseSync(`${DB}`, { readOnly: true });
+  const playRow = (kind) => db.prepare(
+    `SELECT kind, source FROM plays
+     WHERE kind = ? AND user_id = (SELECT id FROM users WHERE name = 'toil')
+     ORDER BY rowid DESC LIMIT 1`,
+  ).get(kind);
+  try {
+    const likeRow = playRow('like');
+    assert.equal(likeRow?.kind, 'like', 'the like was recorded as a play event');
+    assert.ok(likeRow.source.length <= 40, `stored like source is clamped (got ${likeRow.source.length})`);
+
+    const dislike = await jfetch('/api/dislikes', {
+      method: 'POST',
+      body: JSON.stringify({ videoId: '2tOutF8B3f8', dislike: true, source: big }),
+    });
+    assert.equal(dislike.res.status, 200);
+
+    const dislikeRow = playRow('dislike');
+    assert.equal(dislikeRow?.kind, 'dislike', 'the dislike was recorded as a play event');
+    assert.ok(dislikeRow.source.length <= 40, `stored dislike source is clamped (got ${dislikeRow.source.length})`);
+    assert.equal(playRow('like'), undefined, 'the dislike withdrew the like and its evidence row');
+  } finally {
+    db.close();
+  }
+
+  // Undo the dislike so later tests keep their preconditions (a disliked
+  // track is filtered from radio).
+  await jfetch('/api/dislikes', {
+    method: 'POST', body: JSON.stringify({ videoId: '2tOutF8B3f8', dislike: false }),
+  });
 });

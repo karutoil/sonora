@@ -58,11 +58,16 @@ after(() => {
   try { fs.rmSync(TMP, { recursive: true, force: true }); } catch {}
 });
 
-// The devices that matter: two notched iPhones, one classic, one Android.
+// The devices that matter: two notched iPhones, two classics, two small
+// Androids. 320x568 is the screen that made the sign-in bug (and the
+// now-playing transport overflow) reproducible.
 const DEVICES = [
   { name: 'iPhone 15 Pro', width: 393, height: 852, top: 59, bottom: 34 },
   { name: 'iPhone 15 Pro Max', width: 430, height: 932, top: 59, bottom: 34 },
   { name: 'iPhone SE', width: 375, height: 667, top: 20, bottom: 0 },
+  { name: 'iPhone SE (1st gen)', width: 320, height: 568, top: 20, bottom: 0 },
+  { name: 'small Android', width: 320, height: 568, top: 0, bottom: 0 },
+  { name: 'Android 360x640', width: 360, height: 640, top: 0, bottom: 0 },
 ];
 
 // ── static contract ───────────────────────────────────────────────────────
@@ -100,6 +105,40 @@ test('focusing a field cannot leave the window scrolled (iOS keyboard shift)', (
   assert.match(JS, /function pinWindowScroll\(\)/, 'missing the window-scroll pin');
   assert.match(JS, /addEventListener\('focusin'/, 'must react to a field gaining focus');
   assert.match(JS, /addEventListener\('focusout'/, 'must react to the keyboard closing');
+});
+
+test('the sign-in screen clears the status bar and shows the submit button', async (t) => {
+  if (!browser) return t.skip('no chromium available; set CHROME_BIN to enable');
+  // viewport-fit=cover means the auth overlay owns the notch strip too. On a
+  // short phone the form used to start under the status bar, and the submit
+  // button used to end below the screen with nothing able to scroll to it.
+  for (const d of DEVICES) {
+    await browser.eval(`fetch('/api/auth/logout',{method:'POST'}).catch(()=>{})`).catch(() => {});
+    await browser.iphone(d);
+    await browser.goto(`${BASE}/`);
+    await browser.waitFor(`!document.getElementById('auth-overlay').hidden`, 20_000);
+    await browser.waitFor(`innerWidth === ${d.width} && innerHeight === ${d.height}`, 10_000);
+    await new Promise((r) => setTimeout(r, 150));
+
+    const m = await browser.eval(`(() => {
+      const R = (sel) => { const el = document.querySelector(sel); if (!el) return null;
+        const r = el.getBoundingClientRect(); return { top: r.top, bottom: r.bottom, left: r.left, right: r.right }; };
+      const overlay = document.getElementById('auth-overlay');
+      return {
+        vh: innerHeight, vw: innerWidth,
+        name: R('#auth-name'), submit: R('#auth-submit'),
+        overflowY: getComputedStyle(overlay).overflowY,
+      };
+    })()`);
+
+    assert.ok(m.name.top >= d.top - 0.5,
+      `${d.name}: the first field starts at ${m.name.top}px, under the ${d.top}px inset`);
+    assert.ok(m.submit.bottom <= m.vh + 0.5,
+      `${d.name}: #auth-submit ends at ${m.submit.bottom}px, below the ${m.vh}px viewport`);
+    assert.ok(m.submit.left >= 0 && m.submit.right <= m.vw + 0.5,
+      `${d.name}: #auth-submit is outside the viewport horizontally`);
+    assert.equal(m.overflowY, 'auto', `${d.name}: the auth overlay cannot scroll`);
+  }
 });
 
 for (const d of DEVICES) {

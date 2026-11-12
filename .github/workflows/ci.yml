@@ -20,11 +20,106 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  # Fast, fully offline tests. The rest of the suite talks to YouTube and drives
-  # a browser, which is why it is not part of CI (see README → Testing).
+  # Enforcing tests that must stay offline. The rest of the suite talks to YouTube
+  # or drives a browser: the browser-only part runs in the `browser` job, and the
+  # live-network part runs nowhere but on a developer's machine (see README →
+  # Testing).
+  #
+  # Use temp databases, loopback servers and yt-dlp fixtures: accidental external
+  # traffic is a test-fixture bug, not a reason to make release tests depend on
+  # YouTube. library/search-types hit live YouTube and stay developer-run;
+  # library-integrity, station-routes and the mocked follows layer are their
+  # deterministic counterparts. SONORA_FOLLOWS_OFFLINE=1 keeps the latter's live
+  # HTTP cases out of this job without dropping all of follows.test.js.
+  # share/notifications/passkey and the other browser-driven suites live in
+  # the `browser` job because they need Chromium; lockscreen and latency need the
+  # live network *as well* as a browser, so they are in neither job.
+  #
+  # proxy.test.js belongs here and was missing: it is the *only* automated
+  # coverage of the /api/stream Range contract (window clamping, `bytes=-0`,
+  # inverted ranges, the 416-with-content-range reply) — the seek path that has
+  # silently broken twice — and it is offline by construction: a synthetic 3 MiB
+  # file in the cache dir, no yt-dlp, no bot gate, no network.
   unit:
     name: Unit tests (offline)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      # Parse everything that ships, before anything else runs: a stray brace or a
+      # half-finished edit fails here in a second, naming the file and the line,
+      # instead of at runtime on a code path no test in this list reaches. Zero
+      # dependencies on purpose — scripts/check-syntax.js explains why this is
+      # `node --check` and not ESLint.
+      - name: Static check (parse src/, public/, scripts/)
+        run: npm run lint
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run offline tests
+        env:
+          SONORA_FOLLOWS_OFFLINE: '1'
+        run: |
+          node --no-warnings --test --test-concurrency=1 \
+            test/config.test.js \
+            test/db.test.js \
+            test/search-rank.test.js \
+            test/auth.test.js \
+            test/cookies.test.js \
+            test/admin.test.js \
+            test/rooms.test.js \
+            test/rooms-idle.test.js \
+            test/migration.test.js \
+            test/station.test.js \
+            test/audio.test.js \
+            test/ratelimit.test.js \
+            test/playback.test.js \
+            test/media-session.test.js \
+            test/container.test.js \
+            test/proxy.test.js \
+            test/youtube.test.js \
+            test/lifecycle.test.js \
+            test/follows.test.js \
+            test/harness.test.js \
+            test/library-integrity.test.js \
+            test/station-routes.test.js
+
+  # The suites that drive a real Chromium over CDP, which is most of the biggest
+  # test files: passkeys (virtual authenticator), the UX/layout/safe-area sweeps,
+  # the PWA service-worker lifecycle, rooms in two tabs, the queue and the player
+  # handoffs. They are fixture-driven — they boot the server against a temp DB and
+  # keep yt-dlp out of the path — so they need a browser and nothing else. None of
+  # them could run in CI before, which is how that much of the codebase ended up
+  # executing only on a developer's laptop.
+  #
+  # Left out because they need the live internet, which would make this job flaky
+  # rather than informative: e2e, library, follows, search-types and
+  # station-endless (live YouTube metadata), latency (the real artwork CDN) and
+  # lockscreen (drives a live search, then decodes real audio).
+  #
+  # media-session.test.js runs in *both* jobs: its node half pins the module's
+  # contract offline, and its browser half pins the default visibility/clock
+  # bindings the locked-iPhone keep-alive depends on — which cannot be injected
+  # away without also failing to test them.
+  #
+  # Serial: every file launches its own browser, and running several at once on a
+  # two-core runner has them fight over CPU and /tmp profiles (test/helpers/cdp.js
+  # spawns each browser detached with its own profile dir).
+  #
+  # This job is enforcing, not advisory: publish depends on it below. The
+  # "Verify Chromium" step also makes a missing browser a failure rather than an
+  # all-skipped green run.
+  browser:
+    name: Browser tests (Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -36,16 +131,70 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run offline tests
-        run: node --no-warnings --test --test-concurrency=1 test/db.test.js test/search-rank.test.js
+      # Ubuntu's own `chromium` package is a snap shim that never starts inside a
+      # CI container, so install Google's build. test/helpers/cdp.js reads
+      # CHROME_BIN first and otherwise probes PATH for chromium /
+      # chromium-browser / google-chrome / google-chrome-stable; setting it
+      # explicitly turns a bad install into a loud failure instead of a silent
+      # skip in every suite.
+      - name: Install Chromium
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends wget ca-certificates fonts-liberation
+          wget -q -O /tmp/chrome.deb \
+            https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get install -y --no-install-recommends /tmp/chrome.deb
+          echo "CHROME_BIN=/usr/bin/google-chrome-stable" >> "$GITHUB_ENV"
 
-  # Build the production image on every PR and publish it to GHCR on main/tags.
-  image:
-    name: Build container image
+      # The suites skip cleanly when they cannot find a browser (that is right for
+      # a laptop). In CI it would mean a green job that tested nothing, so prove
+      # the browser both exists and can render a document first.
+      - name: Verify Chromium
+        run: |
+          set -euo pipefail
+          test -x "$CHROME_BIN" || { echo "::error::CHROME_BIN=$CHROME_BIN is not executable"; exit 1; }
+          "$CHROME_BIN" --version
+          "$CHROME_BIN" --headless=new --no-sandbox --disable-gpu --dump-dom about:blank > /dev/null
+          # And the seam the suites actually use: cdp.js prefers CHROME_BIN and
+          # falls back to probing PATH. If the wiring is wrong, this fails here
+          # instead of leaving every browser test to skip "cleanly".
+          node --input-type=module -e "
+            import { CHROME } from './test/helpers/cdp.js';
+            if (!CHROME) { console.error('::error::test/helpers/cdp.js found no Chromium'); process.exit(1); }
+            console.log('cdp.js will launch:', CHROME);"
+
+      - name: Run browser tests
+        run: |
+          node --no-warnings --test --test-concurrency=1 \
+            test/cdp.test.js \
+            test/passkey.test.js \
+            test/ux.test.js \
+            test/layout.test.js \
+            test/safe-area.test.js \
+            test/ios-chin.test.js \
+            test/flows.test.js \
+            test/listen-page.test.js \
+            test/listen-venue.test.js \
+            test/player-artist.test.js \
+            test/track-handoff.test.js \
+            test/audio-session.test.js \
+            test/media-session.test.js \
+            test/queue.test.js \
+            test/search-ui.test.js \
+            test/share.test.js \
+            test/notifications.test.js \
+            test/pwa.test.js \
+            test/rooms-browser.test.js
+
+  # Build and smoke-test without registry credentials on every event, including
+  # pull requests. Publication is a separate, explicitly gated job below.
+  build:
+    name: Build and smoke-test container image
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
-      packages: write
     steps:
       - uses: actions/checkout@v4
 
@@ -54,14 +203,6 @@ jobs:
       # GHCR rejects uppercase repository names; normalise once, use everywhere.
       - name: Compute lowercase image name
         run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
-
-      - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Image metadata
         id: meta
@@ -76,21 +217,48 @@ jobs:
             type=sha,format=short
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push
+      - name: Build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Containerfile
-          push: ${{ github.event_name != 'pull_request' }}
-          # Load locally as well, so the smoke test below always has an image.
+          push: false
+          # Load locally so the smoke tests below exercise this exact image.
           load: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # The image must not run as root: ./data is a host-visible bind mount and
+      # yt-dlp/ffmpeg parse remote data, so a root process there leaves root-owned
+      # files the dev server cannot write to. A grep of the Containerfile cannot
+      # prove the USER line took effect in the built layer — `id -u` can.
+      - name: Assert the image runs unprivileged
+        run: |
+          set -euo pipefail
+          IMAGE="$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | head -n1)"
+
+          uid="$(docker run --rm --entrypoint id "$IMAGE" -u)"
+          echo "container uid: $uid"
+          if [ "$uid" = "0" ]; then
+            echo "::error::the image runs as root — the data dir it writes is root-owned on the host"
+            exit 1
+          fi
+
+          # The directory the app writes at runtime has to belong to that same
+          # uid, or a fresh volume without a bind mount is unwritable.
+          owner="$(docker run --rm --entrypoint stat "$IMAGE" -c '%u' /app/data)"
+          echo "/app/data owned by uid $owner"
+          if [ "$owner" != "$uid" ]; then
+            echo "::error::/app/data (uid $owner) is not owned by the runtime user (uid $uid)"
+            exit 1
+          fi
+
       # Proves the image actually boots, not just that it built: the entrypoint
-      # accepts the secret, the server binds, and /api/health returns ok.
+      # accepts the secret, the server binds, and /api/health returns ok — which
+      # now means the process can read its database, see a way to sign in and write
+      # its audio directory, not merely that Fastify answered.
       - name: Smoke test the image
         run: |
           set -euo pipefail
@@ -101,6 +269,11 @@ jobs:
           trap cleanup EXIT
 
           docker run -d --name sonora-smoke \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges \
+            --pids-limit=256 \
+            -e HOST=0.0.0.0 \
+            -e PORT=8130 \
             -e SONORA_SECRET="$(openssl rand -hex 32)" \
             -e SONORA_USER=ci \
             -e SONORA_PASSPHRASE=ci-passphrase \
@@ -126,3 +299,54 @@ jobs:
           node -e "const b=require('/tmp/health.json'); if(b.ok!==true) process.exit(1)"
           docker exec sonora-smoke node scripts/healthcheck.js
           echo "Smoke test passed."
+
+  # Only main/tag/manual runs reach publication, and only after both enforcing
+  # test jobs plus the image smoke test pass. Pull requests never get
+  # packages:write. Rebuilding here is normally cache-only and avoids passing a
+  # mutable multi-hundred-MB image artifact through a privileged job.
+  publish:
+    name: Publish container image to GHCR
+    if: github.event_name != 'pull_request'
+    needs: [unit, browser, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Compute lowercase image name
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Publish
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Containerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,7 +1,12 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
+import net from 'node:net';
+import { freePort } from './helpers/cdp.js';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 // Authentication is the one surface where a regression is not cosmetic: a
 // replayable refresh token or a device that cannot be revoked is a real
@@ -12,9 +17,9 @@ import fs from 'node:fs';
 // server derives a WebAuthn-capable RP ID (an IP can never be one). That is the
 // same override a tunnel deployment uses via SONORA_RP_ID/SONORA_ORIGIN.
 
-const PORT = 8147;
-const BASE = `http://127.0.0.1:${PORT}`;
-const HOST_HEADERS = { 'x-forwarded-host': `localhost:${PORT}`, 'x-forwarded-proto': 'http' };
+let PORT = 0;
+let BASE = '';
+let HOST_HEADERS = null;
 const DB = new URL(`./.tmp/auth-${Date.now()}.db`, import.meta.url).pathname;
 const AUDIO = new URL(`./.tmp/authaudio-${Date.now()}`, import.meta.url).pathname;
 
@@ -62,7 +67,19 @@ const login = (jar, body) => req('/api/auth/login', {
   jar, method: 'POST', body: { name: 'toil', passphrase: 'hunter2hunter2', ...body },
 });
 
+function storedChallenge(id) {
+  const database = new DatabaseSync(DB, { readOnly: true });
+  try {
+    return database.prepare('SELECT id, kind FROM webauthn_challenges WHERE id = ?').get(id);
+  } finally {
+    database.close();
+  }
+}
+
 before(async () => {
+  PORT = await freePort();
+  BASE = `http://127.0.0.1:${PORT}`;
+  HOST_HEADERS = { 'x-forwarded-host': `localhost:${PORT}`, 'x-forwarded-proto': 'http' };
   fs.mkdirSync(new URL('./.tmp', import.meta.url).pathname, { recursive: true });
   proc = spawn(process.execPath, ['--no-warnings', 'src/server.js'], {
     cwd: new URL('..', import.meta.url).pathname,
@@ -71,6 +88,14 @@ before(async () => {
       SONORA_DB: DB, SONORA_AUDIO_DIR: AUDIO,
       SONORA_SECRET: 'auth-test-secret', SONORA_PASSPHRASE: 'hunter2hunter2',
       SONORA_SESSION_MINUTES: '60', SONORA_REFRESH_DAYS: '14',
+      // This file simulates a tunnel: x-forwarded-host names the public host a
+      // passkey has to be scoped to, and forwarded headers are only honoured
+      // when the proxy is trusted (the default is now off — see config.js).
+      SONORA_TRUST_PROXY: '1',
+      // Strict rotation for the replay tests here: the grace window (which the
+      // browser needs when two tabs share a refresh token) is covered on its own
+      // server in this file.
+      SONORA_REFRESH_GRACE_MS: '0',
       // This file signs in far more often than a person does, and the limiter is
       // keyed by IP, so a realistic limit would make the suite fail on itself.
       SONORA_LOGIN_RATE_MAX: '1000',
@@ -228,6 +253,89 @@ test('a remembered device can be forgotten without signing out', async () => {
   assert.equal((await req('/api/auth/refresh', { jar, method: 'POST', body: {} })).status, 401);
 });
 
+test('signing in again without remember clears the old persistent credential', async () => {
+  const jar = new Jar();
+  const remembered = await login(jar, {
+    remember: true, deviceId: 'remember-transition', deviceName: 'Remember transition',
+  });
+  assert.equal(remembered.status, 200);
+  const oldRefresh = jar.get('sonora_refresh');
+  assert.ok(oldRefresh);
+
+  const forgotten = await login(jar, {
+    remember: false, deviceId: 'remember-transition', deviceName: 'Remember transition',
+  });
+  assert.equal(forgotten.status, 200);
+  assert.equal(forgotten.body.remembered, false);
+  assert.equal(jar.has('sonora_refresh'), false, 'the browser deleted the old refresh cookie');
+  const removal = forgotten.res.headers.getSetCookie()
+    .find((cookie) => cookie.startsWith('sonora_refresh='));
+  assert.ok(removal, 'the forgetting response explicitly clears the refresh cookie');
+  assert.match(removal, /max-age=0/i);
+  const access = forgotten.res.headers.getSetCookie()
+    .find((cookie) => cookie.startsWith('sonora_session='));
+  assert.ok(access);
+  assert.doesNotMatch(access, /max-age=/i, 'the replacement access cookie is session-scoped');
+
+  const liveSession = jar.get('sonora_session');
+  jar.set('sonora_refresh', oldRefresh);
+  assert.equal((await req('/api/auth/refresh', { jar, method: 'POST', body: {} })).status, 401);
+  assert.equal((await req('/api/me', {
+    headers: { cookie: `sonora_session=${liveSession}` },
+  })).status, 200, 'the old revoked token cannot delete the replacement session');
+});
+
+test('a revoked token that was never rotated cannot delete its current device', async () => {
+  const jar = new Jar();
+  await login(jar, { remember: true, deviceId: 'revoked-not-rotated', deviceName: 'Revoked only' });
+  const revokedToken = jar.get('sonora_refresh');
+  const before = await req('/api/me', { jar });
+  const deviceId = before.body.user.deviceId;
+
+  // Forgetting through the security screen revokes the token without giving it
+  // a replaced_by successor. That is an ordinary revocation, not evidence that a
+  // rotated credential was stolen.
+  const forgotten = await req(`/api/auth/devices/${encodeURIComponent(deviceId)}`, {
+    jar, method: 'PATCH', body: { remembered: false },
+  });
+  assert.equal(forgotten.status, 200);
+  const currentSession = jar.get('sonora_session');
+  assert.ok(currentSession);
+
+  jar.set('sonora_refresh', revokedToken);
+  const replay = await req('/api/auth/refresh', { jar, method: 'POST', body: {} });
+  assert.equal(replay.status, 401);
+  const me = await req('/api/me', { headers: { cookie: `sonora_session=${currentSession}` } });
+  assert.equal(me.status, 200, 'the current access session survives an old revoked token');
+  assert.equal(me.body.user.deviceId, deviceId);
+  assert.equal(me.body.user.remembered, false);
+});
+
+test('one device cannot make another device remembered with an undeliverable token', async () => {
+  const controller = new Jar();
+  const other = new Jar();
+  await login(controller, { remember: false, deviceId: 'remember-controller', deviceName: 'Controller' });
+  await login(other, { remember: false, deviceId: 'remember-target', deviceName: 'Remote target' });
+
+  const listed = await req('/api/auth/security', { jar: controller });
+  const target = listed.body.devices.find((device) => device.name === 'Remote target');
+  assert.ok(target);
+  assert.equal(target.remembered, false);
+  assert.equal(target.activeRefreshTokens, 0);
+
+  const changed = await req(`/api/auth/devices/${encodeURIComponent(target.id)}`, {
+    jar: controller, method: 'PATCH', body: { remembered: true },
+  });
+  assert.equal(changed.status, 409, 'the browser must enable this on the device receiving its cookie');
+  assert.equal(changed.res.headers.getSetCookie().some((cookie) => cookie.startsWith('sonora_refresh=')), false);
+
+  const otherSecurity = await req('/api/auth/security', { jar: other });
+  const unchanged = otherSecurity.body.devices.find((device) => device.current);
+  assert.equal(unchanged.id, target.id);
+  assert.equal(unchanged.remembered, false, 'a rejected change does not mark the remote device remembered');
+  assert.equal(unchanged.activeRefreshTokens, 0, 'a rejected change creates no orphan refresh token');
+});
+
 test('sign out other devices keeps this one and kills the rest', async () => {
   const a = new Jar();
   await login(a, { remember: true, deviceId: 'keep-a', deviceName: 'Keep' });
@@ -281,7 +389,11 @@ test('passkey registration issues a single-use challenge', async () => {
   assert.equal(options.body.options.rp.id, 'localhost');
   assert.equal(typeof options.body.options.challenge, 'string');
   assert.ok(options.body.options.user.id);
-  assert.ok(jar.has('sonora_webauthn'), 'ceremony is bound to a cookie');
+  assert.ok(jar.has('sonora_webauthn_register'), 'ceremony is bound to its own cookie');
+  // Registration and login no longer share one cookie: a login ceremony
+  // started while a registration was open used to overwrite the challenge and
+  // fail the registration with "that passkey request expired".
+  assert.equal(jar.has('sonora_webauthn_login'), false);
 
   const bad = await req('/api/auth/passkey/register/verify', {
     jar, method: 'POST', body: { challengeId: options.body.challengeId, response: { id: 'x' } },
@@ -320,9 +432,446 @@ test('an unknown credential is rejected without a challenge', async () => {
   assert.equal(verify.status, 401);
 });
 
+test('a newer registration ceremony deletes the previous same-kind challenge row', async () => {
+  const jar = new Jar();
+  await login(jar, { remember: false, deviceId: 'latest-register', deviceName: 'Latest registration' });
+  const first = await req('/api/auth/passkey/register/options', { jar, method: 'POST', body: {} });
+  const second = await req('/api/auth/passkey/register/options', { jar, method: 'POST', body: {} });
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.notEqual(first.body.challengeId, second.body.challengeId);
+  assert.equal(jar.get('sonora_webauthn_register'), second.body.challengeId);
+  assert.equal(storedChallenge(first.body.challengeId), undefined,
+    'the superseded ceremony is deleted instead of lingering until its TTL');
+  assert.equal(storedChallenge(second.body.challengeId)?.kind, 'register');
+});
+
+test('a stale registration verify cannot clear or consume the latest ceremony', async () => {
+  const jar = new Jar();
+  await login(jar, { remember: false, deviceId: 'stale-register', deviceName: 'Stale registration' });
+  const first = await req('/api/auth/passkey/register/options', { jar, method: 'POST', body: {} });
+  const latest = await req('/api/auth/passkey/register/options', { jar, method: 'POST', body: {} });
+  const latestCookie = jar.get('sonora_webauthn_register');
+
+  const stale = await req('/api/auth/passkey/register/verify', {
+    jar, method: 'POST', body: { challengeId: first.body.challengeId, response: { id: 'stale' } },
+  });
+  assert.equal(stale.status, 400);
+  assert.equal(jar.get('sonora_webauthn_register'), latestCookie,
+    'a stale response must leave the newer browser ceremony alone');
+  assert.equal(storedChallenge(latest.body.challengeId)?.kind, 'register');
+
+  // The latest ceremony remains usable and single-use. Invalid WebAuthn data is
+  // enough to prove that its own matching request consumes only its own row.
+  const failedLatest = await req('/api/auth/passkey/register/verify', {
+    jar, method: 'POST', body: { challengeId: latest.body.challengeId, response: { id: 'invalid' } },
+  });
+  assert.equal(failedLatest.status, 400);
+  assert.equal(jar.has('sonora_webauthn_register'), false);
+  assert.equal(storedChallenge(latest.body.challengeId), undefined);
+});
+
+test('passkey login is latest-only and a stale login cannot clear its successor', async () => {
+  const jar = new Jar();
+  const first = await req('/api/auth/passkey/login/options', { jar, method: 'POST', body: {} });
+  const latest = await req('/api/auth/passkey/login/options', { jar, method: 'POST', body: {} });
+  assert.equal(first.status, 200);
+  assert.equal(latest.status, 200);
+  assert.equal(jar.get('sonora_webauthn_login'), latest.body.challengeId);
+  assert.equal(storedChallenge(first.body.challengeId), undefined,
+    'starting again removes the superseded login challenge row');
+
+  const stale = await req('/api/auth/passkey/login/verify', {
+    jar, method: 'POST',
+    body: { challengeId: first.body.challengeId, response: { id: 'stale', response: {} } },
+  });
+  assert.equal(stale.status, 400);
+  assert.equal(jar.get('sonora_webauthn_login'), latest.body.challengeId,
+    'the stale login did not clear the latest cookie');
+  assert.equal(storedChallenge(latest.body.challengeId)?.kind, 'authenticate');
+
+  const latestResult = await req('/api/auth/passkey/login/verify', {
+    jar, method: 'POST',
+    body: { challengeId: latest.body.challengeId, response: { id: 'not-registered', response: {} } },
+  });
+  assert.equal(latestResult.status, 401, 'the latest challenge still reaches credential verification');
+  assert.equal(jar.has('sonora_webauthn_login'), false, 'only the consumed latest cookie is cleared');
+  assert.equal(storedChallenge(latest.body.challengeId), undefined);
+});
+
+test('a failed login ceremony leaves a parallel registration untouched', async () => {
+  const jar = new Jar();
+  await login(jar, { remember: false, deviceId: 'parallel-ceremonies', deviceName: 'Parallel ceremonies' });
+  const registration = await req('/api/auth/passkey/register/options', { jar, method: 'POST', body: {} });
+  const authentication = await req('/api/auth/passkey/login/options', { jar, method: 'POST', body: {} });
+  assert.equal(registration.status, 200);
+  assert.equal(authentication.status, 200);
+  const registrationCookie = jar.get('sonora_webauthn_register');
+  assert.ok(registrationCookie);
+  assert.ok(jar.has('sonora_webauthn_login'));
+
+  const failedLogin = await req('/api/auth/passkey/login/verify', {
+    jar, method: 'POST',
+    body: { challengeId: authentication.body.challengeId, response: { id: 'not-registered', response: {} } },
+  });
+  assert.equal(failedLogin.status, 401);
+  assert.equal(jar.has('sonora_webauthn_login'), false);
+  assert.equal(jar.get('sonora_webauthn_register'), registrationCookie);
+  assert.equal(storedChallenge(registration.body.challengeId)?.kind, 'register');
+
+  const failedRegistration = await req('/api/auth/passkey/register/verify', {
+    jar, method: 'POST',
+    body: { challengeId: registration.body.challengeId, response: { id: 'invalid' } },
+  });
+  assert.equal(failedRegistration.status, 400);
+  assert.equal(jar.has('sonora_webauthn_register'), false);
+  assert.equal(storedChallenge(registration.body.challengeId), undefined);
+});
+
 test('the security surface requires a session', async () => {
   assert.equal((await req('/api/auth/security')).status, 401);
   assert.equal((await req('/api/auth/devices/revoke-others', { method: 'POST', body: {} })).status, 401);
   assert.equal((await req('/api/auth/signout-all', { method: 'POST', body: {} })).status, 401);
   assert.equal((await req('/api/auth/passkey/register/options', { method: 'POST', body: {} })).status, 401);
+});
+
+// ── configuration that has to be a property of the *request* ────────────
+// The three defects below all shared one shape: a setting was decided from the
+// deployment (is a secret configured? is the env var present?) instead of from
+// the request, so the copy-the-template path and the LAN path were broken in
+// ways no unit test could see. Each fixture boots its own server because the
+// env is the subject of the test.
+
+/** A throwaway server on a free port with its own database and audio dir. */
+async function bootFixture(env = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sonora-auth-'));
+  const port = await freePort();
+  const base = `http://127.0.0.1:${port}`;
+  const child = spawn(process.execPath, ['--no-warnings', 'src/server.js'], {
+    cwd: new URL('..', import.meta.url).pathname,
+    env: {
+      ...process.env,
+      PORT: String(port), HOST: '127.0.0.1',
+      SONORA_DB: path.join(dir, 'fixture.db'),
+      SONORA_AUDIO_DIR: path.join(dir, 'audio'),
+      SONORA_SECRET: 'auth-fixture-secret',
+      SONORA_PASSPHRASE: 'hunter2hunter2', SONORA_LOGIN_RATE_MAX: '1000',
+      SONORA_LOG_LEVEL: 'warn', SONORA_POT_PROVIDER: '', SONORA_JS_RUNTIME: '',
+      ...env,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const logs = [];
+  child.stdout.on('data', (d) => logs.push(String(d)));
+  child.stderr.on('data', (d) => logs.push(String(d)));
+  const stop = () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+    try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
+  };
+  for (let i = 0; i < 160; i++) {
+    try {
+      const r = await fetch(`${base}/api/health`);
+      const health = r.ok ? await r.json() : null;
+      if (health?.pid === child.pid) return { child, base, port, logs, stop };
+    } catch {}
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  stop();
+  throw new Error(`fixture server did not start:\n${logs.join('')}`);
+}
+
+/** One POST/GET against a fixture, with its own cookie jar. */
+function fixtureReq(fixture, routePath, { jar = null, body, method = 'GET', headers = {} } = {}) {
+  return fetch(fixture.base + routePath, {
+    method,
+    headers: {
+      ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+      ...(jar ? { cookie: jar.header() } : {}),
+      ...headers,
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  }).then(async (res) => {
+    if (jar) jar.absorb(res);
+    const isJson = res.headers.get('content-type')?.includes('json');
+    return { res, status: res.status, body: isJson ? await res.json() : null };
+  });
+}
+
+/** Send an HTTP request target that fetch() cannot represent (absolute form). */
+function rawLogin(port, target) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ name: 'request-target-missing', passphrase: 'wrong passphrase' });
+    const socket = net.createConnection({ host: '127.0.0.1', port });
+    const chunks = [];
+    socket.setTimeout(5000, () => socket.destroy(new Error(`timed out waiting for ${target}`)));
+    socket.on('connect', () => {
+      socket.end(
+        `POST ${target} HTTP/1.1\r\n`
+        + `Host: localhost:${port}\r\n`
+        + 'Content-Type: application/json\r\n'
+        + `Content-Length: ${Buffer.byteLength(body)}\r\n`
+        + 'Connection: close\r\n\r\n'
+        + body,
+      );
+    });
+    socket.on('data', (chunk) => chunks.push(chunk));
+    socket.on('error', reject);
+    socket.on('close', () => {
+      const raw = Buffer.concat(chunks).toString('latin1');
+      const [head] = raw.split('\r\n\r\n');
+      const [statusLine, ...lines] = head.split('\r\n');
+      const status = Number(statusLine?.split(' ')[1]);
+      const headers = {};
+      for (const line of lines) {
+        const colon = line.indexOf(':');
+        if (colon > 0) headers[line.slice(0, colon).toLowerCase()] = line.slice(colon + 1).trim();
+      }
+      if (!status) reject(new Error(`invalid raw response for ${target}: ${raw}`));
+      else resolve({ status, headers });
+    });
+  });
+}
+
+test('encoded and absolute-form API targets receive the same no-store protection', async () => {
+  const targets = [
+    '/api/auth/login?target=origin',
+    '/%61pi/auth/login?target=encoded',
+    `http://localhost:${PORT}/api/auth/login?target=absolute`,
+    `http://localhost:${PORT}/%61pi/auth/login?target=absolute-encoded`,
+  ];
+  for (const target of targets) {
+    const response = await rawLogin(PORT, target);
+    assert.equal(response.status, 401, target);
+    assert.equal(response.headers['cache-control'], 'no-store', target);
+  }
+  // Fastify rejects an invalid escape through onBadUrl before response hooks;
+  // unlike the valid variants above there is no protected response to cache.
+  const malformed = await rawLogin(PORT, '/%ZZ/api/auth/login?target=malformed');
+  assert.equal(malformed.status, 400);
+});
+
+test('encoded and absolute-form API targets share the canonical login limiter', async () => {
+  const variants = [
+    (port) => '/api/auth/login?limit=origin',
+    (port) => '/%61pi/auth/login?limit=encoded',
+    (port) => `http://localhost:${port}/api/auth/login?limit=absolute`,
+  ];
+  for (const targetFor of variants) {
+    const fixture = await bootFixture({ SONORA_LOGIN_RATE_MAX: '2' });
+    try {
+      const target = targetFor(fixture.port);
+      const responses = [];
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        responses.push(await rawLogin(fixture.port, target));
+      }
+      assert.deepEqual(responses.map((response) => response.status), [401, 401, 429], target);
+      for (const response of responses) {
+        assert.equal(response.headers['cache-control'], 'no-store', target);
+      }
+    } finally {
+      fixture.stop();
+    }
+  }
+});
+
+test('case-variant account names have independent failure lockouts', async () => {
+  const fixture = await bootFixture();
+  try {
+    const admin = new Jar();
+    const signedIn = await fixtureReq(fixture, '/api/auth/login', {
+      jar: admin, method: 'POST',
+      body: { name: 'toil', passphrase: 'hunter2hunter2', deviceId: 'case-admin' },
+    });
+    assert.equal(signedIn.status, 200);
+    const created = await fixtureReq(fixture, '/api/admin/users', {
+      jar: admin, method: 'POST',
+      body: { name: 'TOIL', passphrase: 'correct-horse-passphrase', role: 'user' },
+    });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const wrong = await fixtureReq(fixture, '/api/auth/login', {
+        method: 'POST', body: { name: 'toil', passphrase: 'wrong passphrase' },
+      });
+      assert.equal(wrong.status, 401);
+    }
+    const locked = await fixtureReq(fixture, '/api/auth/login', {
+      method: 'POST', body: { name: 'toil', passphrase: 'hunter2hunter2' },
+    });
+    assert.equal(locked.status, 429);
+    assert.ok(Number(locked.res.headers.get('retry-after')) > 0);
+
+    const variant = new Jar();
+    const otherAccount = await fixtureReq(fixture, '/api/auth/login', {
+      jar: variant, method: 'POST',
+      body: { name: 'TOIL', passphrase: 'correct-horse-passphrase', deviceId: 'case-variant' },
+    });
+    assert.equal(otherAccount.status, 200, 'the distinct SQLite account must not inherit toil’s lock');
+    assert.equal(otherAccount.body.user.name, 'TOIL');
+    assert.equal((await fixtureReq(fixture, '/api/me', { jar: variant })).status, 200);
+
+    const stillLocked = await fixtureReq(fixture, '/api/auth/login', {
+      method: 'POST', body: { name: 'toil', passphrase: 'hunter2hunter2' },
+    });
+    assert.equal(stillLocked.status, 429, 'the variant’s success must not clear toil’s failure history');
+  } finally {
+    fixture.stop();
+  }
+});
+
+test('a replay inside the rotation grace window rotates instead of killing the device', async () => {
+  // Two tabs (or one refresh response lost in flight) both present the same
+  // refresh token. Treating the second as theft deleted the device and signed
+  // the whole browser out; inside the window it must rotate forward instead.
+  const fixture = await bootFixture();
+  try {
+    const jar = new Jar();
+    const loginRes = await fixtureReq(fixture, '/api/auth/login', {
+      method: 'POST', jar,
+      body: { name: 'toil', passphrase: 'hunter2hunter2', remember: true, deviceId: 'two-tabs', deviceName: 'Two tabs' },
+    });
+    assert.equal(loginRes.status, 200);
+    const first = jar.get('sonora_refresh');
+    assert.ok(first, 'the remembered device got a refresh token');
+
+    // Tab A refreshes: the token rotates.
+    jar.cookies.delete('sonora_session');
+    const tabA = await fixtureReq(fixture, '/api/auth/refresh', { method: 'POST', jar, body: {} });
+    assert.equal(tabA.status, 200);
+    const second = jar.get('sonora_refresh');
+    assert.ok(second && second !== first, 'the token rotated');
+    const sessionA = jar.get('sonora_session');
+
+    // Tab B still holds the *old* token and presents it.
+    const tabB = await fixtureReq(fixture, '/api/auth/refresh', {
+      method: 'POST', body: {}, headers: { cookie: `sonora_refresh=${first}` },
+    });
+    assert.equal(tabB.status, 200, 'a just-rotated token is a second tab, not a thief');
+    const rotatedForB = tabB.res.headers.getSetCookie().find((c) => c.startsWith('sonora_refresh='));
+    assert.ok(rotatedForB, 'tab B is handed a fresh token');
+
+    // Nobody was signed out: tab A's access cookie still works and the device
+    // still exists (a revoked device kills every token it issued).
+    assert.equal((await fixtureReq(fixture, '/api/me', { headers: { cookie: `sonora_session=${sessionA}` } })).status, 200);
+    const security = await fixtureReq(fixture, '/api/auth/security', { headers: { cookie: `sonora_session=${sessionA}` } });
+    assert.equal(security.status, 200);
+    assert.equal(security.body.devices.length, 1, 'the device survived the replay');
+    assert.equal(security.body.devices[0].remembered, true);
+
+    // A third presentation follows the chain again, so a tab that retries late
+    // is not punished either.
+    const tabC = await fixtureReq(fixture, '/api/auth/refresh', {
+      method: 'POST', body: {}, headers: { cookie: `sonora_refresh=${first}` },
+    });
+    assert.equal(tabC.status, 200, 'the rotation chain is followed, not just one hop');
+  } finally {
+    fixture.stop();
+  }
+});
+
+test('a blank RP ID/origin is treated as unset, and zeroed lifetimes are clamped', async () => {
+  // `cp .env.example .env` shipped SONORA_RP_ID= and SONORA_ORIGIN= (present but
+  // empty). `??` kept the empty string, passkeySupport() saw rpID '', and every
+  // passkey ceremony answered 400 "needs a real domain" — on a real HTTPS domain.
+  // SONORA_SESSION_MINUTES=0 / SONORA_REFRESH_DAYS=0 used to mint a session with
+  // maxAge 0 (login 200, instantly signed out).
+  const fixture = await bootFixture({
+    SONORA_RP_ID: '', SONORA_ORIGIN: '',
+    SONORA_SESSION_MINUTES: '0', SONORA_REFRESH_DAYS: '0',
+    SONORA_TRUST_PROXY: '1',
+  });
+  try {
+    const caps = await fixtureReq(fixture, '/api/auth/capabilities', {
+      headers: { 'x-forwarded-host': `localhost:${fixture.port}`, 'x-forwarded-proto': 'https' },
+    });
+    assert.equal(caps.status, 200);
+    assert.equal(caps.body.passkeys.supported, true, 'blank is unset: passkeys keep working');
+    assert.equal(caps.body.passkeys.rpID, 'localhost', 'the request host fills the gap');
+    assert.equal(caps.body.passkeys.origin, `https://localhost:${fixture.port}`);
+    assert.ok(caps.body.sessionMinutes >= 1, `sessionMinutes must be clamped, got ${caps.body.sessionMinutes}`);
+    assert.ok(caps.body.refreshDays >= 1, `refreshDays must be clamped, got ${caps.body.refreshDays}`);
+
+    // And the boot log names the blank values instead of leaving them to be
+    // discovered from a misleading passkey message.
+    const log = fixture.logs.join('');
+    assert.match(log, /SONORA_RP_ID is set but blank/);
+    assert.match(log, /SONORA_ORIGIN is set but blank/);
+
+    // A clamped session really is usable: login then /api/me in the same jar.
+    const jar = new Jar();
+    const login = await fixtureReq(fixture, '/api/auth/login', {
+      method: 'POST', jar,
+      headers: { 'x-forwarded-host': `localhost:${fixture.port}`, 'x-forwarded-proto': 'https' },
+      body: { name: 'toil', passphrase: 'hunter2hunter2', remember: true, deviceId: 'clamp-browser' },
+    });
+    assert.equal(login.status, 200);
+    assert.equal((await fixtureReq(fixture, '/api/me', { jar })).status, 200);
+  } finally {
+    fixture.stop();
+  }
+});
+
+test('a Secure cookie is decided per request, so LAN sign-in over plain HTTP works', async () => {
+  // `secure: !config.isDev` meant "a secret is configured", never "this request
+  // is HTTPS". A container on a LAN serves http://192.168.x.x with a secret set,
+  // so every session cookie was Secure and Chrome dropped it: login 200, then
+  // /api/me 401, and the form silently reset.
+  const fixture = await bootFixture({ SONORA_TRUST_PROXY: '1' });
+  try {
+    const lan = { 'x-forwarded-host': `192.168.1.50:${fixture.port}`, 'x-forwarded-proto': 'http' };
+    const caps = await fixtureReq(fixture, '/api/auth/capabilities', { headers: lan });
+    assert.equal(caps.body.cookies.secure, false, 'plain HTTP on a LAN is not a secure context');
+
+    const login = await fetch(`${fixture.base}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...lan },
+      body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+    });
+    assert.equal(login.status, 200);
+    const session = login.headers.getSetCookie().find((c) => c.startsWith('sonora_session='));
+    assert.ok(session, 'a session cookie was set');
+    assert.doesNotMatch(session, /;\s*secure/i,
+      'a Secure cookie over plain HTTP is discarded by the browser — the login would do nothing');
+
+    // Over the tunnel it still is Secure: this is not "never".
+    const httpsCaps = await fixtureReq(fixture, '/api/auth/capabilities', {
+      headers: { 'x-forwarded-host': `music.example.com`, 'x-forwarded-proto': 'https' },
+    });
+    assert.equal(httpsCaps.body.cookies.secure, true);
+  } finally {
+    fixture.stop();
+  }
+});
+
+test('a blank account name with a passphrase refuses to boot', async () => {
+  // An empty name cannot be typed, so the instance would come up with an
+  // unreachable admin account and no error anywhere.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sonora-blankuser-'));
+  const port = await freePort();
+  const child = spawn(process.execPath, ['--no-warnings', 'src/server.js'], {
+    cwd: new URL('..', import.meta.url).pathname,
+    env: {
+      ...process.env,
+      PORT: String(port), HOST: '127.0.0.1',
+      SONORA_DB: path.join(dir, 'blank.db'), SONORA_AUDIO_DIR: path.join(dir, 'audio'),
+      SONORA_SECRET: 'blank-user-secret', SONORA_USER: '', SONORA_PASSPHRASE: 'hunter2hunter2',
+      SONORA_LOG_LEVEL: 'warn', SONORA_POT_PROVIDER: '', SONORA_JS_RUNTIME: '',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const logs = [];
+  child.stdout.on('data', (d) => logs.push(String(d)));
+  child.stderr.on('data', (d) => logs.push(String(d)));
+  try {
+    const code = await new Promise((resolve) => {
+      child.on('exit', (exitCode) => resolve(exitCode));
+      setTimeout(() => { child.kill('SIGKILL'); resolve('timeout'); }, 15_000);
+    });
+    assert.notEqual(code, 'timeout', 'the server must exit instead of serving an unreachable account');
+    assert.notEqual(code, 0, 'a blank bootstrap account is a fatal misconfiguration');
+    assert.match(logs.join(''), /SONORA_USER/);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
+  }
 });

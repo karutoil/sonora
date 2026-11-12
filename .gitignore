@@ -10,7 +10,7 @@ cookies.txt
 *.pem
 *.key
 
-# ─── Runtime state (SQLite database + audio cache) ──────────────────────────
+# ─── Runtime state (SQLite database + audio cache) ─────────────────────────
 data/
 *.db
 *.db-shm
@@ -19,8 +19,24 @@ data/
 # ─── Test and scratch output ────────────────────────────────────────────────
 test/.tmp/
 .tmp/
+.tmp*
 coverage/
 *.log
+npm-debug.log*
+storage-cache/
+sentry/queue/
+artifact-sessions/
+
+# ─── Audit and investigation notes (local working documents) ───────────────
+.audit/
+
+# ─── Coding-agent state (never part of the project) ────────────────────────
+.karucode/
+.rpi/
+.serena/
+.codex-*
+statsig-state.json*
+ChatGPT/
 
 # ─── Editors and OS noise ───────────────────────────────────────────────────
 .DS_Store
@@ -29,3 +45,6 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+*.bak
+*.orig
+*.rej

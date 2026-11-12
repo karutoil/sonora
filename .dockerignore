@@ -1,11 +1,51 @@
+# The image only ever COPYs package.json, src/, public/ and two runtime scripts
+# (see the Containerfile), so everything else is dead weight in the build context.
 node_modules/
 data/
 test/
 .tmp/
-.env
-*.log
-.DS_Store
+.tmp*
+
+# Builds and dependency tooling are recreated inside the image.
 .git/
 .github/
+
+# Secret material, including nested files. The explicit COPY allowlist in the
+# Containerfile is a second boundary, not a reason to send secrets to a builder.
+**/.env
+**/.env.*
+**/.netrc
+**/.npmrc
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/cookies.txt
+**/*-cookies.txt
+**/*.cookies
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/id_rsa*
+**/id_ed25519*
+
+# Never shipped: docs, design records, audit notes.
 docs/
+.audit/
 *.md
+
+# Local coding-agent state and stray editor/OS noise.
+.karucode/
+.rpi/
+.serena/
+ChatGPT/
+sentry/
+storage-cache/
+artifact-sessions/
+.codex-*
+statsig-state.json*
+*.log
+*.bak
+*.orig
+*.rej
+.DS_Store

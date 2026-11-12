@@ -43,7 +43,7 @@ device out on each restart and lose the AES key for the stored YouTube jar).
 Note `??` in `config.js` does not catch an empty string, so the check is in the
 entrypoint, not there.
 
-## The three findings that shaped this
+## The findings that shaped this
 
 ### 1. googlevideo is IP-bound (why there must be a proxy)
 
@@ -84,15 +84,29 @@ track. Pausing and seeking do *not* close it.
 
 Implemented in `public/app.js` and `public/playback.js`:
 - `audio.loop = true` always — the element never emits `ended`.
-- Detect the loop wrap (a non-manual jump from >3 s to <1.5 s), pause, switch source,
-  and start the next track **inside the event** (background timers are delayed).
+- Detect the loop wrap (a non-manual jump from >3 s to <1.5 s), replace the source and
+  start the next track **inside the event** (background timers are delayed).
+- **While the page is hidden, the handoff does not pause the old source.** A pause is
+  exactly where iOS reclaims the audio session, and it does not hand it back until the
+  listener returns to the app: the replacement is accepted, `audio.paused` goes false,
+  the metadata updates, and then the Now Playing widget empties out and nothing is
+  audible. A manual "next" in the background never pauses and is known-good on the
+  device, so the auto-advance now makes the same `playing → src → play` transition
+  instead of routing through a pause the manual path never takes. With the page visible
+  the pause is kept (it costs nothing there and is the ordering the loop workaround was
+  developed against), and the queued pause is marked as a source switch so it is never
+  mistaken for a listener pausing playback.
 - The wrap is detected on `seeking` **and** `timeupdate`. WebKit on a locked iPhone can
   loop without emitting `seeking`; `timeupdate` is then the only witness, and without it
   the same song repeats forever. Both events call one idempotent `endTrack()` so a single
   wrap can never skip two tracks.
-- `navigator.audioSession.type = 'playback'` is claimed on every play intent (feature
-  detected). Without the long-form category WebKit drops the audio session after a couple
-  of silent seconds — exactly the buffering gap between two tracks.
+- `navigator.audioSession.type = 'playback'` is claimed on every visible play intent. A source swap
+  while the page is hidden **forces the full repair sequence before the new `src` is assigned**.
+  Without the long-form category WebKit drops the audio session after a couple of silent seconds —
+  exactly the buffering gap between two tracks. A hidden handoff is the moment the web process's
+  category cache and the GPU session are most likely to disagree, so `playIndex()` cannot trust
+  `claim()` there; visible swaps keep the cheap claim because visibility/page lifecycle events have
+  already repaired the category.
 - Media Session handlers are re-registered on **every** `playing` event, and
   `seekbackward`/`seekforward` are explicitly set to `null` — otherwise iOS ignores
   them and substitutes ±10 s buttons.
@@ -136,6 +150,19 @@ rather than showing a play button over silence. The one pause a person *can* mak
 locked is the lock screen's own pause button: that handler marks the pause as
 deliberate (`state.userPause`), so an interruption is undone and a decision is not.
 
+**Update — the interruption rarely ends while we are looking (2026-11-02).** Coming
+back to the page was the only recovery, and it is the wrong moment: the call is hung up
+or the directions prompt finishes while the listener is *still in the other app*, which
+fires no `visibilitychange`, no `pageshow` and no `playing`. The player stayed paused
+until the app was opened — and a paused background tab never auto-advances, so the
+queue stopped at the end of the current track and the OS's Now Playing widget emptied
+out. `navigator.audioSession` reports exactly this edge, so `public/audio-session.js`
+now exposes `onResume()`: it watches for `interrupted → active` (the edge, not the
+level, so an idle session waking up between two sources is not mistaken for a resume)
+and the player calls the same `resumeIfInterrupted()` it already used on
+`visibilitychange`. The same update removed the pause from the *hidden* track handoff,
+which was the other half of the same failure — see finding #3 above.
+
 Tested in `test/audio-session.test.js`: the module's contract in plain node (one
 assignment for a claim, the ambient→playback cycle for a repair, the rate limit, a
 page that freezes before the deferred step, no API, a throwing setter), the wiring in
@@ -148,15 +175,17 @@ ambient category and this is the bug.
 
 ### 4. The lock screen silently drops artwork and the seek bar
 
-Three separate rules, each of which fails with no error in the page, the console or
-the network log — the controls still appear, only the cover and the scrubber are
-missing. Isolated in `public/media-session.js` so they can be tested without a phone:
+Four separate rules, each of which fails with no error in the page, the console or
+the network log — the controls still appear, only the cover, the scrubber or the
+*buttons* are wrong. Isolated in `public/media-session.js` so they can be tested
+without a phone:
 
 | Rule | Why |
 |---|---|
 | Artwork must be **absolute and same-origin** | WebKit renders nothing for a cross-origin `i.ytimg.com` URL, and ignores relative srcs. Art goes through `/api/img/<id>` like every `<img>` in the UI. |
 | `sizes` must match the **real bitmap** | iOS discards artwork whose declared size is a lie. `/api/img/<id>` is `hqdefault.jpg` → `480x360`. |
 | `setPositionState()` is **required** for a scrubber | Without it the lock screen shows title/artist/art only. It throws `RangeError` when `position > duration`, so position is clamped. And a scrubber is dead without a `seekto` handler. |
+| The handlers must be **re-registered while hidden** | Registering them once at boot is not enough; see below. |
 
 Position state is refreshed from `timeupdate` (throttled to ~1 Hz — every call crosses
 into the media process), plus `loadedmetadata`, `durationchange`, `seeked` and `pause`.
@@ -168,10 +197,59 @@ A `seekto` to 0 looks exactly like the loop wrap from finding #3, so the seek se
 the wrap test (never a timer — background timers are delayed), and `timeupdate` clears
 it as a safety net. A stale flag would stop the queue advancing forever.
 
-Verified in a real browser (`test/lockscreen.test.js`): the artwork URL is same-origin
-and its declared size equals the loaded bitmap, the seek bar tracks the audio, a
-lock-screen seek to 0 moves the playhead without skipping the track, and the
-seek-to-zero wrap still advances the queue afterwards.
+**Update — the media centre shows ±seek buttons instead of previous/next (2026-11-07).**
+Reported from a real iPhone: lock the phone mid-song and the Now Playing widget swaps
+the track arrows for two ±15 s skip buttons. Nothing in the page changes and nothing
+throws. Read out of WebKit's own source (`RemoteCommandListenerCocoa.mm`):
+
+```cpp
+auto currentCommands = !supportedCommands().isEmpty() ? supportedCommands().unionWith(minimalCommands())
+                                                      : defaultCommands();
+```
+
+`defaultCommands()` is Play, Pause, TogglePlayPause, begin/end seeking, SeekToPlaybackPosition
+and **SkipForward/SkipBackward — with no PreviousTrack/NextTrack**. So an *empty*
+page command set does not mean "no buttons"; it means "the ±15 s buttons". The set
+empties because locking the phone relaunches the GPU process, which is the same
+relaunch finding #3's category cache suffers: `NowPlayingManager::removeClient()`
+drops the remote-command listener and a later `addClient()` builds a fresh one whose
+`m_supportedCommands` starts empty. `MediaSession::setActionHandler()` is the only
+thing that repopulates it (`addSupportedCommand` on the non-null branch), and the
+player had only ever called it on `playing`, `pause` and a `visible` transition.
+
+That is exactly the set of moments a locked phone does not produce: audio keeps
+playing, so there is no `playing` and no `pause` — and finding #3 deliberately
+*removed* the pause from a background handoff, which is what closed the last one.
+So the command set stayed empty for the rest of the song and the buttons stayed wrong.
+
+The fix is a keep-alive in `public/media-session.js`: while the document is hidden,
+`position()` re-runs `installHandlers()` — one beat a second for the first 30 s after
+locking (when the relaunch lands), then one every 15 s, because a phone in a pocket
+stays locked for hours. It rides `position()` rather than a timer on purpose:
+`timeupdate` is the one event that keeps firing on a locked iPhone (finding #3), and
+a background timer may not run at all. Repeating is nearly free — WebKit keeps the
+commands in a `HashSet` and `updateSupportedCommands()` early-returns when the set is
+unchanged, so a repeat beat costs no MediaRemote IPC, and the beat that matters is the
+one that lands after the relaunch. `installHandlers()` also re-arms on *both*
+visibility transitions now, not only the way back in, and the guest room page
+(`public/listen.js`) does the same.
+
+`seekbackward`/`seekforward` stay explicitly `null` through every beat: registering
+them would put SkipForward/SkipBackward into the set and re-create the bug.
+
+Deliberately *not* handled: a page that is hidden **and paused**. A paused element
+emits no `timeupdate`, so there is nothing to ride — and nothing needs riding, because
+`PlayCommand` is in `defaultCommands()`, so the lock screen's play button still works,
+and resuming fires `playing`, which re-registers everything. A polling timer there
+would burn battery to fix what one press already fixes.
+
+Verified in a real browser (`test/lockscreen.test.js`, `test/media-session.test.js`):
+the artwork URL is same-origin and its declared size equals the loaded bitmap, the seek
+bar tracks the audio, a lock-screen seek to 0 moves the playhead without skipping the
+track, the seek-to-zero wrap still advances the queue afterwards, and — with the page
+forced hidden and the playhead ticking on real timers — the app re-registers
+previous/next repeatedly, keeps the seek buttons nulled, never pauses the element, and
+a `nexttrack` press from that state really skips the track.
 
 ### 5. Resuming where you left off — on the same device or another one
 
@@ -196,6 +274,351 @@ its owner:
 A device that booted into someone else's session is a **reader** until the user plays:
 background/visibility saves are skipped, so merely opening the app on a second device
 cannot steal the session. Restoring is still not playing — nothing autoplays.
+
+### 6. A locked iPhone runs no page script, so the next track has to already be in the stream
+
+Reported against the live instance (2026-11-09): *"On iOS when the phone is locked and
+the track ends, it does not play the next track automatically."* Everything in finding #3
+was already shipped and working on the visible player — the wrap detector fires from
+`timeupdate`, the hidden handoff never pauses, the audio session is repaired before the
+swap — and the track still stopped at the boundary.
+
+The production log says why, and it is not the player: the page stopped running. The last
+request the phone made was `PUT /api/now` at `19:20:24.866` — the `visibilitychange` save,
+i.e. the instant the screen locked — with the playhead at 149.5 s of a 176 s track. That
+save is *driven by `timeupdate`* (`saveSession` is throttled to one write per 15 s and
+called from the timeupdate handler), so its cadence is a heartbeat for "this page's media
+events are still arriving": every 15 s while unlocked, and then nothing. The track's end,
+26 s later, produced no `/api/events` `complete`, no `/api/stream/<next>` request and no
+further save for the rest of the night. The page was not slow, and nothing threw: WebKit
+suspended it.
+
+That is the documented WebKit behaviour, not a mistake in our code. A media element keeps
+playing while the web process is suspended — that is how background audio works at all —
+but script does not run, and the events that would tell it about a track boundary are
+delivered to a process that is not executing (WebKit bug 173332 is the same failure with
+`ended`; bug 261554 is the iOS 17.2+ variant where `play()` on a new `src` resolves and
+is silent). A client-side auto-advance therefore cannot work in that state; the only thing
+that crosses a locked track boundary is a media resource that *already contains* the next
+tracks, because the media process keeps streaming it with no script involved. That is why
+an internet-radio `<audio src="https://…">` plays for hours on a locked iPhone.
+
+So on the way into the background the element is handed the queue as one stream:
+
+- `POST /api/queue-stream/plan` (armed from every track start and every `playing`, while
+  the page is still awake) answers a token plus the ordered `{ videoId, durationMs }` of
+  the tracks that are *already cached*. It is a player endpoint: ids are only ever served
+  out of the audio cache the player itself filled, so it is not an open YouTube proxy.
+- On `hidden`, `enterQueueStream()` points the element at
+  `GET /api/queue-stream/:token?at=<playhead ms>`. `src/queue-stream.js` builds an ffmpeg
+  concat list — the first entry with `inpoint` at that playhead — and streams it as ONE
+  fragmented MP4 (`-c copy`, paced with `-re`), repeating the list until it covers a day.
+  No page script is needed from here on: track boundaries happen inside the stream.
+- On `visible` (or `pageshow`), `leaveQueueStream()` maps the stream position back to
+  `(track, offset)` with `public/queue-stream.js` and hands playback back to the normal
+  per-track player there — so unlocking shows the song that is actually playing, at the
+  right second, and seeking/duration/metadata are the real ones again.
+- While the stream plays and the page *is* awake (unlock in progress, another engine), the
+  mapped track drives `state.index`, the Now Playing metadata, the player bar and the
+  session save; the wrap detector and `endTrack()` are inert, and any deliberate seek,
+  skip or pause leaves the stream first.
+
+Scope, deliberately: iOS/iPadOS only (every other engine keeps delivering `timeupdate` to
+a hidden element, so the per-track handoff works there and a second source swap would only
+add a gap) and personal playback only (a room's playhead is the server's). Every queue mode
+gets a plan: queue order is the queue from the playhead; shuffle is the current track then
+the rest in a fresh random order (the player picks at random too, so any order is as right
+as the one it would have picked); repeat-one is the current track alone, which the server
+loops — that *is* repeat-one. The first version skipped shuffle and repeat-one, which left
+exactly the listeners most likely to leave the phone locked with no protection at all.
+
+**Update — the first deploy worked, but the phone never asked for a plan (2026-11-10).**
+The rebuilt image served the new shell, yet a full listening session from the iPhone
+produced per-track `/api/stream/<id>` handoffs, `/api/now` saves every 15 s, `complete`
+events at real track ends — and not one `POST /api/queue-stream/plan`. Two explanations
+were equally consistent with the server log: the page was still the shell it had loaded
+before the deploy (a PWA stays resident for days; the new worker installs and precaches in
+the background while the old page keeps running), or `armQueueStream()` bailed early on the
+device. Nothing the server could see told them apart, which is the real defect: a feature
+whose whole design is "it happens while the page is not running" needs to say what it
+decided.
+
+So the client now reports through `POST /api/client-report` — authenticated, bounded to
+4 KB, rate-limited, logged at info and never stored. It sends `live-plan` (armed, with the
+track count or the failure), `live-enter` / `live-leave` (the position mapping), `live-error`
+and `live-skip` (why it could not arm). Every report carries `build: queue-stream-2`, the
+device name, queue length and the shuffle/repeat state, so one log line answers what three
+guesses could not. The arming path also lost its last silent hole: shuffle, repeat-one and
+single-track queues now all get a plan (above), and a plan that fails is reported rather
+than swallowed.
+
+A stream also has to prove it plays: four seconds after the swap, the page (while it is
+still awake) checks the element is advancing — `HAVE_FUTURE_DATA` or a non-zero playhead,
+not paused, no error. If it is not, the player reports `live-stalled` and hands playback
+back to the per-track element, which at worst keeps the current song going. Silently
+accepting a source WebKit never decodes is the one failure mode that looks exactly like the
+bug this feature exists to fix.
+
+**Update — the diagnostics paid for themselves: iOS refuses the fMP4 (2026-11-10).** The
+reports from the phone, once it ran `queue-stream-2`, said it exactly:
+
+```
+live-enter ok:true  src=/api/queue-stream/…?at=4235
+live-enter ok:false reason=play-rejected error=NotSupportedError
+live-error
+live-leave elapsedMs=0 track=qN4ooNx77u0 offsetMs=4235
+```
+
+`NotSupportedError` is the engine refusing the *source*, not a gesture (`NotAllowedError`)
+— WebKit will not play an unseekable, chunked fragmented MP4 from a plain `<audio src>`.
+Chromium plays it happily, which is why every test passed; fMP4 is an MSE/HLS payload on
+iOS, not a progressive one. The same reports confirmed the earlier suspicion about the
+missing plan in the first round: `shuffle: true`. The build that skipped shuffle had
+nothing to arm, exactly as designed — and that design was wrong.
+
+The stream is now **MP3** (`audio/mpeg`, `-c:a libmp3lame -b:a 192k`, paced with `-re`),
+because a live MP3 over HTTP is precisely what a locked iPhone plays for hours — every
+internet radio station is one. The cost is one lossy generation and ~1% of a core per
+listener, paid only while a page is hidden. Two guards came with it:
+`enterQueueStream()` forces the audio-session repair *before* it assigns the new source
+(the same rule as a hidden track swap in `playIndex`), and any `NotSupportedError` —
+whether it arrives as a rejected `play()` or as the element's own error event — sets
+`streamBlocked` for the rest of the page and hands playback straight back to the per-track
+player. A rejected stream can no longer be retried into silence, which is what "locking
+the phone now stops playback right away" was: the swap replaced a working track with a
+source WebKit would not decode.
+
+Verified against the live deployment with a throwaway account: `/api/queue-stream/…`
+answers `audio/mpeg`, 71 KB in three seconds (192 kbps at real time, `ffprobe` reads it as
+mp3), and the deployed client in Chromium with an iPhone UA arms the plan, swaps on
+`hidden`, and reaches `readyState 3` playing. What still needs the phone is only whether
+iOS accepts it — the format every radio stream already proves.
+
+**Update — the lock can arrive before the plan (2026-11-10, later).** With MP3 the phone
+stopped rejecting the source, and the next report was quieter but just as precise: a plan
+was armed (`live-plan ok:true tracks:27`), and then **no `live-enter` at all** — while
+`/api/now` saves kept flowing for a minute and the lock-screen next button worked. Two
+things came out of that:
+
+* the page was *running* after the lock (iOS gives a locked audio page a grace period
+  before suspending it), so this was not the freeze — it was the entry condition;
+* `enterQueueStream()` only ran on the `visibilitychange → hidden` transition. If the plan
+  for the playing track had not arrived by that instant — which is exactly what happens
+  when the lock lands within a second of a track change — nothing ever tried again, even
+  though the page was alive for another minute and armed several more plans.
+
+So the plan became a **timeline** rather than "the queue starting at this track":
+`GET /api/queue-stream/:token?at=` now takes an offset into the *whole plan*, and
+`concatList` starts ffmpeg at whichever entry contains it (via `inpoint`), so a plan armed
+for one track can start the stream two songs later — a plan is still the same queue.
+`planOffsetFor()` computes that position on the client (`locate()` is its inverse, and the
+test asserts they round-trip), which removes the "stale plan" race entirely.
+
+On top of that the player now **converges** instead of relying on one transition: it tries
+to enter whenever the page is hidden, playing, and has a plan — on the way in, when a plan
+arrives, on `playing`, and on every `timeupdate` while still running. The armed plan is no
+longer cleared while a new one is in flight. Every bail-out is reported (`no-plan`,
+`not-in-plan`, `paused`, `blocked`), and repeated *failures* are throttled to one a minute
+while successes always go through, so convergence cannot spam the log.
+
+`test/queue-stream-handoff.test.js` now covers the exact shape: hide the page first, start
+a new track while hidden, and the element must end up on `/api/queue-stream/…` playing once
+its plan arrives.
+
+**Update — the transport itself was wrong twice, and the device was right both times
+(2026-11-10, evening).** The reports from `queue-stream-5` finally showed the stream
+reaching the phone and dying there: `live-enter ok:true at:168571`, then four seconds later
+`live-stalled {readyState:1, time:0, error:null}` — AVFoundation accepted the connection
+and starved on an *indefinite* MP3 response; my health check reverted, the convergence
+re-entered, and the page ping-ponged until it froze. An endless HTTP body is not a shape
+the iOS media pipeline schedules in the background.
+
+The transport is now **HLS**, the one shape iOS's media process is built to keep fetching
+with no script: finite MPEG-TS segment files plus a playlist it re-reads on its own
+cadence. One session per plan: a fast unpaced head burst (~30 s, five segments, on disk
+before the first playlist is served) and a real-time tail (`-re`) cutting 6 s segments for
+as long as the listener stays; the playlist is a sliding window over what exists, with a
+24 s grace behind the playhead and 18 s ahead, `#EXT-X-DISCONTINUITY` at the head/tail
+seam, and `#EXT-X-ENDLIST` only once the tail has died and the window reaches the last
+produced segment. Segments are immutable and cacheable; the playlist is `no-store`.
+
+Two engine rules were measured the hard way, and both are now load-bearing:
+
+1. **The playlist URL must end in `.m3u8`.** Same bytes, same
+   `application/vnd.apple.mpegurl` content type, same headers: `/root.m3u8` plays,
+   `/rootnoext` is `NotSupportedError`; `/api/queue-stream/<tok>/list.m3u8` plays,
+   `/api/queue-stream/<tok>` is `NotSupportedError` — at both path depths, VOD and live.
+   Chromium (and WebKit) pick the HLS demuxer by the *extension*, not the content type.
+   The route is `/api/queue-stream/:token/live.m3u8` for exactly this reason; every earlier
+   "it works in Chromium" probe had quietly been using a `.m3u8` path.
+2. **A live playlist needs at least three segments.** Apple's authoring rule, enforced by
+   Chromium: a two-segment live list fails where the identical bytes with `#EXT-X-ENDLIST`
+   play. A short plan therefore gets shorter head segments
+   (`headSpan/3`, floored at 1 s) so the first playlist always has three.
+
+Two robustness rules came out of watching the phone fail on a bad segment: segments are
+served `no-store` rather than `immutable` (a caching layer in front that ever hands out a
+partial copy would otherwise pin that corruption for an hour), and a stream failure is
+counted rather than fatal — two failures in a row give up on the stream for the page, one
+failure cools down for 15 s and retries, because a single truncated fetch through a tunnel
+is not a verdict on the transport.
+
+And segments are **re-encoded** (`-c:a aac -b:a 128k -ar 48000 -ac 2`), not remuxed:
+copying through the concat demuxer emits non-monotonic-DTS warnings at track seams and the
+resulting TS decodes to `MEDIA_ERR_DECODE` in the browser (measured: same segment bytes as
+VOD play, concat-cut ones do not), and a queue is heterogeneous YouTube rips — 44.1/48 kHz,
+mono/stereo, LC/HE-AAC — whose codec configuration a copy stream would change mid-list.
+One encoder pass makes every segment of every plan one stream; the price is a real-time
+AAC encode per locked listener.
+
+**Update — seeking while locked (2026-11-10, night).** The device log showed every
+lock-screen seek doing `live-leave offset=<target>` followed immediately by
+`live-enter at=<the old playhead>`: leaving the stream hands playback to the per-track
+player, whose resume is asynchronous, and the hidden convergence re-entered the stream
+before that resume landed — reading the element's still-old clock and snapping playback
+back to where it was. After about a minute the page is fully suspended and the seek never
+runs at all. A seek is now a move *inside* the stream: same session, new plan offset, new
+`src` nonce (`k`), and the server slides its playlist window to the `at` a new `k` names.
+The window itself no longer runs on the server's wall clock — it follows what the listener
+consumes (each segment fetch is the playhead; between fetches it advances only while the
+gap is short enough to be playing), so a paused or suspended listener keeps its window and
+resumes where it left off. The in-app scrubber paints while dragging and seeks on release
+while streaming; the lock-screen `seekto` and the keyboard arrows go through the same door.
+
+Verified in headless Chromium against the real routes: plan → hidden swap →
+`live.m3u8` → segments → playback across a track boundary inside the stream, convergence
+while already hidden, and rejoin on visible — `test/queue-stream-handoff.test.js` drives
+all four against a real server and real ffmpeg.
+
+**Update — the health check was killing working streams (2026-11-10, night).** The phone's
+own trace showed the stream *working*: `live-enter ok at=194631`, then the server log shows
+the media process fetching seg 0–2 at +1 s, re-polling the playlist at +15 s and fetching
+again at +16 s — and then the client's four-second health check, firing late out of a
+suspended page, read the frozen JS-visible element (`readyState 1, currentTime 0`) and
+reverted a stream that was playing. The revert re-entered with a fresh plan, three ffmpeg
+sessions stacked inside four seconds, the per-user cap answered `429`, and the phone went
+silent. Three structural fixes: the health check never judges while the document is hidden
+(and never reverts a stream that has played at all); leaving a stream tells the server
+(`DELETE /api/queue-stream/<token>/live.m3u8`, keepalive) so a session and its ffmpeg tail
+die with the listener instead of after the idle timeout; and the per-user session cap went
+from 2 to 4 so a legitimate re-entry cannot 429.
+
+**Update — the seek still failed, because the paced broadcast could not serve it
+(2026-11-11, night).** With seek-in-stream shipped, the device reports changed shape but
+not outcome: `live-seek k=2 at=329819` fired, yet the element kept fetching the segments
+around its *old* position and the lock-screen bar snapped back. The server log told why —
+the playlist after a far seek came back **empty** (`#EXT-X-ENDLIST` with no segments).
+
+The paced-tail transport had two structural limits that seeking hits head-on:
+
+* the tail only ever produced audio *up to the real-time frontier*. A seek to five minutes
+  into the plan asked for segments the broadcast had not reached, so there was nothing to
+  list;
+* and producing a segment via ffmpeg's **segment muxer** with a non-zero
+  `-output_ts_offset` is a trap: the muxer splits on *absolute* PTS, so it writes a
+  few-hundred-byte sliver into the `seq`-numbered file and the real audio into `seq+1`.
+  The sliver then trips the sub-second guard and the segment vanishes. (Measured in the
+  container: `-output_ts_offset 6.0` + segment muxer → `cut-000001.ts` = 0.021 s,
+  `cut-000002.ts` = 6.0 s.)
+
+The transport is therefore now **on-demand**: there is no tail. The playlist names the
+slice the listener is in, and any segment not already on disk is cut for it right there —
+one ffmpeg run per segment, `-f mpegts` single-file (never the segment muxer), with
+`-output_ts_offset` at the slice start so independently-produced files share one
+continuous PTS timeline and need no discontinuity tags. Seeking to any position is then
+just "cut the segments there": a cold open or a far seek costs ~300 ms of encode, not a
+wait for a broadcast to catch up. The overnight pace falls out for free — the media
+process polls the playlist every segment, so production tracks consumption, and a
+suspended listener produces nothing. A sliver guard (`< 1 s` → drop) and an atomic
+tmp→serve rename keep a half-written or overshoot segment from ever reaching a playlist,
+and `openQueueStream` pre-cuts the opening window so the very first playlist is never the
+empty one.
+
+**Update — absolute segment timestamps desynced the playhead, and an app switch
+silenced the phone (2026-11-11, midday).** Two device reports, one root cause each.
+
+*Positions that ran away.* The on-demand segments were stamped with their **absolute**
+plan position (`-output_ts_offset start`). Chromium normalises `currentTime` to elapsed
+since load, but WebKit reports the segment PTS, so on the iPhone the client computed
+`startMs + currentTime` and counted the anchor **twice**. Each re-entry compounded it —
+the device log shows the mapped position walking 152 s -> 999 s -> 5376 s (89 minutes in a
+15-minute plan) with the queue index bouncing 0 -> 37 -> 33 -> 10 -> 37, and the server
+serving `seg/828.ts`..`seg/847.ts` for a `k=9` load. The lock-screen widget emptied
+because the metadata described a track nobody was hearing. Fix: every segment's PTS is now
+relative to *that load's* anchor, and `-muxdelay 0 -muxpreload 0` zeroes the muxer's own
+1.4 s base, so the media timeline starts at exactly 0 for every load and both engines
+agree. A re-anchor (seek, re-entry) now invalidates the whole segment cache plus a
+generation counter that drops in-flight cuts from the old anchor, since a stale file would
+restart the timeline in the wrong place. Client-side belt and braces: `streamElapsedSeconds`
+rejects any `currentTime` ahead of the wall clock since the src was assigned (a live stream
+cannot run faster than time), reports it as `live-skew`, and both the mapping and
+`leaveQueueStream` ignore the reading rather than believe it. Verified live: the stream
+clock advanced 5.00 s across 5 s of wall time.
+
+*Switching apps stopped the music for good.* The chain, from the device log: Discord took
+the audio output mid-swap, the element paused, `leaveQueueStream` handed back to the
+per-track player, and that `play()` was **rejected** — after which nothing in the page could
+ever observe the silence. No `visibilitychange` (the listener never came back), no Audio
+Session `statechange` (another app grabbing the output is not always classified as an
+interruption), and a paused element fires no `timeupdate` to ride. The rejected-play path
+also left `switching` armed, and the pause handler deliberately ignores an armed swap, so
+even the intent to resume was never recorded. Two fixes: a `resumeWanted` intent set at both
+rejected-`play()` sites and at a hidden non-deliberate pause, which survives the honest
+`state.playing = false`; and a 10 s watchdog that calls `resumeIfInterrupted()` while hidden,
+bounded to 60 attempts and reset by a real `playing`. A deliberate pause — lock screen or
+transport — clears the intent and sets `userPause`, which now short-circuits the resume
+decision outright, so the watchdog can never restart music the listener stopped. Both halves
+are pinned by browser tests in `test/queue-stream-handoff.test.js`.
+
+**Update — the update machinery itself bricked a locking phone (2026-11-11, morning).**
+The device symptom: lock the phone, the song plays ~1 s, the Now Playing widget disappears
+and returns twice, then stays blank with nothing playing. The server log told the whole
+story — three full page loads inside two seconds at 07:45:29–31, then four locks over the
+next half hour each reporting `live-enter no-plan playing:false` and *zero* plan requests:
+the reload chain (from the previous round's "an idle page accepts updates itself") had
+reloaded the app while a song was starting, raced its own SKIP_WAITING/claim, reloaded
+again, and landed on a fresh paused page with no plan armed. Every later lock found
+exactly that.
+
+An auto-reload is only safe when "idle" means *settled* idle. Three guards now:
+
+* **boot grace** — no auto-reload within 20 s of page load (the restore/startup window);
+* **settled idle** — five continuous seconds of pause, and any `play` in between cancels
+  the pending acceptance (iOS emits pause/play blips during the audio-session resume
+  handshake, which is what fired the reload under a playing song);
+* **storm guard** — an auto-reload stamps sessionStorage; a page that *boots from* an
+  update reload never auto-reloads again (the pill stays for a human tap), which ends a
+  SKIP_WAITING/claim race at exactly one reload.
+
+The same settled-idle rule applies to the stale-page reload path. Pinned by two new tests
+in `test/pwa.test.js`: a transient pause while playing must not reload the page, and a
+storm-booted page must not auto-reload again.
+
+What it costs, stated plainly: while the phone is locked the Now Playing widget keeps
+naming the track that was playing at lock time, and the play log does not see the tracks
+that went by — the page is not running, so neither can be updated. Both correct themselves
+the moment the page wakes (`applyStreamPosition` maps the stream and publishes the real
+track); the music, which is the point, does not stop. A lock-screen skip or pause while the
+page is frozen is also not delivered — that was already true before this change.
+
+One implementation trap worth writing down: fragmented MP4 with `frag_keyframe` alone
+does not stream through a pipe. Every AAC frame is a keyframe, and with `-re` pacing the
+muxer buffered and emitted the 728-byte `ftyp`/`moov` and then nothing — the element sat
+at `readyState 0` forever. Measured alternatives: 71 KB in 5 s with `frag_every_frame`,
+52 KB with `-frag_duration 500000`. Half-second fragments are the setting that works.
+
+Verified in headless Chromium (`test/queue-stream-handoff.test.js`, iPhone UA, real
+ffmpeg, real 4 s tracks): the plan is armed while visible and starts with the playing
+track; hiding makes the element play `/api/queue-stream/…` **without pausing it**; the
+first track's boundary passes with the element still on the stream, no
+`/api/stream/<next>` request and no `src` reassignment — playback itself continues past
+it — while the mapped title becomes the second track; showing the page rejoins
+`/api/stream/<track two>` within a second of where the stream had reached and restores
+`loop`. `test/queue-stream.test.js` covers the mapping, the concat list (offset, repeats,
+escaping), the routes (401, ownership, 404, HEAD, hang-up) and a real stream's length from
+a requested offset. What no test here can prove is the premise: that iOS stops running the
+page. That is the production log above; the next device check is to lock the phone
+mid-track and confirm the *music keeps going*, not just that the app recovers.
 
 ## Architecture
 
