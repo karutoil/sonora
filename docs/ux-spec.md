@@ -1,11 +1,23 @@
 # sonora — production UX polish spec
 
-Status: **implemented** — this was the polish-pass contract; `docs/ui.md` records what shipped.
-Every agent working on this repo reads `docs/ui.md` first.
-Repo: `~/projects/muse-pwa`. Login for browser tests: whatever bootstrap account your
-local `.env` creates (`SONORA_USER` / `SONORA_PASSPHRASE` — the dev instance's values are
-local and intentionally not recorded here). **Do not restart the dev server, do not
-modify `data/`, do not sign the existing session out.**
+Status: **implemented**. This was the polish-pass contract. Where a rule is
+enforced by a test the test is named; where the shipped code deviates it is marked
+as a known gap. The live record of what the interface is *now* is [`ui.md`](ui.md)
+— read that first. Shipped by
+this pass: the token/typography hierarchy, real skeletons and empty states, the
+now-playing sheet (grip, tabs, up-next, swipe-dismiss, 180ms exit), the
+segmented library/search controls, in-app create/confirm sheets (no native
+dialogs), pointer-drag queue reordering, install/update/offline chrome, the
+`--app-h` installed-iOS fix, safe-area insets, and reduced-motion handling.
+Last verified against this tree: **2026-11-12** (`public/app.css`,
+`public/index.html`, `public/offline.html`, `test/library.test.js`,
+`test/safe-area.test.js`, `test/ios-chin.test.js`).
+
+Repo: the sonora source tree (layout and setup are in `README.md`). Browser
+tests create their own server and a temporary data directory, so they never
+touch a running dev instance or its `data/`. The login for a local instance is
+whatever its own `.env` bootstraps (`SONORA_USER` / `SONORA_PASSPHRASE`); those
+values stay local and are intentionally not recorded here.
 
 The app is a personal YouTube music PWA. It works; the problem is the finish. We are turning a
 good-looking mock into a shipped-feeling product: consistent tokens, real hierarchy, complete
@@ -28,7 +40,7 @@ max-width:650px
 (whitespace inside `calc()` matters):
 
 ```css
-.app{ ... padding:var(--sat) ... }                    /* last .app{ rule in the file wins */
+.app{ ... padding:var(--sat) ... }                    /* last line-anchored .app{ rule wins */
 .app{ ... grid-template-rows:minmax(0,1fr) calc(87px + var(--sab)); }
 .app{ ... height:var(--app-h,100dvh) ... }            /* installed-iOS chin, see docs/ui.md */
 .mobile-nav{ ... height:calc(67px + var(--sab)) ... }
@@ -36,8 +48,13 @@ max-width:650px
 .now-modal{ padding:calc(64px + var(--sat)) ... }
 ```
 
+(The test reads the last `.app{` that starts a line, so the 21 safe-areas block
+must stay last; the media-query `.app{` rules above it are indented and do not
+match. All six literals were re-grepped in `public/app.css` on 2026-11-12.)
+
 `index.html` and `offline.html` must keep a byte-identical inline `--app-h` boot
-script before their stylesheets; `test/ios-chin.test.js` compares the two. The
+script before their stylesheets (compared byte for byte on 2026-11-12);
+`test/ios-chin.test.js` compares the two. The
 root chain (`html`, `body`) must use `height:var(--app-h,100%)` as well as
 `.app` — a `100%` root clips the taller shell and the chin comes back.
 
@@ -68,7 +85,9 @@ Existing JS hooks that must keep working: every `data-action`, `data-page`, `dat
 - Spacing: 4px base scale. Radii: 8 / 12 / 16 / 22 / pill. Don't mix arbitrary values.
 - Motion tokens: `--dur-1:140ms; --dur-2:220ms; --dur-3:320ms;
   --ease-out:cubic-bezier(.22,.68,.18,1); --ease-spring:cubic-bezier(.2,.9,.25,1.2)`.
-  Animate **transform/opacity only**. Entrance: page fade+8px rise 220ms; card grids stagger
+  Animate **transform/opacity only** for movement, entrances and exits (known
+  gap: hover/focus still transitions `background`/`color`/`border-color`, and
+  the skeleton shimmer moves a gradient). Entrance: page fade+8px rise 220ms; card grids stagger
   (30ms per item, cap 8); sheets slide up 320ms; backdrop fade 180ms; toast rise 220ms;
   heart pop; skeleton shimmer; waveform/eq loops. Nothing bouncy or longer than 400ms.
   Everything collapses under `@media (prefers-reduced-motion: reduce)`.
@@ -121,9 +140,12 @@ Width helpers `.w-35 .w-40 .w-60 .w-70` (percent). Shimmer via `::after` gradien
 Swipe-to-close sets inline `transform` and toggles `.dragging` (transition disabled).
 `.now-modal.dragging{transition:none}`.
 
-**Player** — `<div class="mini-progress"><i style="width:var(--progress,0%)"></i></div>` inside the
-mobile bar (the old `:before` line goes away); `.player.is-playing` when playing; `.player.is-empty`;
-`.player-song-meta` already exists. Mobile controls must be **≥44×44px**.
+**Player** — `<div class="mini-progress" aria-hidden="true"><i></i></div>` inside the
+mobile bar (the old `:before` line is gone). The `<i>` is pinned to full width inline and
+scaled with `scaleX(position/duration)` on each `timeupdate` — compositor-only, no `--progress`
+invalidation of the player subtree (`--progress` still sizes the sheet's own bar). `#player`
+carries `.is-playing` while playing and `.is-empty` with no track; `.player-song-meta` already
+exists. Mobile controls must be **≥44×44px**.
 
 **Segmented control** (library tabs / player tabs)
 ```html
@@ -133,8 +155,11 @@ mobile bar (the old `:before` line goes away); `.player.is-playing` when playing
 ```
 Keep `.chip.selected`/`.modal-tabs button.active` working too.
 
-**Forms** — `.form-sheet` (single-column modal), `.form-row`, `.form-actions`, `.btn-primary`
-(alias of `.play-btn` look), `.btn-ghost`, `.field-hint`, `.field-error`, `.btn-loading` with spinner.
+**Forms** — `.form-sheet` (single-column modal), `.form-actions`, `.field-hint`,
+`.field-error`, `.btn-loading` with spinner. **Known gaps:** `.form-row`, `.btn-primary`
+and `.btn-ghost` from the original contract never shipped; the app uses `.form-body`,
+`.form-actions` with `.play-btn` (primary) and `.secondary-btn` (ghost) instead.
+`.press` is styled in `app.css` but no code adds it.
 
 **Search** — `.search-shell`, `.search-recent` (row of `.chip.small`), `.search-hint`,
 `.search-skeleton`.
@@ -157,13 +182,20 @@ on active nav; safe-area padding preserved.
 **Context menu** — `.context-menu.flip-y` / `.flip-x` when it would overflow the viewport.
 
 **Install / update / offline** (owned by the PWA agent, namespaced `.pwa-*`, its own
-`public/pwa.css`): `.pwa-banner`, `.pwa-banner.show`, `.pwa-pill`, `.pwa-pill.show`, `.pwa-sheet`.
-The install offer is made at every width — Windows and macOS install PWAs too — as
-`.pwa-banner` below 1081px and as `.pwa-pill[data-kind="install"]` above it.
+`public/pwa.css`): `.pwa-banner`, `.pwa-pill`, `.pwa-pill[data-kind="install"]`,
+`.pwa-pill[data-kind="update"]`, `.pwa-pill[data-kind="offline"]`, `.pwa-sheet`.
+(There is no `.show` class: `pwa.js` appends and removes these nodes, and the
+pill's state lives in `data-kind`.) The install offer is made at every width —
+Windows and macOS install PWAs too — as `.pwa-banner` below 1081px and as
+`.pwa-pill[data-kind="install"]` above it.
 
 ---
 
-## 4. Measured defects to fix (from real-browser audit at 390×844)
+## 4. Measured defects at the time (pre-pass audit at 390×844)
+
+This is the state the pass started from — the reason each rule above exists, not
+a description of the app now. Each item was addressed in the pass unless noted
+in §3 as a known gap.
 
 1. **Library → Playlists is stuck on "Loading…" forever.** `libraryPage()` computes
    `loading = state.browse[tab.toLowerCase()] === null`; `browse.playlists` never exists.
@@ -210,4 +242,5 @@ Real browser (headless Chromium via `test/helpers/cdp.js`), viewports:
 - `prefers-reduced-motion` removes animation, never breaks layout.
 - Offline: reloading while offline shows the branded shell (or offline page), not a browser error.
 - Lighthouse PWA installability (manifest icons 192/512 + maskable, SW registered).
-- `npm test` stays green (143 tests; live-YouTube tests may be flaky — do not weaken them).
+- `npm test` stays green (the whole suite: 50 files; live-YouTube tests may be
+  flaky — do not weaken them).

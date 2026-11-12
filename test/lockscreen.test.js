@@ -351,7 +351,7 @@ test('the lock screen gets artwork, metadata and a working seek bar', async (t) 
   await browser.goto(`${BASE}/`);
   // Log in, then reload so the app boots authenticated.
   await browser.eval(`fetch('/api/auth/login',{method:'POST',headers:{'content-type':'application/json'},
-    body:JSON.stringify({name:'toil',passphrase:'hunter2hunter2'})}).then(r=>r.status)`);
+    body:JSON.stringify({name:'admin',passphrase:'hunter2hunter2'})}).then(r=>r.status)`);
   await browser.goto(`${BASE}/`);
   await browser.waitFor(`!!document.querySelector('.mobile-nav button')`);
 

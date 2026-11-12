@@ -77,7 +77,7 @@ after(() => {
 const hostCookie = async () => {
   const res = await fetch(`${BASE}/api/auth/login`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2', deviceId: 'venue', deviceName: 'Chromium' }),
+    body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2', deviceId: 'venue', deviceName: 'Chromium' }),
   });
   assert.equal(res.status, 200);
   return (res.headers.getSetCookie?.()[0] ?? res.headers.get('set-cookie')).split(';')[0];
@@ -169,7 +169,7 @@ test('the venue is a view, not the default, and costs nothing until asked for',
     assert.equal(venue.screenTitle, 'Beta Song', 'and so does the projector');
     assert.equal(venue.screenArt, `/t/${IDS[1]}/art.jpg`, 'which shows the sleeve, not a placeholder');
     assert.ok(venue.screenFill > 0, 'and carries the playhead');
-    assert.equal(venue.host, 'toil', 'the host is the one named person');
+    assert.equal(venue.host, 'admin', 'the host is the one named person');
     assert.equal(venue.posters, 5, 'the wall is hung with this room’s five sleeves, once each');
     assert.equal(venue.playerTitle, 'Beta Song', 'the player view still agrees');
     assert.equal(venue.playerRows, 4, 'and still holds the queue');
@@ -229,7 +229,7 @@ test('the room is the room: its people, its queue, its themes, and no chat',
     })()`);
     assert.ok(lines.length > 0);
     const spoken = await browser.eval(`document.querySelector('.v-bubble').textContent`);
-    assert.match(spoken, /toil is hosting|Up next:|in the room|on the projector|In sync/,
+    assert.match(spoken, /admin is hosting|Up next:|in the room|on the projector|In sync/,
       `a bubble is a status, not a message (${spoken})`);
     assert.doesNotMatch(spoken, /I love|good vibe|hi |hello/i, 'and never pretends to be a person talking');
 

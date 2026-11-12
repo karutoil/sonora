@@ -163,7 +163,7 @@ test('an untrusted forwarded host cannot poison the passkey RP context', async (
     // which lets registration options succeed and persist the row.
     const login = await fetch(`${base}/api/auth/login`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+      body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
     });
     assert.ok(login.ok, `login failed: ${login.status}`);
     const cookie = login.headers.getSetCookie()[0].split(';')[0];
@@ -228,7 +228,7 @@ test('the login screen explains passkeys and offers a remember-me choice', async
 
 test('a wrong passphrase reports the server message and keeps the screen open', async (t) => {
   if (!needBrowser(t)) return;
-  await browser.eval(`document.getElementById('auth-name').value = 'toil'`);
+  await browser.eval(`document.getElementById('auth-name').value = 'admin'`);
   await browser.eval(`document.getElementById('auth-pass').value = 'not-the-passphrase'`);
   await browser.eval(`document.getElementById('auth-form').requestSubmit()`);
   await browser.waitFor(`document.getElementById('auth-err').textContent.length > 0`, 10_000);
@@ -283,7 +283,7 @@ test('a passkey signs you in without a passphrase', async (t) => {
   await browser.waitFor(`document.getElementById('auth-overlay').hidden`, 25_000);
 
   const me = await browser.eval(`fetch('/api/me').then((r) => r.json())`);
-  assert.equal(me.user.name, 'toil');
+  assert.equal(me.user.name, 'admin');
   assert.ok(me.user.hasPasskeys, 'the session reports that a passkey exists');
 });
 
@@ -310,7 +310,7 @@ test('a synced (backed-up) passkey is not refused after its stored counter moves
   await browser.waitFor(`document.getElementById('auth-overlay').hidden`, 25_000);
 
   const me = await browser.eval(`fetch('/api/me').then((r) => r.json())`);
-  assert.equal(me.user.name, 'toil', 'the synced passkey still signs in');
+  assert.equal(me.user.name, 'admin', 'the synced passkey still signs in');
 
   // The stored counter is still updated from the response, so a later
   // single-device regression is still visible; `backed_up` follows the last
@@ -358,7 +358,7 @@ test('a revoked passkey can no longer sign in', async (t) => {
   if (!needBrowser(t)) return;
   // Sign back in with the passphrase, remove the passkey, then confirm the
   // server has nothing left to authenticate against.
-  await browser.eval(`document.getElementById('auth-name').value = 'toil'`);
+  await browser.eval(`document.getElementById('auth-name').value = 'admin'`);
   await browser.eval(`document.getElementById('auth-pass').value = 'hunter2hunter2'`);
   await browser.eval(`document.getElementById('auth-form').requestSubmit()`);
   await browser.waitFor(`document.getElementById('auth-overlay').hidden`, 20_000);

@@ -345,7 +345,9 @@ test('Chromium would install this as an app, with the manifest it reads', async 
   assert.ok(m.icons.some((i) => i.purpose === 'maskable'),
     'without a maskable icon Android crops the square icon into its own shape');
   assert.ok((m.shortcuts?.length ?? 0) >= 3, 'home-screen long-press shortcuts are declared');
-  assert.equal(m.launch_handler?.client_mode, 'navigate-existing');
+  // focus-existing: a shortcut tap must not reload the running app (which
+  // stops music mid-track); the still-running page consumes ?page= itself.
+  assert.equal(m.launch_handler?.client_mode, 'focus-existing');
 });
 
 // ── the lock screen (a real background transition) ────────────────────────
@@ -577,13 +579,12 @@ test('the app fits a phone screen at every size Android ships, portrait and land
     if (layout.vw < 811) {
       assert.equal(layout.sidebar, null, `${c.name}: the desktop sidebar is on screen on a phone`);
     }
-    // Accessibility floor: Android's own guidance is 48 dp and WCAG's enhanced
-    // target is 44, but the app's secondary topbar arrows measure 36 dp, so 36
-    // is the floor this suite enforces. Everything under 44 is written to
-    // layout.json for the audit rather than failing the run (a design change,
-    // not a regression).
-    const small = layout.targets.filter((x) => x.h < 36 || x.w < 36);
-    assert.deepEqual(small, [], `${c.name}: touch targets under 36 dp: ${JSON.stringify(small)}`);
+    // Accessibility floor: Android's own guidance is 48 dp; WCAG 2.2's enhanced
+    // target is 44 dp, and that is the floor this suite enforces. The secondary
+    // topbar arrows used to measure 36 dp and are the pair that was fixed —
+    // every target is also written to layout.json for the audit.
+    const small = layout.targets.filter((x) => x.h < 44 || x.w < 44);
+    assert.deepEqual(small, [], `${c.name}: touch targets under 44 dp: ${JSON.stringify(small)}`);
   }
   // Recorded for the audit: the smallest target measured, and everything that
   // misses the 44 dp comfortable-thumb size.

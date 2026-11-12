@@ -846,7 +846,7 @@ function renderNav() {
     </button>`).join('');
 
   // The station is pinned to the person, not to a page: its label carries the
-  // name so the sidebar entry reads "toil's station".
+  // name so the sidebar entry reads "admin's station".
   const stationBtn = $('nav-station');
   if (stationBtn) {
     const stationOn = activeRoute('station');
@@ -4169,7 +4169,13 @@ function openFormSheet(html, { label = 'Dialog', trigger = null, focus = null } 
 // checkbox, because that is what gives keyboard, screen-reader and touch
 // behaviour for free.
 function settingsHtml() {
-  const rows = prefKeys().map((key) => {
+  // desktopAlerts is hidden on engines without Notification (iOS Safari in a
+  // PWA): the toggle would store a pref that can never alert, and the settings
+  // sheet is the one surface that must not overpromise. notifications.js
+  // refuses to keep the pref on those engines too — belt and braces.
+  const rows = prefKeys()
+    .filter((key) => key !== 'desktopAlerts' || typeof Notification === 'function')
+    .map((key) => {
     const meta = PREF_META[key] ?? {};
     const label = meta.label ?? key;
     const hint = meta.hint ?? '';

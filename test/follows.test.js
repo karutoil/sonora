@@ -188,6 +188,11 @@ test('two followers of one artist each get one notification and the release is s
     assert.equal(items[0].artistId, id);
     assert.equal(items[0].url, `#/c/a${ALBUM_THREE.id}`);
     assert.match(items[0].body, /New album from Fixture Artist/);
+    // The thumb must be the same-origin proxy URL, never the raw CDN URL:
+    // off-origin icons render art-less on iOS (media-session.js documents it)
+    // and the notification panel would make a third-party request per row.
+    assert.equal(items[0].thumb, `/api/img?u=${encodeURIComponent('https://img.test/three.jpg')}`,
+      'the release thumb bypassed the image proxy');
     assert.equal(db.countUnread(user.id), 1);
   }
 });
@@ -252,42 +257,56 @@ test('a fanout failure rolls back the release baseline and a retry delivers the 
   }
 });
 
-test('a successful empty catalogue stays initialized so its first later release is news', async () => {
+test('an unreadable empty page is left uninitialized so no parse miss floods the bell', async () => {
   resetTables();
   const id = artistId('empty-then-release');
   db.followArtist(alice.id, { artistId: id, name: 'Fixture Artist' });
   const pages = { [id]: pageOf(id, { albums: [], singles: [] }) };
+  const warns = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => { warns.push(args.join(' ')); };
 
-  const first = await pollFollows({ page: fakePage(pages) });
-  assert.equal(first.created, 0);
-  assert.deepEqual(first.checked, 1);
-  assert.equal(db.artistReleaseInitialized(id), true, 'empty is a durable successful baseline');
-  assert.deepEqual(db.knownReleases(id), [], 'no synthetic release pollutes the baseline');
-  assert.equal(db.db.prepare(`
-    SELECT COUNT(*) AS n FROM artist_releases
-    WHERE release_id = '__sonora_initialized_empty_v1__'
-  `).get().n, 0, 'the compatibility sentinel is retired');
-  const initializedAt = db.db.prepare(
-    'SELECT initialized_at FROM artist_release_state WHERE artist_id = ?',
-  ).get(id).initialized_at;
+  try {
+    // An empty page is indistinguishable from a parse miss (artistPage cannot
+    // tell "no sections parsed" from "genuinely no releases"), so the safe
+    // default is: no baseline, no fanout, one warning. Re-checked next sweep.
+    const first = await pollFollows({ page: fakePage(pages) });
+    assert.equal(first.created, 0);
+    assert.deepEqual(first.checked, 1);
+    assert.equal(db.artistReleaseInitialized(id), false, 'an empty read must not become a durable baseline');
+    assert.deepEqual(db.knownReleases(id), []);
+    assert.equal(db.listNotifications(alice.id).length, 0, 'nothing fans out from an empty read');
 
-  const emptyAgain = await pollFollows({ page: fakePage(pages) });
-  assert.equal(emptyAgain.created, 0);
-  assert.equal(db.db.prepare(
-    'SELECT initialized_at FROM artist_release_state WHERE artist_id = ?',
-  ).get(id).initialized_at, initializedAt, 'polling does not move the original initialization');
+    // A second empty sweep warns at most once (the module remembers).
+    await pollFollows({ page: fakePage(pages) });
+    assert.equal(warns.length, 1, `expected exactly one unreadable-page warning, got ${warns.length}`);
 
-  pages[id] = pageOf(id, { albums: [ALBUM_ONE] });
-  const released = await pollFollows({ page: fakePage(pages) });
-  assert.equal(released.created, 1, 'the first real release after an empty baseline must not be swallowed');
-  assert.deepEqual(db.listNotifications(alice.id).map((n) => n.title), [ALBUM_ONE.title]);
+    // The first *readable* page initializes and reports only real releases.
+    pages[id] = pageOf(id, { albums: [ALBUM_ONE, ALBUM_TWO] });
+    const released = await pollFollows({ page: fakePage(pages) });
+    assert.equal(released.created, 0, 'a first readable page is a baseline, not news');
+    assert.equal(db.artistReleaseInitialized(id), true);
+    assert.equal(db.db.prepare(`
+      SELECT COUNT(*) AS n FROM artist_releases
+      WHERE release_id = '__sonora_initialized_empty_v1__'
+    `).get().n, 0, 'the compatibility sentinel is retired');
+
+    pages[id] = pageOf(id, { albums: [ALBUM_ONE, ALBUM_TWO, ALBUM_THREE] });
+    const news = await pollFollows({ page: fakePage(pages) });
+    assert.equal(news.created, 1, 'the first release after a real baseline must not be swallowed');
+    assert.deepEqual(db.listNotifications(alice.id).map((n) => n.title), [ALBUM_THREE.title]);
+  } finally {
+    console.warn = originalWarn;
+  }
 });
 
 test('durable initialization rolls back with a failed reconciliation and can be retried', async () => {
   resetTables();
   const id = artistId('empty-rollback');
   db.followArtist(alice.id, { artistId: id, name: 'Fixture Artist' });
-  const page = pageOf(id, { albums: [], singles: [] });
+  // A page WITH a release, so the initialization path is exercised (an empty
+  // page no longer initializes — that is the flood guard, not this test).
+  const page = pageOf(id, { albums: [ALBUM_ONE] });
 
   await assert.rejects(checkArtist(id, {
     page,
@@ -299,9 +318,9 @@ test('durable initialization rolls back with a failed reconciliation and can be 
   assert.equal(db.artistReleaseInitialized(id), false, 'the inserted state was rolled back');
   assert.deepEqual(db.knownReleases(id), []);
 
-  await checkArtist(id, { page });
-  const released = await checkArtist(id, { page: pageOf(id, { albums: [ALBUM_ONE] }) });
-  assert.deepEqual(released.fresh.map((r) => r.releaseId), [ALBUM_ONE.id]);
+  await checkArtist(id, { page: pageOf(id, { albums: [ALBUM_ONE] }) });
+  const released = await checkArtist(id, { page: pageOf(id, { albums: [ALBUM_ONE, ALBUM_TWO] }) });
+  assert.deepEqual(released.fresh.map((r) => r.releaseId), [ALBUM_TWO.id]);
   assert.equal(released.created, 1, 'the successful retry does not consume the later release');
 });
 
@@ -589,7 +608,7 @@ httpTest('the follow and notification routes require a session', async () => {
 
 httpTest('sign in', async () => {
   const { status } = await jfetch('/api/auth/login', {
-    method: 'POST', body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+    method: 'POST', body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
   });
   assert.equal(status, 200);
   assert.ok(cookie, 'a session cookie came back');
@@ -653,7 +672,7 @@ httpTest('notifications keep their shape, order and unread count, and can be rea
   // something a test should depend on.
   const sdb = serverDb();
   try {
-    const uid = sdb.prepare("SELECT id FROM users WHERE name = 'toil'").get().id;
+    const uid = sdb.prepare("SELECT id FROM users WHERE name = 'admin'").get().id;
     const insert = sdb.prepare(`
       INSERT INTO notifications
         (user_id, kind, title, body, thumb, url, artist_id, artist_name, video_id, dedupe, created_at, read_at)

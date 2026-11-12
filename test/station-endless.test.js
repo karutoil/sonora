@@ -78,7 +78,7 @@ before(async () => {
   }
   const { res } = await jfetch('/api/auth/login', {
     method: 'POST',
-    body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+    body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
   });
   assert.equal(res.status, 200, 'login failed');
 });

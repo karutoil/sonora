@@ -111,22 +111,22 @@ test('health is public, API requires auth', async () => {
 
 test('wrong passphrase is rejected', async () => {
   const { res } = await jfetch('/api/auth/login', {
-    method: 'POST', body: JSON.stringify({ name: 'toil', passphrase: 'nope' }),
+    method: 'POST', body: JSON.stringify({ name: 'admin', passphrase: 'nope' }),
   });
   assert.equal(res.status, 401);
 });
 
 test('login sets a session cookie', async () => {
   const { res, body } = await jfetch('/api/auth/login', {
-    method: 'POST', body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+    method: 'POST', body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
   });
   assert.equal(res.status, 200);
-  assert.equal(body.user.name, 'toil');
+  assert.equal(body.user.name, 'admin');
   assert.ok(cookie.startsWith('sonora_session='), 'cookie was captured');
 
   const me = await jfetch('/api/me');
   assert.equal(me.res.status, 200);
-  assert.equal(me.body.user.name, 'toil');
+  assert.equal(me.body.user.name, 'admin');
 });
 
 test('search returns real tracks with 11-char video ids', async () => {

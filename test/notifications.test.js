@@ -219,8 +219,8 @@ before(async () => {
   await browser.goto(`${BASE}/`);
   const status = await browser.eval(`fetch('/api/auth/login', { method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }) }).then((r) => r.status)`);
-  assert.equal(status, 200, 'browser login with toil/hunter2hunter2 failed');
+    body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }) }).then((r) => r.status)`);
+  assert.equal(status, 200, 'browser login with admin/hunter2hunter2 failed');
   await browser.goto(`${BASE}/`);
   await browser.waitFor(`!!document.querySelector('#mobile-nav button')`, 20_000);
 });
@@ -586,7 +586,7 @@ test('a fresh row still alerts after retention reuses SQLite ids and the page re
   const seeded = new DatabaseSync(path.join(server.dir, 'ux.db'));
   try {
     seeded.exec('PRAGMA busy_timeout = 5000');
-    const uid = seeded.prepare("SELECT id FROM users WHERE name = 'toil'").get().id;
+    const uid = seeded.prepare("SELECT id FROM users WHERE name = 'admin'").get().id;
     const insert = seeded.prepare(`
       INSERT INTO notifications
         (user_id, kind, title, body, thumb, url, artist_id, artist_name, video_id, dedupe, created_at, read_at)
@@ -625,7 +625,7 @@ test('a fresh row still alerts after retention reuses SQLite ids and the page re
     const createdAt = new Date().toISOString();
     try {
       pruned.exec('PRAGMA busy_timeout = 5000');
-      const uid = pruned.prepare("SELECT id FROM users WHERE name = 'toil'").get().id;
+      const uid = pruned.prepare("SELECT id FROM users WHERE name = 'admin'").get().id;
       const readCutoff = new Date(Date.now() - 60 * 86_400_000).toISOString();
       const unreadCutoff = new Date(Date.now() - 120 * 86_400_000).toISOString();
       const removed = pruned.prepare(`

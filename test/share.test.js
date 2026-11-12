@@ -83,7 +83,7 @@ before(async () => {
   const login = await fetch(`${base}/api/auth/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+    body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
   });
   assert.ok(login.ok, `login failed: ${login.status} ${await login.text()}`);
   cookie = (login.headers.getSetCookie?.()[0] ?? login.headers.get('set-cookie')).split(';')[0];
@@ -447,7 +447,7 @@ test('API bodies require explicit JSON, while valid empty POSTs and same-origin 
     headers: {
       origin: base, 'sec-fetch-site': 'same-origin', 'content-type': 'application/json',
     },
-    body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+    body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
   });
   assert.equal(publicLogin.status, 200);
   await publicLogin.arrayBuffer();
@@ -507,7 +507,7 @@ test('an authenticated loopback proxy supplies the canonical card and mutation o
         ...forwarded, origin: publicOrigin, 'sec-fetch-site': 'same-origin',
         'content-type': 'application/json',
       },
-      body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+      body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
     });
     assert.equal(login.status, 200, await login.text());
     const fixtureCookie = login.headers.getSetCookie()[0].split(';')[0];
@@ -633,7 +633,7 @@ test('the track menu copies a shareable /t/ link', async (t) => {
     const status = await browser.eval(`fetch('/api/auth/login', {
       method: 'POST', credentials: 'same-origin',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+      body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
     }).then((r) => r.status)`);
     assert.equal(status, 200);
 

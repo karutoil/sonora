@@ -149,7 +149,7 @@ for (const d of DEVICES) {
     await browser.goto(`${BASE}/`);
     // log in, then reload so the app boots authenticated
     await browser.eval(`fetch('/api/auth/login',{method:'POST',headers:{'content-type':'application/json'},
-      body:JSON.stringify({name:'toil',passphrase:'hunter2hunter2'})}).then(r=>r.status)`);
+      body:JSON.stringify({name:'admin',passphrase:'hunter2hunter2'})}).then(r=>r.status)`);
     await browser.goto(`${BASE}/`);
     await browser.iphone(d);
     // Device metrics are applied asynchronously by CDP; wait until the mobile

@@ -1,10 +1,23 @@
 # Sonora · Sleeve-first v2 (unification pass)
 
-Direction 01 was implemented on the home hero only. This pass makes the whole app
+**Status: implemented.** The pass landed; this file is kept as the contract it
+promised, not as a plan. The live record of what the interface is *now* is
+[`ui.md`](ui.md) — read that first, and read every rule below as a rule the code
+has to keep or consciously change.
+
+Direction 01 was implemented on the home hero only. This pass made the whole app
 read as one system. It is a **contract**: the class names below are shared by
 `public/app.css` (visual) and `public/app.js` (markup) and must match exactly.
+Re-grepped against this tree on 2026-11-12: 29 class names, 3 data attributes and
+16 custom properties below all still resolve in `public/app.css`, `public/app.js`
+and `public/pwa.css`. Two literals had drifted, one described offset was off by a
+pixel, and one closure note no longer describes the code; each is corrected or
+marked where it stands.
 
-## Evidence from the current build (1440×1000 and 390×844)
+## Evidence from the build the pass started from (1440×1000 and 390×844)
+
+These nine points are the state *before* the pass. They are the reason the rules
+exist, not a description of the current app.
 
 1. **The home hero goes stale.** The phone player showed a playing track while the
    hero still rendered the "Find your afterglow" fallback. On desktop the same
@@ -65,8 +78,11 @@ read as one system. It is a **contract**: the class names below are shared by
 ```
 - Replaces `.section-head` and `.sleeve-shelf-head` usage on routed pages.
   Keep both old classes working (other code/tests use `.section-head`).
-- `.shelf` for tiles is `grid-template-columns: repeat(auto-fill, minmax(104px, 1fr))`
-  with `max-width` per tile so a single item can never stretch.
+- `.shelf` for tiles is `grid-template-columns: repeat(auto-fill, minmax(96px, 120px))`
+  — a fixed-width grid whose **upper bound is what stops a lone tile stretching**, so
+  one item renders at 120px and never takes the whole column. (The brief first wrote
+  this as `minmax(104px, 1fr)` plus a per-tile `max-width`; the shipped rule gets the
+  same guarantee from the track's maximum, and is written that way once, in `.shelf`.)
 
 ### Sleeve tile — any artwork entity
 ```html
@@ -99,6 +115,10 @@ read as one system. It is a **contract**: the class names below are shared by
   to a slim bar. Keep `.pwa-banner` / `.pwa-pill` class names (tests pin them).
 
 ## Ownership
+
+This table was the working agreement for the pass and is kept for the record; it is
+not a rule for anyone reading this today. The only part that still applies is the last
+line: do not run the full `npm test` when a focused suite answers the question.
 
 | File | Owner | May change |
 |---|---|---|
@@ -152,7 +172,12 @@ are recorded here so a later pass does not undo them.
    search, and clip the fifth tab mid-word on a phone.
 5. **Radio stations are sleeves.** They were the last second card system — a
    bordered container with padding and a 3:2 crop. Now borderless, 1:1, same
-   `--r-cover` radius, with the play disc revealed on hover where hover exists.
+   `--r-cover` radius, with the play disc revealed on hover where hover exists
+   (and always visible where there is no hover to reveal it). The override sits at
+   the end of `public/app.css` under "radio stations are sleeves too"; the
+   original `.station` block earlier in the file still declares the bordered 3:2
+   card, so a grep for `.station{` finds the rule that lost, not the one that
+   ships.
 6. **One "now playing" idiom.** The queue drawer marked its current row with a
    brown wash and 16px art radius; it now uses the table's coral edge, coral
    duration and the 8px sleeve, and its close button is the same 44px circle as
@@ -180,7 +205,7 @@ Rules that keep it from happening again:
 - The extras never exceed half the content column. The redundant "expand player"
   button is gone (the cover, the title and the rail arrow all open the same
   sheet), gaps are 6px, and the volume slider is the only flexible item
-  (`flex:0 1 88px;min-width:56px`) so it yields before anything overlaps.
+  (`flex:0 1 88px;min-width:48px`) so it yields before anything overlaps.
 - Below 1311px the bar drops to what a bar is for: cover, title, transport,
   queue, volume. Room and lyrics come back at 1311px; the taste buttons at
   1181px. Everything dropped is still reachable in the rail (from 1081px), in
@@ -200,8 +225,9 @@ transport's centre equals the content column's centre at every width.
 The row carries four kinds of control — what is playing, taste, transport,
 utilities, volume — and 24px of air was not enough to tell them apart at this
 density; it read as one strip of glyphs. Each gap now holds a 22px hairline
-(`--line-2`, 1px, centred, positioned `left:-13px` = exactly half the grid gap),
-and the volume control gets the same mark inside the utilities cluster.
+(`--line-2`, 1px, centred, positioned `left:-13px` — half of the 24px grid gap
+minus the hairline's own 1px, so the mark's centre sits midway between the
+clusters), and the volume control gets the same mark inside the utilities cluster.
 
 - Two of the marks sit in the grid gaps; the third is inside `.player-extras`,
   where `.volume-group` gained 11px of `padding-left`. That is paid for by the

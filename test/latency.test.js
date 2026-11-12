@@ -48,7 +48,7 @@ async function seed(base) {
   const login = await fetch(`${base}/api/auth/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+    body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
   });
   assert.equal(login.status, 200, 'login');
   const cookie = login.headers.getSetCookie()[0].split(';')[0];
@@ -90,7 +90,7 @@ before(async () => {
 
   const status = await browser.eval(`fetch('/api/auth/login', { method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }) }).then((r) => r.status)`);
+    body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }) }).then((r) => r.status)`);
   assert.equal(status, 200, 'browser login failed');
 });
 

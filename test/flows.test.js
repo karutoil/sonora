@@ -33,7 +33,7 @@ test.before(async () => {
   // Log in once: the cookie survives every navigation in this session.
   await browser.goto(`${server.base}/`);
   const status = await browser.eval(`fetch('/api/auth/login',{method:'POST',headers:{'content-type':'application/json'},
-    body:JSON.stringify({name:'toil',passphrase:'hunter2hunter2'})}).then(r=>r.status)`);
+    body:JSON.stringify({name:'admin',passphrase:'hunter2hunter2'})}).then(r=>r.status)`);
   assert.equal(status, 200, 'browser login failed');
 });
 

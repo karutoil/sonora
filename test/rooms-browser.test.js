@@ -145,7 +145,7 @@ const guestTime = (b) => b.eval(`document.getElementById('listen-audio').current
 
 test('two people hear the same second, one with no account at all', { skip: !CHROME && 'chromium not installed' }, async (t) => {
   // ── the host: a real account, the real app ─────────────────────────────
-  const login = await signIn(host, 'toil', 'hunter2hunter2', 'host-browser');
+  const login = await signIn(host, 'admin', 'hunter2hunter2', 'host-browser');
   assert.equal(login.status, 200, 'the host signs in');
   const created = await createRoom(host, {
     visibility: 'public', control: 'everyone', playing: true, positionMs: 5000, queue: QUEUE,
@@ -165,10 +165,10 @@ test('two people hear the same second, one with no account at all', { skip: !CHR
     headphones: !!document.querySelector('[data-action="room"]'),
     errors: window.__errors,
   })`);
-  assert.match(room.title ?? '', /toil/i, 'the room page names the host');
+  assert.match(room.title ?? '', /admin/i, 'the room page names the host');
   assert.match(room.track ?? '', /Alpha Song/, 'and what is playing');
   assert.equal(room.queue, 3, 'and the shared queue');
-  assert.ok(room.roster.includes('toil'), 'the host is in the roster');
+  assert.ok(room.roster.includes('admin'), 'the host is in the roster');
   assert.deepEqual(room.errors, [], 'the room page rendered without errors');
   await host.waitFor(`/Synced|Syncing|Out of sync/.test(document.querySelector('[data-room-sync]')?.textContent ?? '')`, 15_000);
   const badge = await host.eval(`document.querySelector('[data-room-sync]').textContent`);
@@ -288,7 +288,7 @@ test('two people hear the same second, one with no account at all', { skip: !CHR
 
 test('a private room is a wall for strangers and needs no account to listen when public',
   { skip: !CHROME && 'chromium not installed' }, async (t) => {
-    const login = await signIn(host, 'toil', 'hunter2hunter2', 'host-browser');
+    const login = await signIn(host, 'admin', 'hunter2hunter2', 'host-browser');
     assert.equal(login.status, 200);
 
     const priv = await createRoom(host, {
@@ -369,7 +369,7 @@ test('a private room is a wall for strangers and needs no account to listen when
 
 test('a guest gets one tap, a 5% start and a volume control',
   { skip: !CHROME && 'chromium not installed' }, async (t) => {
-    const login = await signIn(host, 'toil', 'hunter2hunter2', 'host-browser');
+    const login = await signIn(host, 'admin', 'hunter2hunter2', 'host-browser');
     assert.equal(login.status, 200);
 
     // A browser as strict as Safari about autoplay (`--autoplay-policy=
@@ -495,7 +495,7 @@ test('a guest gets one tap, a 5% start and a volume control',
 
 test('a room follows what you play, survives a restart and comes back on reload',
   { skip: !CHROME && 'chromium not installed' }, async (t) => {
-    const login = await signIn(host, 'toil', 'hunter2hunter2', 'host-browser');
+    const login = await signIn(host, 'admin', 'hunter2hunter2', 'host-browser');
     assert.equal(login.status, 200);
 
     // A real playlist, made through the API the UI uses, so the test can press
@@ -603,7 +603,7 @@ test('a room follows what you play, survives a restart and comes back on reload'
 // private (or whose guest cookie expired) used to spin 'Reconnecting…' forever.
 test('a guest on the polling fallback reaches a terminal state when the room closes',
   { skip: !CHROME && 'chromium not installed' }, async (t) => {
-    const login = await signIn(host, 'toil', 'hunter2hunter2', 'host-browser');
+    const login = await signIn(host, 'admin', 'hunter2hunter2', 'host-browser');
     assert.equal(login.status, 200);
 
     // The server refuses to establish the guest's stream at all: the
@@ -715,7 +715,7 @@ test('a guest on the polling fallback reaches a terminal state when the room clo
 // and in test/rooms.test.js; what is under test here is the client's.
 test('the sync engine survives refused commands, dead streams and stale events',
   { skip: !CHROME && 'chromium not installed' }, async (t) => {
-    const login = await signIn(host, 'toil', 'hunter2hunter2', 'host-browser');
+    const login = await signIn(host, 'admin', 'hunter2hunter2', 'host-browser');
     assert.equal(login.status, 200);
     const room = await createRoom(host, {
       visibility: 'public', control: 'everyone', playing: true, positionMs: 3000, queue: [QUEUE[0]],

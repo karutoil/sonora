@@ -111,7 +111,7 @@ before(async () => {
 
   const res = await fetch(`${BASE}/api/auth/login`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+    body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
   });
   cookie = res.headers.getSetCookie()[0].split(';')[0];
 });
@@ -385,7 +385,7 @@ test('listening to a second room does not revoke the first room’s guest', asyn
   const member = new CookieJar();
   const login = await fetch(`${BASE}/api/auth/login`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+    body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
   });
   member.absorb(login);
 
@@ -428,7 +428,7 @@ test('a guest cookie for another room does not authorise this room’s audio', a
   const member = new CookieJar();
   const login = await fetch(`${BASE}/api/auth/login`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+    body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
   });
   member.absorb(login);
   const room = await openRoom(member, GUEST_VIDEO, 'Room C');
@@ -894,7 +894,7 @@ test('the artwork cache evicts by total bytes without clearing every recent entr
   await withArtFixture(async (base, upstreamPort) => {
     const login = await fetch(`${base}/api/auth/login`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+      body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
     });
     assert.equal(login.status, 200);
     const auth = login.headers.getSetCookie()[0].split(';')[0];

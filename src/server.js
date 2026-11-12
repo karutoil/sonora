@@ -4275,7 +4275,7 @@ app.delete('/api/youtube/cookies', async (req, reply) => {
 const USERNAME = /^[A-Za-z0-9._-]{1,40}$/;
 // Six characters was the whole policy, and the passphrase is the only factor on
 // an instance whose login name is a known constant (SONORA_USER defaults to
-// `toil`). Twelve is the shortest length that makes an offline dictionary pass
+// `admin`). Twelve is the shortest length that makes an offline dictionary pass
 // on the stored scrypt hash impractical rather than trivial, and the scrypt cost
 // is not the defence here: nothing rate-limits a copy of the database file.
 const MIN_PASSWORD = 12;

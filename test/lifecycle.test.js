@@ -140,7 +140,7 @@ async function runFixture() {
     // would itself start reconciliation, which belongs to a different test.
     const database = await import('../src/db.js');
     database.bootstrapUser();
-    const admin = database.findUser('toil');
+    const admin = database.findUser('admin');
     database.createUser('lifecycle-listener', PASS);
     const listener = database.findUser('lifecycle-listener');
     for (const user of [admin, listener]) {
@@ -171,7 +171,7 @@ async function request(server, route, {
   };
 }
 
-async function login(server, name = 'toil') {
+async function login(server, name = 'admin') {
   const res = await request(server, '/api/auth/login', {
     method: 'POST', body: { name, passphrase: PASS },
   });

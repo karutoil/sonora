@@ -64,7 +64,7 @@ async function req(path, { jar = null, body, method = 'GET', headers = {} } = {}
 }
 
 const login = (jar, body) => req('/api/auth/login', {
-  jar, method: 'POST', body: { name: 'toil', passphrase: 'hunter2hunter2', ...body },
+  jar, method: 'POST', body: { name: 'admin', passphrase: 'hunter2hunter2', ...body },
 });
 
 function storedChallenge(id) {
@@ -411,7 +411,7 @@ test('passkey registration issues a single-use challenge', async () => {
 });
 
 test('passkey login options do not reveal whether an account exists', async () => {
-  const known = await req('/api/auth/passkey/login/options', { method: 'POST', body: { name: 'toil' } });
+  const known = await req('/api/auth/passkey/login/options', { method: 'POST', body: { name: 'admin' } });
   const unknown = await req('/api/auth/passkey/login/options', { method: 'POST', body: { name: 'nobody-here' } });
   assert.equal(known.status, 200);
   assert.equal(unknown.status, 200);
@@ -680,7 +680,7 @@ test('case-variant account names have independent failure lockouts', async () =>
     const admin = new Jar();
     const signedIn = await fixtureReq(fixture, '/api/auth/login', {
       jar: admin, method: 'POST',
-      body: { name: 'toil', passphrase: 'hunter2hunter2', deviceId: 'case-admin' },
+      body: { name: 'admin', passphrase: 'hunter2hunter2', deviceId: 'case-admin' },
     });
     assert.equal(signedIn.status, 200);
     const created = await fixtureReq(fixture, '/api/admin/users', {
@@ -691,12 +691,12 @@ test('case-variant account names have independent failure lockouts', async () =>
 
     for (let attempt = 0; attempt < 5; attempt += 1) {
       const wrong = await fixtureReq(fixture, '/api/auth/login', {
-        method: 'POST', body: { name: 'toil', passphrase: 'wrong passphrase' },
+        method: 'POST', body: { name: 'admin', passphrase: 'wrong passphrase' },
       });
       assert.equal(wrong.status, 401);
     }
     const locked = await fixtureReq(fixture, '/api/auth/login', {
-      method: 'POST', body: { name: 'toil', passphrase: 'hunter2hunter2' },
+      method: 'POST', body: { name: 'admin', passphrase: 'hunter2hunter2' },
     });
     assert.equal(locked.status, 429);
     assert.ok(Number(locked.res.headers.get('retry-after')) > 0);
@@ -706,14 +706,14 @@ test('case-variant account names have independent failure lockouts', async () =>
       jar: variant, method: 'POST',
       body: { name: 'TOIL', passphrase: 'correct-horse-passphrase', deviceId: 'case-variant' },
     });
-    assert.equal(otherAccount.status, 200, 'the distinct SQLite account must not inherit toil’s lock');
+    assert.equal(otherAccount.status, 200, 'the distinct SQLite account must not inherit admin’s lock');
     assert.equal(otherAccount.body.user.name, 'TOIL');
     assert.equal((await fixtureReq(fixture, '/api/me', { jar: variant })).status, 200);
 
     const stillLocked = await fixtureReq(fixture, '/api/auth/login', {
-      method: 'POST', body: { name: 'toil', passphrase: 'hunter2hunter2' },
+      method: 'POST', body: { name: 'admin', passphrase: 'hunter2hunter2' },
     });
-    assert.equal(stillLocked.status, 429, 'the variant’s success must not clear toil’s failure history');
+    assert.equal(stillLocked.status, 429, 'the variant’s success must not clear admin’s failure history');
   } finally {
     fixture.stop();
   }
@@ -728,7 +728,7 @@ test('a replay inside the rotation grace window rotates instead of killing the d
     const jar = new Jar();
     const loginRes = await fixtureReq(fixture, '/api/auth/login', {
       method: 'POST', jar,
-      body: { name: 'toil', passphrase: 'hunter2hunter2', remember: true, deviceId: 'two-tabs', deviceName: 'Two tabs' },
+      body: { name: 'admin', passphrase: 'hunter2hunter2', remember: true, deviceId: 'two-tabs', deviceName: 'Two tabs' },
     });
     assert.equal(loginRes.status, 200);
     const first = jar.get('sonora_refresh');
@@ -802,7 +802,7 @@ test('a blank RP ID/origin is treated as unset, and zeroed lifetimes are clamped
     const login = await fixtureReq(fixture, '/api/auth/login', {
       method: 'POST', jar,
       headers: { 'x-forwarded-host': `localhost:${fixture.port}`, 'x-forwarded-proto': 'https' },
-      body: { name: 'toil', passphrase: 'hunter2hunter2', remember: true, deviceId: 'clamp-browser' },
+      body: { name: 'admin', passphrase: 'hunter2hunter2', remember: true, deviceId: 'clamp-browser' },
     });
     assert.equal(login.status, 200);
     assert.equal((await fixtureReq(fixture, '/api/me', { jar })).status, 200);
@@ -825,7 +825,7 @@ test('a Secure cookie is decided per request, so LAN sign-in over plain HTTP wor
     const login = await fetch(`${fixture.base}/api/auth/login`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...lan },
-      body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+      body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
     });
     assert.equal(login.status, 200);
     const session = login.headers.getSetCookie().find((c) => c.startsWith('sonora_session='));

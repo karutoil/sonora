@@ -135,7 +135,7 @@ before(async () => {
     try {
       const health = await request('/api/health');
       if (health.status === 200 && health.body.pid === proc.pid) {
-        adminCookie = await login('toil');
+        adminCookie = await login('admin');
         const me = await request('/api/me', { cookie: adminCookie });
         adminId = me.body.user.id;
         return;

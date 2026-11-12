@@ -171,7 +171,7 @@ test('the bootstrap account is an admin on a brand-new database', () => {
     db.bootstrapUser();
     console.log('@@' + JSON.stringify(db.listUsersWithStats().map((u) => [u.name, u.role])));
   `, { SONORA_PASSPHRASE: 'hunter2hunter2' });
-  assert.deepEqual(JSON.parse(out), [['toil', 'admin']]);
+  assert.deepEqual(JSON.parse(out), [['admin', 'admin']]);
 });
 
 // ── the migration mechanism ─────────────────────────────────────────────

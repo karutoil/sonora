@@ -106,7 +106,7 @@ test('on the sign-in screen every sprite icon is scaled into its box', async (t)
 test('every icon in the signed-in app is scaled into its box', async (t) => {
   if (!need(t)) return;
   await browser.eval(`fetch('/api/auth/login',{method:'POST',headers:{'content-type':'application/json'},
-    body:JSON.stringify({name:'toil',passphrase:'hunter2hunter2',remember:true,deviceId:'ic'})}).then(r=>r.status)`);
+    body:JSON.stringify({name:'admin',passphrase:'hunter2hunter2',remember:true,deviceId:'ic'})}).then(r=>r.status)`);
   for (const page of ['home', 'library', 'security', 'admin']) {
     await browser.goto(`${BASE}/#/${page}`);
     await browser.waitFor(`!!document.querySelector('#page-root .page-title, #page-root .sec-card')`, 20_000);
@@ -322,7 +322,7 @@ test('a lone icon sits dead centre in its tile, on both axes', async (t) => {
 test('the signed-in chrome keeps its icons centred too', async (t) => {
   if (!need(t)) return;
   await browser.eval(`fetch('/api/auth/login',{method:'POST',headers:{'content-type':'application/json'},
-    body:JSON.stringify({name:'toil',passphrase:'hunter2hunter2',remember:true,deviceId:'ct'})}).then(r=>r.status)`);
+    body:JSON.stringify({name:'admin',passphrase:'hunter2hunter2',remember:true,deviceId:'ct'})}).then(r=>r.status)`);
   await browser.goto(`${BASE}/#/security`);
   await browser.waitFor(`!!document.querySelector('.sec-row')`, 20_000);
   const boxes = await browser.eval(TILE_PROBE(['.sec-ico', '.icon-btn', '.auth-reveal']));

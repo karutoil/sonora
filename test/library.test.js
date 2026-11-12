@@ -70,7 +70,7 @@ test('library endpoints require auth', async () => {
 
 test('sign in', async () => {
   const { res } = await jfetch('/api/auth/login', {
-    method: 'POST', body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+    method: 'POST', body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
   });
   assert.equal(res.status, 200);
 });
@@ -588,7 +588,7 @@ test('likes and dislikes clamp the source string they persist', async () => {
   const db = new DatabaseSync(`${DB}`, { readOnly: true });
   const playRow = (kind) => db.prepare(
     `SELECT kind, source FROM plays
-     WHERE kind = ? AND user_id = (SELECT id FROM users WHERE name = 'toil')
+     WHERE kind = ? AND user_id = (SELECT id FROM users WHERE name = 'admin')
      ORDER BY rowid DESC LIMIT 1`,
   ).get(kind);
   try {

@@ -6,18 +6,45 @@ so the next change extends the system instead of fighting it.
 ## Structure
 
 ```
-index.html          shell only: icons, sidebar, topbar, rail, page, player, nav, overlays
+index.html          shell only: icons, sidebar, topbar, rail, page, player, nav,
+                    overlays + the --app-h boot script (before any stylesheet)
+offline.html        the branded offline document; carries a byte-identical
+                    --app-h boot script and its own inline stylesheet
 app.css             tokens → reset → typography → shell → player → pages → overlays
                     → motion → responsive → safe areas (must stay last)
-app.js              one module: state, hash router, renderers, playback, interactions
-fonts.css           self-hosted Inter variable (latin + latin-ext only)
-pwa.css / pwa.js    install, update and offline chrome (namespaced .pwa-*)
-rooms.css           Listen Together surfaces (namespaced .room-*)
-rooms.js            the shared-playhead client: clock, drift, commands
+app.js              the app module: state, hash router, renderers, playback,
+                    interactions (it imports the five modules below)
+audio-session.js    iOS audio-session category: claim 'playback' inside the first
+                    gesture, and re-arm it after the page is backgrounded
+playback.js         end-of-track detection for a looping <audio> (WebKit never
+                    fires `ended`): isLoopWrap() + handoffTrack()
+queue-stream.js     the queue as one continuous media stream: planTrackIds,
+                    locate, planOffsetFor, streamSrc — the mapping that survives a
+                    frozen page while the media process keeps playing
+media-session.js    lock-screen / Media Session integration (artSrc, metadata,
+                    position state, seekto, keep-alive)
+rooms.css / rooms.js  Listen Together surfaces (namespaced .room-*) and the
+                    shared-playhead client: clock offset, drift, commands
 listen.js           the no-account listener page for a public room
+listen-venue.js     optional `?view=venue` view of that room (people, projector,
+                    record); lazy-imported by listen.js, never a second player
+notifications.css / notifications.js  the bell: `.notif-*` panel styles, the
+                    poll, the badge, and the OS notification
+pwa.css / pwa.js    install, update and offline chrome (namespaced .pwa-*)
+fonts.css + fonts/  self-hosted Inter variable (latin + latin-ext only)
+icons/ + manifest.webmanifest  install icons (incl. maskable) and PWA metadata
 sw.js               versioned shell precache; network-first for anything executable
-media-session.js    lock-screen / Media Session integration
 ```
+
+`index.html` loads exactly three module scripts — `app.js`, `pwa.js` and
+`notifications.js`. `app.js` statically imports `rooms.js`, `media-session.js`,
+`audio-session.js`, `playback.js` and `queue-stream.js`, so those five are never
+`<script>` tags; `sw.js` precaches the whole graph, because a module missing from
+the shell is a dead offline app (`test/pwa.test.js` asserts every static import
+is in the shell list). The hidden-playback modules have their own suites
+(`test/audio-session.test.js`, `test/queue-stream.test.js`,
+`test/queue-stream-handoff.test.js`), and `docs/pwa-device-audit.md` carries the
+device record behind them.
 
 The app is a single document with a hash router. Every page is a template
 string rendered into `#page-root`; there is no component framework and no build
@@ -26,38 +53,55 @@ cache can hold it.
 
 ## Tokens
 
-Everything visual comes from `:root` in `app.css`:
+Everything visual comes from the tokens in `:root` in `app.css` (a handful of
+one-off literals survive — the selected chip's cream fill, some hero text
+colours — but new work goes through a token):
 
 - **Surfaces** `--bg --bg-deep --side --panel --card --card-2 --card-3`.
   Layered, warm charcoal. Depth comes from a 1px inset highlight
-  (`--inset`) and shadows only on things that actually float.
+  (`--inset`) plus the hairline set `--line --line-2 --line-3`, and shadows
+  (`--shadow-1/2/3`, `--shadow-accent`) only on things that actually float.
 - **Ink** `--white --text-2 --muted --soft` — each is ≥4.5:1 on the surfaces
   it is used on.
+- **Status** `--ok --warn --bad` and their soft fills `--ok-soft --bad-soft`.
 - **Accent** `--accent:#ff997b` (pinned by a test), `--accent-2`,
   `--accent-ink`, `--accent-soft`, `--accent-line`.
-- **Radii** 8 / 12 / 16 / 22 / pill. Do not introduce a new value.
+- **Radii** `--r-xs/sm/md/lg/pill` = 8 / 12 / 16 / 22 / 999px, plus the role
+  aliases `--r-cover --r-cover-lg --r-sheet` which resolve to that scale. Do
+  not introduce a new value.
 - **Motion** `--dur-1/2/3` (140/220/320ms), `--ease-out`, `--ease-spring`.
-  Only `transform` and `opacity` are animated. Everything is disabled under
+  Movement and entrances animate only `transform` and `opacity`. **Known gap:**
+  hover/focus still transitions `background`, `color` and `border-color`
+  (cheap paint, no layout), and the skeleton shimmer moves a gradient rather
+  than a transform. Everything is disabled under
   `prefers-reduced-motion: reduce`.
-- **Chrome metrics** `--topbar-h --player-h --nav-h --gutter`, plus the
-  safe-area insets `--sat --sab --sal --sar`.
+- **Layering** `--z-topbar --z-rail --z-player --z-nav --z-drawer --z-overlay
+  --z-menu --z-toast`.
+- **Chrome metrics** `--topbar-h` (60px) `--player-h` (71px) `--nav-h` (67px)
+  `--gutter` (17px), the layout widths `--side-w --rail-w --chrome-gutter`, plus
+  the safe-area insets `--sat --sab --sal --sar` (declared in the last `:root`,
+  in the safe-areas section).
 
 ## Layout
 
-Base styles are mobile. Breakpoints add, never subtract:
+Base styles are mobile; `min-width` blocks add columns, and a few
+`max-width:650px` blocks trim phone chrome (labels, nav arrows, secondary
+actions):
 
 | width | shell |
 | --- | --- |
 | ≤650 | one column: topbar, scrolling page, mini player, bottom nav |
-| 651–810 | 69px icon rail; full player bar (transport + extras) |
-| 811–1080 | icon rail + now-playing rail |
-| 1081–1310 | 235px sidebar + now-playing rail |
-| ≥1311 | 235px sidebar, wide page, 292px now-playing rail |
+| 651–810 | 69px icon rail (labels hidden); 82px player row, transport + extras |
+| 811–1080 | 214px labelled sidebar, no now-playing rail; three-column player bar |
+| 1081–1310 | 218px sidebar + 264px now-playing rail |
+| 1311–1600 | 235px sidebar + 292px now-playing rail (the pinned desktop shell) |
+| ≥1601 | 253px sidebar, 310px rail, wider gutters |
 
 The document never scrolls; `.main` does. `.app` is padded by the safe-area
 insets, and the player/nav rows grow by `--sab`, so nothing is painted under a
 notch, an island or a home indicator. `test/safe-area.test.js` asserts this in a
-real browser with real insets on three iPhone sizes.
+real browser with real insets on four iPhone sizes (15 Pro, 15 Pro Max, SE and
+SE 1st gen).
 
 ### Installed-app height (`--app-h`)
 
@@ -81,20 +125,53 @@ So the shell height comes from `--app-h`, not from a viewport unit:
 - Full-screen `.overlay` / `.drawer-backdrop` take it too (`inset:0` resolves
   against the same short viewport), so sheets still reach the bottom.
 - `offline.html` carries a byte-identical copy of the script (a test compares
-  them) because it has its own stylesheet.
+  them) because it ships its own inline stylesheet instead of `app.css`.
 
-It refuses the override in Safari (where the browser chrome really does cover
-the difference), while the keyboard is open (a ~350px shortfall), and in a
-resized window such as iPad multitasking.
+It publishes nothing in Safari, where the browser chrome really does own that
+space and `100dvh` is correct; in a standalone app it publishes `100vh` instead
+of `screen.height` when the gap is too big to be a safe-area strip — the
+keyboard (~350px), a resized or split-screen window such as iPad multitasking —
+so the override is never stretched to cover those.
 
 **Self-check.** Because a silent gap is unfixable while a labelled one is not,
 `pwa.js` measures the smaller of `.app` and the root against `screen.height`
 and, if the shell still cannot reach the bottom of an iOS home-screen app,
-raises a dismissible pill reading `Display: 793px of 852px — 59px short`.
+raises a dismissible `pwa-pill[data-kind="chin"]` reading *"This app can't fill
+your screen — reopening it usually fixes it."* The measurement is not the
+sentence: it goes on the pill's `title` and to `console.debug` as
+`Display: 793px of 852px — 59px short`, where a bug report can find it.
 
 `test/ios-chin.test.js` asserts the cold-start geometry, the post-re-measure
-("dock") geometry, all four refusals, and that the self-check fires only when
+("dock") geometry, every refusal, and that the self-check fires only when
 the shell is actually clipped.
+
+## Home: the sleeve
+
+Home is sleeve-first; `docs/sleeve-first-v2.md` is the token-level contract for
+the `.sleeve-*` vocabulary, and this is the behaviour it has to keep.
+
+`homePage()` renders, in order: the greeting head, `homeHero()`, `homeShelf()`,
+`homeStationStrip()`, the playlists grid (`.card-grid`), then one discovery
+feature. The hero is the **real** track from the restored session, not a mock-up:
+`sleeveFeatured()` reads `state.home.featured` / `featuredPos`, the track's own
+cover fills `.sleeve-hero-art` (the brand wash only when the catalogue has no
+art), its title and channel sit on it, and one `play-btn`
+(`data-action="play-featured"`) resumes it. A saved position under five seconds
+renders no "N in" chip. With nothing played on this device the hero is the
+branded `is-empty` fallback offering `Start listening` (`data-action="surprise"`)
+and search — never an invented cover. A session restored from another device
+flips the tag to `UP NEXT · FROM YOUR <DEVICE>` and the button to
+`Continue here`.
+`syncHomeFeatured()` keeps the hero in step with what is actually playing and
+repaints only the hero and the shelf, restoring focus.
+
+`homeShelf()` is "Back in rotation": at most six `.sleeve-tile` /
+`.sleeve-shelf-item` buttons (`data-track`, same play path as any row), with a
+one-line empty state plus `Find music` when nothing has been played here.
+`homeStationStrip()` is the quiet second door — a `.sleeve-station` strip that
+opens the station (`data-page="station"`) and a play button
+(`data-action="play-station"`) beside it. Playlists and discovery stay below
+the fold, where browsing belongs.
 
 ## Artists and albums
 
@@ -125,16 +202,20 @@ the album column of those rows is read from the shelf's own flex columns
 
 ## Interaction contracts
 
-- **Routing.** `#/home`, `#/search`, `#/library`, `#/radio`, `#/admin`,
-  `#/security`,
+- **Routing.** `#/home`, `#/search`, `#/library`, `#/radio`, `#/station`,
+  `#/admin`, `#/security`,
   `#/c/<collection>` (playlist `p3`, album `aMPR…`/`aPL…`, `liked`, `recent`),
   `#/artist/<channel id or name>`,
   `#/mood/<feeling>`, `#/t/<videoId>` (share link), `#/room/<code>` (a Listen
-  Together room). `navigate()` pushes history;
-  `popstate` and the phone's back gesture restore the previous page. A page
-  whose content is *fetched* (collection, artist, mood, security) must also be
-  kicked by `boot()`: rendering the route alone leaves the skeleton up on a cold
-  deep link.
+  Together room); anything else falls back to Discover. `navigate()` pushes
+  history (and a duplicate push for the page already showing is refused);
+  `popstate` and the phone's back gesture restore the previous page and its
+  scroll. A page whose content is *fetched* (collection, artist, mood,
+  security, room, and the `#/t/` share) must also be kicked by `boot()`:
+  rendering the route alone leaves the skeleton up on a cold deep link. The
+  station is the exception with no kick of its own: boot's background
+  `loadStation({ silent: true })` fills both the home strip and the station page,
+  which repaint when the answer lands.
 - **Overlays.** `openOverlay(id, trigger, focusSelector)` stores the trigger,
   moves focus into the dialog, and `closeOverlay` restores focus. Every overlay
   is `role="dialog" aria-modal="true"`, traps Tab, closes on Escape, and plays a
@@ -147,8 +228,11 @@ the album column of those rows is read from the shelf's own flex columns
   its first item, closes on any outside click, and is opened by right-click
   *and* long-press on a track row.
 - **Feedback.** `notify(message, 'success'|'info'|'error')` renders a polite
-  live region. Likes, sorts, shuffle, repeat, volume and the library tab persist
-  in `localStorage` under `sonora.*`.
+  live region (the toast's `data-kind` picks the icon). Shuffle, repeat,
+  volume/mute, the collection sort, recent searches, the library tab, the room
+  code (`sonora.room`), the device id and the client preferences all persist in
+  `localStorage` under `sonora.*` (`store` in `app.js`). Likes and dislikes are
+  server state, not local storage.
 - **Loading.** Anything fetched shows a skeleton (`.sk-hero`, `.sk-grid`,
   `.sk-rows`) or a `.spinner` inside the pressed button — never a bare
   "Loading…" line. Empty lists render `.empty-state` with a next action.
@@ -160,16 +244,19 @@ the album column of those rows is read from the shelf's own flex columns
   in the sheet and the row menu); 651–1080 keeps the title readable instead.
   The now-playing sheet is the full control surface on a phone.
 - **Keyboard.** Space play/pause, ←/→ seek 5s, Alt+←/→ previous/next, `/` or
-  ⌘/Ctrl-K search, `m` mute, `q` queue, Esc closes the topmost layer. Track
-  rows and the player title are real buttons and respond to Enter/Space.
+  ⌘/Ctrl-K search, `m` mute, `q` queue, Esc closes the topmost layer. Track rows
+  are focusable `div[role="row"]` and the player title is a
+  `strong[role="button"]`; both answer Enter/Space through the global keydown
+  handler, which is why they are not `<button>` elements (the row already
+  contains buttons for like, album and the menu).
 - **Install.** Offered at every width: Windows and macOS install PWAs from
   Chromium too (Start-menu / Dock entry, frameless window, offline shell), so
   the offer is not gated on phone widths. Only its shape is: `.pwa-banner`
-  (card) below 1081px, `.pwa-pill[data-kind="install"]` (one line, bottom-right,
-  filled Install) above it, swapped live on resize by `reflowInstall()`. The
-  breakpoint is `DESKTOP_QUERY` in `pwa.js` and mirrors `app.css`'s sidebar one.
-  Both snooze for 14 days on dismiss, and neither asks inside a standalone
-  window.
+  (card) below 1081px, `.pwa-pill[data-kind="install"]` (one line, centred above
+  the player, filled Install action) above it, swapped live on resize by
+  `reflowInstall()`. The breakpoint is `DESKTOP_QUERY` in `pwa.js` and mirrors
+  `app.css`'s sidebar one. Both snooze for 14 days on dismiss, and neither asks
+  inside a standalone window.
 
 ## Sign-in and account security
 
@@ -405,10 +492,13 @@ the server is the source of truth.
   server-supplied `url` on each row — a route is never built on the client.
 - Desktop/PWA alerts go through the service worker
   (`registration.showNotification`) so they survive a backgrounded tab, with
-  `new Notification(...)` as the fallback. `sw.js`'s `notificationclick`
-  focuses an open window and posts the route to it (a bare `#/…` would open a
-  blank page), or opens the resolved URL. The highest seen row id is stored
-  under `sonora.notifSeen`, and the first run only records a baseline.
+  `new Notification(...)` as the fallback. `sw.js`'s `notificationclick` posts
+  the route to an open app window and focuses it (a bare `#/…` would open a
+  blank page), or opens the resolved URL. The highest seen row id is stored per
+  account under `sonora.notifSeen:<accountId>` — there is deliberately no shared
+  fallback key, because a `/api/me` timeout once let one account's watermark
+  suppress another's alerts; with no known account nothing is announced or
+  written. The first run for an account only records a baseline.
 
 ## Tests that pin this document
 
@@ -417,8 +507,8 @@ the server is the source of truth.
   fills the screen, and the override stays off in Safari, with the keyboard
   open, and in a resized window.
 - `test/ux.test.js` — overflow, touch targets, focus trap/restore, ARIA,
-  reduced motion, skeletons, deep links, no native dialogs, artist pages and
-  album opening (H2a–H2c).
+  reduced motion, skeletons, route/back navigation and scroll restore (J, Q, R),
+  no native dialogs, artist pages and album opening (H2a–H2c).
 - `test/flows.test.js` — create playlist, add/remove, optimistic likes, sort
   persistence, mobile hero layout, offline boot, share links.
 - `test/pwa.test.js` — manifest/icons, service worker strategies, offline
@@ -444,6 +534,10 @@ the server is the source of truth.
   played history, the up-next card, the room facts, a host command repainting
   the queue in place (no reload), the phone's stacked layout and scroll-away
   strip, and the ended room staying readable.
+- `test/listen-venue.test.js` — the opt-in venue view: lazy (costs nothing until
+  asked), a view rather than a second player, the real people and queue, no
+  chat, remembered across visits, and a blocked-autoplay guest still able to
+  start the room from it.
 - `test/rooms-idle.test.js` — housekeeping never prunes a room someone is
   listening to.
 - `test/queue.test.js` — the drawer lists the queue with a grip, a real pointer
@@ -469,7 +563,10 @@ the server is the source of truth.
   over HTTP including the per-user throttle.
 
 Run everything with `npm test` (Chromium is required for the browser suites;
-set `CHROME_BIN` if it is not on `PATH`). The suites run serially on purpose:
-each one launches its own headless Chromium and its own server, and running
-them in parallel makes the real-browser geometry assertions flaky under CPU
-contention. `npm run test:parallel` exists for a fast smoke run, not for CI.
+set `CHROME_BIN` if it is not on `PATH`). Each suite launches its own headless
+Chromium and its own server, so `npm test` runs the files with
+`--test-concurrency=8`; CI instead runs two gated selections — the offline `unit`
+job and the `browser` job — each with `--test-concurrency=1` (the runner has two
+cores, so parallel real-browser geometry assertions fight over CPU and `/tmp`
+profiles); the live-YouTube suites run in neither job. `npm run test:serial` is
+the local equivalent of the CI shape when a geometry test flakes.

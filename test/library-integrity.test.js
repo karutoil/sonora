@@ -72,7 +72,7 @@ before(async () => {
     await new Promise((resolve) => setTimeout(resolve, 100));
     if (i === 119) throw new Error(`server did not start:\n${logs.join('')}`);
   }
-  await owner.login('toil', 'hunter2hunter2');
+  await owner.login('admin', 'hunter2hunter2');
   const created = await owner.request('/api/admin/users', {
     method: 'POST',
     body: { name: 'other', passphrase: 'other-password-123', role: 'user' },
@@ -307,7 +307,7 @@ test('repeated absolute likes and dislikes do not duplicate taste evidence', asy
     const db = new DatabaseSync(DB, { readOnly: true });
     const row = db.prepare(`
       SELECT COUNT(*) AS n FROM plays p JOIN users u ON u.id = p.user_id
-      WHERE u.name = 'toil' AND p.video_id = ? AND p.kind = ?
+      WHERE u.name = 'admin' AND p.video_id = ? AND p.kind = ?
     `).get(videoId, kind);
     db.close();
     assert.equal(row.n, 1, `${route}: three identical requests must be one evidence transition`);

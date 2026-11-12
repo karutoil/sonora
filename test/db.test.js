@@ -11,7 +11,7 @@ const db = await import('../src/db.js');
 
 test('bootstrap user is created and verifies', () => {
   db.bootstrapUser();
-  const u = db.findUser('toil');
+  const u = db.findUser('admin');
   assert.ok(u, 'bootstrap user exists');
   assert.equal(db.verifyPassword(u, 'hunter2hunter2'), true);
   assert.equal(db.verifyPassword(u, 'wrong'), false);
@@ -73,7 +73,7 @@ test('expired session is rejected', () => {
 });
 
 test('plays and likes are recorded per user', () => {
-  const u = db.findUser('toil');
+  const u = db.findUser('admin');
   db.recordPlay({ userId: u.id, videoId: 'dQw4w9WgXcQ', kind: 'start', source: 'search' });
   db.recordPlay({ userId: u.id, videoId: 'dQw4w9WgXcQ', kind: 'complete' });
   db.toggleLike(u.id, 'dQw4w9WgXcQ', true);
@@ -94,7 +94,7 @@ test('plays and likes are recorded per user', () => {
 });
 
 test('a second user does not see the first user\'s likes', () => {
-  const a = db.findUser('toil');
+  const a = db.findUser('admin');
   const b = db.createUser('someone-else', 'pw');
   db.toggleLike(a.id, 'aaaaaaaaaaa', true);
   assert.equal(db.listLikes(b.id).length, 0, 'likes are scoped by user_id');

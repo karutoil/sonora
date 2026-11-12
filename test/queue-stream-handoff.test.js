@@ -124,7 +124,7 @@ before(async () => {
   await browser.goto(`${server.base}/`);
   const status = await browser.eval(`fetch('/api/auth/login', { method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }) }).then((r) => r.status)`);
+    body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }) }).then((r) => r.status)`);
   assert.equal(status, 200);
   // Park the app before seeding so its visibility save cannot overwrite the
   // fixture while the next document is starting.

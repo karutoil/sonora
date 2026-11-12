@@ -42,7 +42,7 @@ const track = (over) => ({
 // ── naming ──────────────────────────────────────────────────────────────
 
 test('the station is named after its owner', () => {
-  assert.equal(stationName('toil'), "toil's station");
+  assert.equal(stationName('admin'), "admin's station");
   assert.equal(stationName('  Ada  '), "Ada's station");
   // No name is not a reason to show "undefined's station".
   assert.equal(stationName(''), 'Your station');
@@ -511,7 +511,7 @@ test('a non-finite station cursor is clamped instead of answering 500', async ()
     const login = await fetch(`${base}/api/auth/login`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+      body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
     });
     assert.equal(login.status, 200);
     const cookie = login.headers.getSetCookie()[0].split(';')[0];

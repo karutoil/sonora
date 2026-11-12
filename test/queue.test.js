@@ -40,7 +40,7 @@ async function loginCookie() {
   const res = await fetch(`${BASE}/api/auth/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+    body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
   });
   const raw = res.headers.getSetCookie?.()[0] ?? res.headers.get('set-cookie') ?? '';
   if (!raw) throw new Error(`login returned no session cookie (${res.status})`);
@@ -154,8 +154,8 @@ before(async () => {
   await browser.goto(`${BASE}/`);
   const status = await browser.eval(`fetch('/api/auth/login', { method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }) }).then((r) => r.status)`);
-  assert.equal(status, 200, 'browser login with toil/hunter2hunter2 failed');
+    body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }) }).then((r) => r.status)`);
+  assert.equal(status, 200, 'browser login with admin/hunter2hunter2 failed');
   await browser.goto(`${BASE}/`);
   await browser.waitFor(`!!document.querySelector('#mobile-nav button')`, 20_000);
 });

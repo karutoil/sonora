@@ -100,7 +100,7 @@ test.before(async () => {
   await browser.goto(`${BASE}/`);
   const status = await browser.eval(`fetch('/api/auth/login', { method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'toil', passphrase: ${JSON.stringify(PASS)} }) }).then((r) => r.status)`);
+    body: JSON.stringify({ name: 'admin', passphrase: ${JSON.stringify(PASS)} }) }).then((r) => r.status)`);
   assert.equal(status, 200, 'browser login failed');
   await browser.goto(`${BASE}/`);
   await browser.waitFor(`!!document.querySelector('#mobile-nav button')`, 20_000);

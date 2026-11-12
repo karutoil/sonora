@@ -326,6 +326,10 @@ test('the stream is a live HLS session: playlist first, then real segments', asy
   const foreignSeg = await fetch(`${server.base}/api/queue-stream/not-a-token/seg/0.ts`, { headers: { cookie } });
   assert.equal(foreignSeg.status, 404);
   assert.equal(foreignSeg.status, 404);
+  // The session holds an ffmpeg slot until the 120 s idle sweeper reaps it;
+  // later tests open their own and the per-user cap counts them, so end this
+  // one the way the app does when it leaves the stream.
+  await fetch(`${server.base}/api/queue-stream/${token}/live.m3u8`, { method: 'DELETE', headers: { cookie } });
 });
 
 test('a seek repositions the window; polls ride what the listener consumed', async (t) => {
@@ -365,6 +369,44 @@ test('a seek repositions the window; polls ride what the listener consumed', asy
   await fetch(`${server.base}/api/queue-stream/${token}/live.m3u8`, { method: 'DELETE', headers: { cookie } });
 });
 
+test('the per-user stream cap answers BUSY instead of stacking muxers', async (t) => {
+  if (!HAS_FFMPEG) return t.skip('no ffmpeg available');
+  // MAX_STREAMS_PER_USER is 4: a client that leaves and re-enters with fresh
+  // plans (health-check reverts, seek fallbacks) used to stack ffmpeg sessions
+  // until the 120 s idle sweeper caught up. The cap was declared but never
+  // wired; the 429/BUSY branch it feeds was unreachable.
+  // Earlier tests may hold slots (their cleanup is best-effort), so open
+  // until the cap answers, then prove the refusal and the release.
+  const tokens = [];
+  let refusal = null;
+  for (let i = 0; i < 5 && !refusal; i++) {
+    const { token } = await (await plan(['qqq00000001'])).json();
+    const res = await fetch(`${server.base}/api/queue-stream/${token}/live.m3u8?at=0`, { headers: { cookie } });
+    if (res.status === 429) refusal = { res, token };
+    else {
+      assert.equal(res.status, 200, `opening stream ${i + 1} failed`);
+      tokens.push(token);
+    }
+  }
+  assert.ok(refusal, 'the per-user cap never answered within five opens');
+  assert.equal(refusal.res.status, 429, 'the cap refused with something other than 429');
+  assert.equal((await refusal.res.json()).code, 'BUSY');
+
+  // Ending one session frees the slot for the next.
+  const released = tokens.shift();
+  await fetch(`${server.base}/api/queue-stream/${released}/live.m3u8`, { method: 'DELETE', headers: { cookie } });
+  const { token: retry } = await (await plan(['qqq00000001'])).json();
+  const afterDelete = await fetch(`${server.base}/api/queue-stream/${retry}/live.m3u8?at=0`, { headers: { cookie } });
+  assert.equal(afterDelete.status, 200, 'a freed slot was not reusable');
+  tokens.push(retry);
+
+  // Cleanup: the remaining sessions would otherwise hold muxers until the
+  // idle sweeper reaps them.
+  for (const token of tokens) {
+    await fetch(`${server.base}/api/queue-stream/${token}/live.m3u8`, { method: 'DELETE', headers: { cookie } });
+  }
+});
+
 test('a client report needs a session and stays bounded', async () => {
   const post = (body, opts = {}) => fetch(`${server.base}/api/client-report`, {
     method: 'POST',
@@ -391,6 +433,9 @@ test('a stream belongs to the listener who planned it', async () => {
   const head = await fetch(`${server.base}/api/queue-stream/${token}/live.m3u8`, { method: 'HEAD', headers: { cookie } });
   assert.equal(head.status, 200);
   assert.equal(head.headers.get('content-type'), 'application/vnd.apple.mpegurl');
+  // The HEAD open holds an ffmpeg slot like any other; release it so the
+  // per-user cap in later tests starts from this test's own zero.
+  await fetch(`${server.base}/api/queue-stream/${token}/live.m3u8`, { method: 'DELETE', headers: { cookie } });
 });
 
 test('DELETE ends a session so a skipper cannot stack them', async (t) => {

@@ -154,7 +154,7 @@ async function loginAndOpen(viewport) {
   await browser.iphone(viewport);
   await browser.goto(`${BASE}/`);
   await browser.eval(`fetch('/api/auth/login',{method:'POST',headers:{'content-type':'application/json'},
-    body:JSON.stringify({name:'toil',passphrase:'hunter2hunter2'})}).then(r=>r.status)`);
+    body:JSON.stringify({name:'admin',passphrase:'hunter2hunter2'})}).then(r=>r.status)`);
   await browser.goto(`${BASE}/`);
   await browser.iphone(viewport);
   await browser.waitFor(`!!document.querySelector('.mobile-nav button')`);

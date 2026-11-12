@@ -57,7 +57,7 @@ async function request(base, route, { cookie = '', body, method = 'GET', headers
   return { res, body: type.includes('json') ? await res.json() : await res.text() };
 }
 
-async function login(base, name = 'toil') {
+async function login(base, name = 'admin') {
   const response = await request(base, '/api/auth/login', {
     method: 'POST', body: { name, passphrase: PASS },
   });

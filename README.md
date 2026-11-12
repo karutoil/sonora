@@ -8,7 +8,7 @@
 Search, endless radio, likes, playlists, an installable offline PWA, and shared listening rooms —
 with your own account, your own database, and no algorithm you cannot see.
 
-[![Node](https://img.shields.io/badge/node-%E2%89%A522.5-3c873a?logo=node.js&logoColor=white)](https://nodejs.org)
+[![Node](https://img.shields.io/badge/node-%E2%89%A522.13-3c873a?logo=node.js&logoColor=white)](https://nodejs.org)
 [![Container](https://img.shields.io/badge/container-podman%20%7C%20docker-892ca0?logo=docker&logoColor=white)](#quick-start)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
 [![PWA](https://img.shields.io/badge/PWA-installable-ff997b)](#features)
@@ -18,10 +18,10 @@ with your own account, your own database, and no algorithm you cannot see.
 
 </div>
 
-> **Naming.** The product, npm package, container image and every environment variable are all
-> `sonora` / `SONORA_*`. This repository directory is still named `muse-pwa`, and two paths on an
-> existing install (`data/muse.db`, `~/.local/share/muse-venv`) are detected for compatibility.
-> See [Migrating from Muse](#migrating-from-muse) if you are upgrading.
+> **Naming.** The product, repository, npm package, container image and every environment variable
+> are all `sonora` / `SONORA_*`. A checkout made before the rename is still named `muse-pwa` on
+> disk, and two paths on an existing install (`data/muse.db`, `~/.local/share/muse-venv`) are
+> detected for compatibility. See [Migrating from Muse](#migrating-from-muse) if you are upgrading.
 
 ---
 
@@ -31,8 +31,9 @@ with your own account, your own database, and no algorithm you cannot see.
 
 - Search songs, albums, artists and playlists in one request, with type tabs that switch over the
   answer already on screen (no refetch).
-- Endless radio and a station that mixes four lanes (familiar, adjacent, discovery, recent) from
-  what you actually play — no external recommendation service.
+- Endless radio and a station that mixes four lanes — the song that seeded it, more from artists
+  you already play, an artist-adjacent pick and something trending in the same lane — from what
+  you actually play. No external recommendation service.
 - A queue you can actually edit: drag or Alt+↑/↓ to reorder (the playing song stays the playing
   song), and “Add to queue” from any track menu next to “Play next”.
 - Likes, dislikes, playlists, listening history and per-track stats.
@@ -54,19 +55,30 @@ with your own account, your own database, and no algorithm you cannot see.
 - Accounts stored locally in SQLite — passphrase plus optional **passkeys**, remembered devices
   with rotating refresh tokens, and per-device revocation.
 - Installable PWA with an offline app shell.
-- Admin panel for users, storage, the YouTube cookie jar and backups.
+- Admin panel — **Overview**, **Users**, **Library**, **Storage** and **System** — for accounts,
+  the shared track library, cache limits, a consistent SQLite backup download and the YouTube
+  cookie jar.
 - No cloud dependency, no build step, no third-party analytics.
 
 ## Quick start
 
-There are two ways to run it. The container is the recommended path: it ships everything `yt-dlp`
-needs (ffmpeg, a JS runtime, the PO-token plugin).
+### One-line install (recommended)
 
-### Option A — container (recommended)
+Install and start sonora with a single command. It detects Docker or Podman, configures a secure `.env` (generating a random secret and admin passphrase), builds the container, and starts the server:
 
 ```bash
-git clone https://github.com/<you>/muse-pwa.git
-cd muse-pwa
+curl -fsSL https://raw.githubusercontent.com/karutoil/sonora/master/install.sh | bash
+```
+
+Once running, open **http://127.0.0.1:8130** and sign in with the username and passphrase printed at the end of the script.
+
+---
+
+### Manual container setup (Option A)
+
+```bash
+git clone https://github.com/karutoil/sonora.git
+cd sonora
 
 cp .env.example .env
 # Edit .env and set the two required values:
@@ -103,7 +115,8 @@ maps container uid 1000 to a subuid that cannot write a directory owned by your 
 > documented command fails with "--userns and --pod cannot be set together". Keep both files
 > together: the override exists for its side effect on the mount, not just its comment.
 
-`./data` holds the SQLite database, the audio cache and the imported YouTube cookie jar. It is
+`./data` holds the SQLite database, the audio cache and the materialised YouTube cookie jar
+(`youtube-cookies.txt`, mode 0600; the encrypted copy lives in the database). It is
 bind-mounted, so the container and a local dev server share the same state — just never run both
 at once (SQLite is the reason).
 
@@ -132,8 +145,10 @@ at once (SQLite is the reason).
 
 ### Option B — local development
 
-Requirements: **Node.js ≥ 22.5** (the app uses the built-in `node:sqlite`), **yt-dlp**, and
-**ffmpeg**. A JS runtime for `yt-dlp` (Deno or Node) is recommended.
+Requirements: **Node.js ≥ 22.13** — the first 22.x release where the built-in **`node:sqlite`**
+runs without a flag (it is still experimental, hence the `--no-warnings` in every npm script; CI
+and the author run the latest 22.x) — plus **yt-dlp** and **ffmpeg**. A JS runtime for `yt-dlp`
+(Deno or Node) is recommended.
 
 ```bash
 npm ci
@@ -148,6 +163,7 @@ Useful scripts:
 | --- | --- |
 | `npm start` | Run the server (data in `./data`) |
 | `npm run dev` | Same, with `--watch` |
+| `npm run lint` | Parse every file in `src/`, `public/` and `scripts/` (`node --check`); no dependencies, no config |
 | `npm test` | Full suite, 8 files at a time (needs network + a browser — see [Testing](#testing)) |
 | `npm run test:serial` | Same suite one file at a time — for bisecting a flake |
 | `npm run admin -- list` | List accounts, roles and status |
@@ -174,7 +190,7 @@ first account. Every other variable is optional.** The **Need** column says whic
 | --- | --- | --- | --- |
 | `SONORA_SECRET` | **Required** in a container; optional in dev | random per process | Signs session cookies **and** derives the AES key for an imported YouTube cookie jar. Set it explicitly in production. |
 | `SONORA_PASSPHRASE` | **First run** | — | Passphrase for the bootstrap account. Only used while the users table is empty. |
-| `SONORA_USER` | Optional | `toil` (`admin` in `.env.example`) | Name of the bootstrap account. Set this explicitly for a new instance. |
+| `SONORA_USER` | Optional | `admin` | Name of the bootstrap account. Set this explicitly if you want another name. |
 | `PORT` | Optional | `8130` | HTTP port. |
 | `HOST` | Optional | `127.0.0.1` | Bind address. Containers set `0.0.0.0`. |
 | `SONORA_BIND` | Optional | `127.0.0.1` | Host address the compose file publishes on. Use `0.0.0.0` for LAN access. |
@@ -183,12 +199,15 @@ first account. Every other variable is optional.** The **Need** column says whic
 
 | Variable | Need | Default | Purpose |
 | --- | --- | --- | --- |
-| `SONORA_DB` | Optional | `./data/sonora.db` | SQLite database path. |
+| `SONORA_DB` | Optional | `./data/sonora.db` | SQLite database path. An existing `./data/muse.db` is used instead (see [Migrating from Muse](#migrating-from-muse)). |
 | `SONORA_AUDIO_DIR` | Optional | `./data/audio` | Downloaded-audio cache directory. |
 | `SONORA_CACHE_MB` | Optional | `8192` | Cache ceiling in MB. |
 | `SONORA_MAX_DOWNLOADS` | Optional | `4` | Concurrent `yt-dlp` downloads. |
 | `SONORA_DOWNLOAD_TIMEOUT_MS` | Optional | `120000` | Download safety ceiling. |
-| `SONORA_LOG_LEVEL` | Optional | `info` | Fastify log level (`warn` is quieter). |
+| `SONORA_DOWNLOAD_QUEUE_TIMEOUT_MS` | Optional | `20000` | How long a track request waits for a free download slot before the server answers "busy" so the player moves on. |
+| `SONORA_QUEUE_COVER_MS` | Optional | `86400000` (24 h) | How far ahead one hidden-playback queue stream is written before it stops repeating the plan. Lowering it bounds how long a locked phone can keep playing without the page running. |
+| `SONORA_LOG_LEVEL` | Optional | `info` | Fastify log level (`fatal`, `error`, `warn`, `info`, `debug`, `trace`; `warn` is quieter). |
+| `FFMPEG_BIN` / `FFPROBE_BIN` | Optional | autodetected on `PATH` | `ffmpeg` and `ffprobe`, used to cut the hidden queue stream's segments. The image installs both; set these only when they live outside `PATH`. |
 
 ### Sessions, auth and rooms
 
@@ -196,10 +215,11 @@ first account. Every other variable is optional.** The **Need** column says whic
 | --- | --- | --- | --- |
 | `SONORA_SESSION_MINUTES` | Optional | `720` | Access-token lifetime. Remembered devices renew silently. |
 | `SONORA_REFRESH_DAYS` | Optional | `30` | Lifetime of a "remember this device" refresh token. |
-| `SONORA_SESSION_DAYS` | Optional | `90` | Legacy alias, kept so older deployments keep working. |
+| `SONORA_SESSION_DAYS` | Optional | `90` | Legacy alias for `SONORA_REFRESH_DAYS` (read only when that is unset), kept so older deployments keep working. The admin panel still shows it as "Session days". |
+| `SONORA_REFRESH_GRACE_MS` | Optional | `30000` | Grace window for refresh-token rotation. Two tabs presenting the same token inside it rotate its successor forward instead of signing the device out; outside it a replay is treated as theft and revokes the device. `0` means strict (any replay revokes). |
 | `SONORA_LOGIN_RATE_MAX` | Optional | `10` | Sign-in attempts per window, per client. |
 | `SONORA_LOGIN_RATE_WINDOW` | Optional | `1 minute` | Rate-limit window. |
-| `SONORA_TRUST_PROXY` | Conditional | `0` | Number of trusted proxy hops. Set `1` only when one known tunnel/proxy is in front (needed for correct client IPs). |
+| `SONORA_TRUST_PROXY` | Conditional | `0` | Which peers may supply `X-Forwarded-*`. `0` (or unset) trusts nobody; `1` is only an alias for `loopback`; anything else is a comma-separated list of proxy IPs/CIDRs (e.g. `10.89.1.0/24`). Hop counts above 1 and `true` are rejected at boot. |
 | `SONORA_SECURE_COOKIES` | Conditional | `auto` | `Secure` cookies on HTTPS/localhost. Use `always` or `never` only for a proxy setup whose scheme cannot be detected. |
 | `SONORA_ROOM_HOURS` | Optional | `12` | Idle hours before an empty room is deleted. |
 | `SONORA_ROOM_MAX_MEMBERS` | Optional | `50` | Member cap per room. |
@@ -229,9 +249,11 @@ IPs behind *"Sign in to confirm you're not a bot"*. None is required to run.
 | `SONORA_YTDLP_COOKIES` | Optional | — | Path to a `cookies.txt` for `yt-dlp`. |
 | `SONORA_YT_COOKIE` | Optional | — | Raw `Cookie:` header used by `youtubei.js` for metadata. |
 | `SONORA_POT_PROVIDER` | Optional | `http://127.0.0.1:4416` | `bgutil` PO-token provider endpoint; empty disables it. |
-| `SONORA_JS_RUNTIME` | Optional | autodetected Deno | JS runtime for `yt-dlp` (`node:/usr/local/bin/node`, `deno:/path`). |
+| `SONORA_JS_RUNTIME` | Optional | autodetected `~/.deno/bin/deno`, else unset | JS runtime for `yt-dlp` (`node:/usr/local/bin/node`, `deno:/path`). Empty disables it; `compose.yaml` sets `node:/usr/local/bin/node` explicitly. |
+| `SONORA_YTIMG_HOST` | Optional | `i.ytimg.com` | Host (or full `http(s)://` URL) the id-based artwork proxy fetches covers from. The proxy still serves ids only, and only from YouTube's image domains. |
 | `SONORA_URL_TTL_MS` | Optional | `10800000` (3 h) | Reserved legacy diagnostic setting; no longer changes playback or fetching. |
 | `SONORA_RESOLVE_TIMEOUT_MS` | Optional | `25000` | Metadata request timeout. |
+| `SONORA_UPSTREAM_TIMEOUT_MS` | Optional | `20000` | Reserved: parsed from the environment but not applied by any request path yet. |
 
 ### Container-only (compose)
 
@@ -285,6 +307,7 @@ single-document offline shell practical.
 
 ```bash
 npm ci
+npm run lint      # parse every shipped file; seconds, no dependencies
 npm test          # full suite
 ```
 
@@ -296,8 +319,9 @@ make the full suite slower than the fixture-only checks; timing depends on host 
 conditions.
 
 CI has separate enforcing offline and browser jobs. Its image build/smoke test and both test jobs
-must pass before GHCR publication. The offline job includes mock-backed follows/release tests and
-fixture-only library/station HTTP suites; its seven live follows HTTP cases report explicit skips.
+must pass before GHCR publication. The offline job includes mock-backed follows/release tests, the
+fixture-only library/station HTTP suites and the hidden-playback queue-stream contract; its seven
+live follows HTTP cases report explicit skips.
 Live-YouTube end-to-end, library, search-types, station-endless, lockscreen and real-CDN latency
 checks remain developer-run, not release gates. The shared live-audio download gate may skip only
 an explicit `503` response with code `BOT_GATED`: `BUSY`, `ENOSPC`, timeouts, empty/malformed results,
@@ -324,6 +348,7 @@ SONORA_FOLLOWS_OFFLINE=1 node --no-warnings --test --test-concurrency=1 \
   test/ratelimit.test.js \
   test/playback.test.js \
   test/media-session.test.js \
+  test/queue-stream.test.js \
   test/container.test.js \
   test/proxy.test.js \
   test/youtube.test.js \
@@ -334,20 +359,31 @@ SONORA_FOLLOWS_OFFLINE=1 node --no-warnings --test --test-concurrency=1 \
   test/station-routes.test.js
 ```
 
-The browser job runs the 18 fixture-driven `*.test.js` files listed in
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml); run them explicitly when changing UI code.
+The browser job runs the fixture-driven suites named in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) — including the installed-Android device pass
+(`android-pwa`) and the iOS queue-stream handoff and track-version harnesses — so a regression there
+now fails the release gate; run them locally when changing UI or playback code. It installs `ffmpeg`
+(the stream fixtures) and `dbus` (the MPRIS check) rather than assuming them. Live-YouTube suites are
+the only ones left developer-run.
 
 ## Project layout
 
 ```
 src/            server, routes, database, YouTube client, audio cache, rooms
 public/         the entire client (HTML/CSS/JS, service worker, icons) — no build step
-scripts/        admin CLI, container entrypoint, healthcheck, icon generator
-test/           unit, integration, browser and end-to-end tests
-docs/           design records: UI, UX, auth and rooms
+scripts/        admin CLI, container entrypoint, healthcheck, syntax checker, icon generator
+test/           unit, integration, browser and end-to-end tests (fixtures in test/fixtures/)
+docs/           design records: UI, UX, auth, rooms, the PWA device audit, design studies
+.github/workflows/ci.yml   the offline, browser, image-smoke and GHCR jobs
 Containerfile   production image (Node + yt-dlp + ffmpeg + PO-token plugin)
+install.sh      single-command curl/bash installer
 compose.yaml    hardened single-service stack; publishes 127.0.0.1:8130 and mounts ./data
 compose.podman.yaml  rootless-Podman keep-id override for the ./data bind mount
+.env.example    every environment variable, with explanations (copy to .env)
+package.json    scripts and the seven runtime dependencies; package-lock.json pins them
+PLAN.md         the engineering plan and the measurements behind the design
+LICENSE         MIT
+.gitignore      keeps `.env`, `data/` and any `cookies.txt` out of git (`.dockerignore` mirrors it)
 ```
 
 ## Deployment notes
@@ -383,16 +419,18 @@ The rename was mechanical, but three things live outside the source tree:
 
 Two consequences are expected and one-time: session and passkey cookies were renamed, so every
 **device is signed out once**, and the cookie-jar key salt changed, so a previously imported
-YouTube cookie jar is discarded and must be re-imported (Admin → YouTube). The yt-dlp venv at
-`~/.local/share/muse-venv` continues to be detected, so there is nothing to reinstall.
+YouTube cookie jar is discarded and must be re-imported (Admin → System → *Connect session*). The
+yt-dlp venv at `~/.local/share/muse-venv` continues to be detected, so there is nothing to
+reinstall.
 
 - **Ports and origin.** The dev server and the container both use `8130` on purpose, so bookmarks,
   the installed PWA and a tunnel configuration keep working unchanged.
 - **HTTPS is required for passkeys and service workers.** Put the app behind a TLS proxy or a
   tunnel (the author runs Cloudflare Tunnel). Set `SONORA_RP_ID`, `SONORA_ORIGIN` and
   `SONORA_PUBLIC_URL` to the public origin when the proxy rewrites `Host`.
-- **Persist `./data`.** It contains the database and the audio cache. Back it up through
-  *Admin → Storage → Backup* or by copying the file while the server is stopped.
+- **Persist `./data`.** It contains the database, the audio cache and the materialised cookie jar.
+  Back it up with *Admin → Storage → Download backup* (a consistent `VACUUM INTO` snapshot, safe to
+  take while the server runs) or by copying the files while the server is stopped.
 - **Keep `SONORA_SECRET` stable.** Rotating it invalidates every session and makes the encrypted
   YouTube cookie jar unreadable (you will need to re-import cookies).
 - **Do not run the container and `npm start` against the same `./data` at the same time.**
@@ -403,9 +441,11 @@ YouTube cookie jar is discarded and must be re-imported (Admin → YouTube). The
 ## Security notes
 
 - All state is local. There is no telemetry and no third-party service beyond YouTube itself.
-- Session cookies are `HttpOnly`, signed, and `Secure` on HTTPS/localhost by default (`auto` mode).
-  Refresh tokens rotate on use;
-  replaying an old one revokes the device. Passkeys are optional and revocable per device.
+- Session cookies are `HttpOnly`, `SameSite=Lax`, HMAC-signed and `Secure` on HTTPS/localhost by
+  default (`auto` mode). Refresh tokens rotate on use and a replayed one revokes the device — except
+  inside `SONORA_REFRESH_GRACE_MS` (30 s), where a second tab presenting the same token rotates its
+  successor forward instead of signing the browser out; set it to `0` for strict revocation.
+  Passkeys are optional and revocable per device.
 - The imported YouTube cookie jar is encrypted at rest with a key derived from `SONORA_SECRET` and is
   never sent back to a client.
 - Public listening rooms use a separate, room-scoped guest cookie so "anyone with the link" cannot
@@ -423,6 +463,8 @@ YouTube cookie jar is discarded and must be re-imported (Admin → YouTube). The
 | [`docs/rooms.md`](docs/rooms.md) | Listen Together: database, wire format, sync algorithm, limits |
 | [`docs/sleeve-first-direction.md`](docs/sleeve-first-direction.md) | The sleeve-first visual direction: one real cover as the front door |
 | [`docs/sleeve-first-v2.md`](docs/sleeve-first-v2.md) | The unification pass — the class-name contract shared by `public/app.css` and `public/app.js` |
+| [`docs/ui-concepts.html`](docs/ui-concepts.html) | Three explorable interface directions (open it in a browser) — the study `sleeve-first-direction.md` implements |
+| [`docs/pwa-device-audit.md`](docs/pwa-device-audit.md) | The Android-phone device pass: install, lock screen, background playback, offline, deep links, passkeys and layout — what was verified, with evidence, and what could not be |
 | [`PLAN.md`](PLAN.md) | The engineering plan and the measurements behind the design |
 | [`.env.example`](.env.example) | Every environment variable, with explanations |
 

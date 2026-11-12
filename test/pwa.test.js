@@ -283,6 +283,104 @@ test('service worker is versioned and cleans up old caches', () => {
   assert.match(SW, /keys\.length - RUNTIME_MAX/);
 });
 
+test('the activate sweep deletes only strictly older sonora caches, never a rollback target', () => {
+  // A rolled-back sw.js (older VERSION) used to sweep the *newer* worker's
+  // complete caches away, so a re-deploy had to re-precache everything while
+  // offline users lost the shell. The sweep must compare versions and keep
+  // both unparsable names (not ours to judge) and newer ones.
+  const activate = SW.slice(SW.indexOf("addEventListener('activate'"), SW.indexOf("addEventListener('message'"));
+  assert.match(SW, /const versionOf = \(name\) =>/, 'no version parser: the sweep cannot compare');
+  assert.match(activate, /versionOf\(key\)/, 'activate never calls versionOf');
+  assert.match(activate, /version < THIS_VERSION/, 'the sweep does not require strictly-older');
+  assert.doesNotMatch(
+    activate,
+    /\.filter\(\(key\) => key !== SHELL_CACHE && key !== RUNTIME_CACHE\)\s*\.map\(/,
+    'the sweep still deletes every cache that is not its own',
+  );
+});
+
+test('promoteStagedShell survives a per-key write failure without a silent mixed shell', () => {
+  // One failed live.put used to abort the whole promote: some URLs new, some
+  // old, stale entries never removed, and requiredComplete() still said
+  // "complete" because it only checks URL presence.
+  const promote = SW.slice(SW.indexOf('async function promoteStagedShell'), SW.indexOf('// ── activate'));
+  assert.match(promote, /failed\.push\(key\.url\)/, 'a failed promote key is not collected');
+  assert.match(promote, /if \(failed\.length\)/, 'collecting failures without acting on them');
+  assert.match(promote, /live\.delete\('\/'\)/, 'a mixed shell is not demoted to the offline page');
+  // Promote-then-delete-stale order: the cache is never momentarily empty.
+  assert.ok(
+    promote.indexOf('await live.delete(key)') > -1
+      && promote.indexOf('await live.delete(key)') < promote.indexOf("live.delete('/')"),
+    'the stale-entry sweep must run before the incomplete-shell demotion',
+  );
+});
+
+test('networkFirst matches the exact URL before ignoreSearch, and only without a query', () => {
+  // ignoreSearch answered /app.js?v=2 with the cached /app.js v1 bytes — fine
+  // while no shell URL carries a query, a silent stale-code bug the day one does.
+  const nf = SW.slice(SW.indexOf('async function networkFirst'), SW.indexOf('/**\n * Serve what we have'));
+  assert.ok(
+    nf.indexOf('cacheName: SHELL_CACHE }') > -1 && nf.indexOf('cacheName: SHELL_CACHE }') < nf.indexOf('ignoreSearch: true'),
+    'the exact match is not tried before ignoreSearch',
+  );
+  assert.match(nf, /!new URL\(request\.url\)\.search/, 'ignoreSearch may run for a URL that has a query string');
+});
+
+test('buildId self-fetch is bounded by a timeout', () => {
+  // A TCP-open-no-data stall (exactly what flaky tunnels do) hung the install
+  // event forever: no installed state, no update pill, no error.
+  const buildId = SW.slice(SW.indexOf('function buildId'), SW.indexOf('// What a document needs'));
+  assert.match(buildId, /AbortSignal\.timeout\(\d+\)/, 'buildId fetch has no deadline');
+});
+
+test('a no-store document is never written into the shell', () => {
+  // The comment claimed the guard gated "anything written"; it only gated the
+  // runtime cache. refreshShellDocument wrote whatever the server said.
+  const refresh = SW.slice(SW.indexOf('async function refreshShellDocument'), SW.indexOf('// ── install'));
+  assert.match(refresh, /NO_STORE\.test\(response\.headers\.get\('cache-control'\)/, 'no no-store check before the shell write');
+  assert.ok(
+    refresh.indexOf('NO_STORE.test') < refresh.indexOf('cache.put', refresh.indexOf('NO_STORE.test')),
+    'the no-store check runs after the put',
+  );
+});
+
+test('runtime cache hits refresh their recency, and shell-owned assets update online', () => {
+  // Eviction was FIFO by insertion: a hot share card could be evicted while
+  // stale entries survived. And shell-owned icons/fonts were pinned to
+  // install-time bytes forever, even online.
+  const swr = SW.slice(SW.indexOf('function staleWhileRevalidate'), SW.indexOf('// Which fallback document'));
+  assert.match(swr, /await cache\.put\(request, runtime\.clone\(\)\)/, 'a runtime hit does not re-insert (no LRU bump)');
+  assert.match(swr, /keys\.length - RUNTIME_MAX/);
+  assert.match(
+    swr,
+    /caches\.open\(SHELL_CACHE\)[\s\S]{0,160}shell\.put\(request, response\.clone\(\)\)/,
+    'a revalidated shell-owned icon/font is never written back to the shell',
+  );
+});
+
+test('a notification click that cannot focus a window tries the next one', () => {
+  // focus() failing still posted the route to an invisible client and
+  // returned: the user tapped a release and nothing happened.
+  const click = SW.slice(SW.indexOf("addEventListener('notificationclick'"), SW.indexOf('// ── strategies'));
+  assert.doesNotMatch(click, /await client\.focus\(\)\.catch\(\(\) => \{\}\)/, 'a failed focus is still treated as success');
+  assert.match(click, /focus\(\)[\s\S]{0,80}continue/, 'no fallthrough to the next window/openWindow');
+});
+
+test('listen pages are precached best-effort but never required', () => {
+  // /l/<code> guest rooms had no offline story: a blip left a play button that
+  // does nothing. The scripts are precached; the HTML route stays network-first
+  // (it is server-rendered per room); a missing listen.js must not fail the
+  // app's own install.
+  const list = precacheList();
+  for (const url of ['/listen.js', '/listen-venue.js']) {
+    assert.ok(list.includes(url), `PRECACHE is missing ${url} (guest rooms have no offline story)`);
+  }
+  const required = requiredList();
+  for (const url of ['/listen.js', '/listen-venue.js']) {
+    assert.ok(!required.includes(url), `${url} is required: a missing guest script bricks the app install`);
+  }
+});
+
 test('service worker never caches API responses, streams or non-GET', () => {
   assert.match(SW, /request\.method !== 'GET'\) return/);
   assert.match(SW, /\^\\\/api\\\//);
@@ -1235,7 +1333,7 @@ test('a manifest shortcut lands on the page it names', async (t) => {
   // own throwaway database) so the nav actually renders.
   await browser.eval(`fetch('/api/auth/login', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+    body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
   }).then((response) => response.ok)`);
 
   await browser.goto(`${BASE}/?page=search`);
@@ -1261,7 +1359,7 @@ test('a collection shortcut lands on the collection it names', async (t) => {
   if (!browser) return t.skip('no chromium available; set CHROME_BIN to enable');
   await browser.eval(`fetch('/api/auth/login', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+    body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
   }).then((response) => response.ok)`);
 
   await browser.goto(`${BASE}/?collection=liked`);
@@ -1601,7 +1699,7 @@ test('a shortcut query handed to the running window is honoured without a reload
   // one. The listener here is the fallback for a query that lands by focus.
   await browser.eval(`fetch('/api/auth/login', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+    body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
   }).then((response) => response.ok)`);
   await browser.goto(`${BASE}/`);
   await browser.waitFor(`!!document.querySelector('[data-page="search"]')`, 15_000);

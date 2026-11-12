@@ -8,16 +8,31 @@ verified on this machine.
 Run it with:
 
 ```bash
-npm test                                # the whole suite, this audit included
-node --test test/android-pwa.test.js    # just the device pass (~25 s)
+npm test                                             # the whole suite, this audit included
+node --no-warnings --test test/android-pwa.test.js   # just the device pass (~21 s)
 ```
 
-Verified against this tree: `npm run lint` clean, `npm test` **857 tests, 0 failures**
-(856 pass, 1 upstream-dependent skip) in 145 s, of which `test/android-pwa.test.js` is
-**12/12 passing**.
+Verified in this tree on 2026-11-12 (Node v22.22.2):
+
+```console
+$ node --no-warnings --test test/android-pwa.test.js
+# tests 12
+# pass 12
+# fail 0
+# skipped 0
+# duration_ms 20714.152316
+$ npm run lint
+check-syntax: 26 files parse cleanly (src/, public/, scripts/).
+```
+
+Whole-suite totals are deliberately not quoted here: they move with every commit, and a
+number in a document outlives the run that produced it. The stable claims are that this
+file is **12 checks and all 12 pass** (skipped 0 — the MPRIS check found its D-Bus
+session bus), and that `npm run lint` is clean.
 
 Screenshots from the last run are written to `.tmp/android/` (git-ignored), along with
-`layout.json` (every measured viewport and touch target).
+`layout.json` — every measured viewport, the smallest target found and every target
+under 44 dp.
 
 ---
 
@@ -39,21 +54,24 @@ Sideloading Chrome onto an AOSP image on top of that is not a test, it is an
 archaeology project.
 
 So the phone is reproduced one layer lower, at the layer that decides what the web app
-sees: the renderer. Everything a PWA can observe is genuine, not patched:
+sees: the renderer. Everything a PWA can observe there is what a phone would report; where
+a headless browser can only be *told*, the mechanism is named in the table, and the few
+places that remain a patch rather than a device are called out.
 
 | What a phone gives a PWA | How it is produced here |
 | --- | --- |
 | Android Chrome UA + `navigator.userAgentData` (`platform: Android`, model, `mobile: true`) | `Emulation.setUserAgentOverride` with full user-agent metadata |
 | 412×915 dp at DPR 2.625, five touch points, `pointer: coarse`, `hover: none` | `Emulation.setDeviceMetricsOverride` + `setTouchEmulationEnabled` + `setEmitTouchEventsForMouse` |
 | Status-bar and navigation-bar safe areas (`env(safe-area-inset-*)`) | `Emulation.setSafeAreaInsetsOverride` (24 dp top, 48 dp bottom) |
-| `display-mode: standalone` — an installed app | a real Chromium **app window** (`--app=…`), not a media-query patch. `Emulation.setEmulatedMedia` does *not* reach `display-mode`, so patching it would have proved nothing |
+| `display-mode: standalone` — an installed app | a real Chromium **app window** (`--app=…`), which is the only genuine `display-mode: standalone` a headless box can produce. The device emulation *also* sets the `display-mode` media feature (`test/helpers/android.js`) so the same window can be driven across profiles — so the assertion alone cannot separate the two, and the app window is what makes it real |
 | The screen locking while music plays | a real background tab: the app receives a genuine `visibilitychange` → `hidden` from the browser, which is exactly the state an audible page is left in when a phone screen goes off |
 | Doze / frozen renderer | `Page.setWebLifecycleState('frozen')` |
 | No network | `Network.emulateNetworkConditions({offline:true})` — a real offline flag in the network stack, with the service worker on the real path |
 | The OS media layer the notification is drawn from | **MPRIS over a private D-Bus session.** Chromium publishes the same `media_session` state an Android notification is built from: `PlaybackStatus`, `xesam:title`, `xesam:artist`, `mpris:length`, `mpris:artUrl`, `CanGoNext`… and its `Next`/`Pause`/`Play` calls are delivered back into the page |
 
-The audio is real audio: `test/fixtures/silent-6.m4a` (6 s of AAC, generated with
-`ffmpeg -f lavfi -i anullsrc=r=8000:cl=mono -t 6 -c:a aac -b:a 8k`) copied into the
+The audio is real audio: `test/fixtures/silent-6.m4a` (6 s of AAC, generated the same
+way as the other audio fixtures — `ffmpeg -f lavfi -i anullsrc=r=8000:cl=mono -c:a aac
+-b:a 8k`, see `test/helpers/audio-fixture.js`) copied into the
 server's audio cache, so `<audio>` plays, loops, ends and hands off exactly as it does for
 a listener — no yt-dlp, no YouTube, no network.
 
@@ -68,12 +86,12 @@ The suite runs the Pixel 8 unless a check says otherwise.
 | # | Check | What the evidence is |
 | --- | --- | --- |
 | 1 | The app boots on a phone that reports itself as an Android device | UA `Android 14; Pixel 8`, `coarse`/`hover:none` true, `standalone` true, insets 24/48, and a relaunch stays signed in |
-| 2 | Chromium would install this as an app | `Page.getInstallabilityErrors` → `[]`; manifest parses; `id`/`start_url`/`scope` = `/`, `display: standalone`, 192/512/512-maskable icons, `background_color`, ≥3 shortcuts, `launch_handler: navigate-existing` |
-| 3 | The lock screen gets artwork, metadata, a seek bar and track buttons | `navigator.mediaSession` receives absolute same-origin `/api/img/…` artwork (`320x180`, `image/jpeg`), title/artist/album, in-range position state, and `play`/`pause`/`previoustrack`/`nexttrack`/`seekto` handlers while `seekbackward`/`seekforward` stay null |
+| 2 | Chromium would install this as an app | `Page.getInstallabilityErrors` → `[]`; manifest parses; `id`/`start_url`/`scope` = `/`, `display: standalone`, 192/512/512-maskable icons, `background_color`, ≥3 shortcuts, `launch_handler.client_mode: focus-existing` (a shortcut tap must not reload the running app) |
+| 3 | The lock screen gets artwork, metadata, a seek bar and track buttons | `navigator.mediaSession` receives absolute same-origin `/api/img/…` artwork (`320x180`, and **no declared MIME type** — `/api/img` relays the upstream `content-type`, so a hardcoded one is dropped silently the moment it disagrees with the bytes), title/artist/album, in-range position state, and `play`/`pause`/`previoustrack`/`nexttrack`/`seekto` handlers while `seekbackward`/`seekforward` stay null |
 | 4 | **A song ends and the next one starts while the screen is off** | with the page genuinely `hidden`, the 6 s track wraps, the queue advances to track 2, the element keeps playing, **no `paused` state is ever published to the OS**, the new track is named, and the handlers are re-registered while hidden |
 | 5 | The notification can skip, pause and seek while the app is off screen | `nexttrack`, `pause`, `play` and `seekto` invoked on the published handlers while `hidden` all move the player, and a seek does not skip the track |
 | 6 | Freezing the app does not lose the session | after a renderer freeze/thaw the media session and its buttons survive, and one press resumes the same track (no replay, no double-skip) |
-| 7 | The app fits every phone size Android ships, portrait and landscape | no horizontal overflow, player bar above the bottom nav (412/360/320 dp) and on-screen, sidebar only ≥811 dp, smallest touch target 36 dp (see finding 3) |
+| 7 | The app fits every phone size Android ships, portrait and landscape | no horizontal overflow, player bar above the bottom nav (412/360/320 dp) and on-screen, sidebar only ≥811 dp, smallest measured target 44 dp (see finding 3) |
 | 8 | The shell installs itself, boots with no network, and says what still needs one | active worker + `sonora-shell-*` cache containing `/`, `/app.js`, `/app.css`, `/pwa.js`, `/manifest.webmanifest`; offline cold start renders "You are offline — sonora needs a connection to reach YouTube"; the offline pill admits playback needs a connection; an offline `/t/<id>` deep link gets the branded offline page with a retry |
 | 9 | A home-screen shortcut and a shared link land inside the installed app | `?page=search` → `#/search` with the search field, `?collection=liked` → `#/c/liked`, `/t/<id>` renders the card, and the back gesture stays inside the document |
 | 10 | The operating system receives the session, and its buttons drive the app | MPRIS: `PlaybackStatus: Playing`, title/artist/album, `mpris:length` 6000000 µs, `mpris:artUrl` present (Chromium fetched the artwork itself), `CanGoNext/Previous/Play/Pause/Seek` all true; `Next` advances the queue, `Pause`/`Play` round-trip |
@@ -117,9 +135,10 @@ second test covers `?collection=liked`. Both fail if the bug is reintroduced.
 
 ### 3.2 Offline is the app shell only — there is no offline playback
 
-The service worker deliberately never caches `/api/` or `/stream/`, and the audio cache
-lives on the **server's** disk, so with no network the shell paints an honest
-"You are offline — playback needs a connection". That is coherent, but for a phone app it
+The service worker deliberately never caches `/api/`, `/stream/` or `/audio/`, and the
+audio cache lives on the **server's** disk, so with no network the app paints its own
+offline page ("You are offline — sonora needs a connection to reach YouTube") and the
+offline pill says "You're offline — playback needs a connection." That is coherent, but for a phone app it
 is the largest remaining gap: a listener on a train gets the chrome and nothing to play.
 
 Recommendation, in order of value for effort:
@@ -130,19 +149,29 @@ Recommendation, in order of value for effort:
    client needs its own copy and the SW needs a `/stream/` cache-first branch for
    downloaded ids only.
 2. **Offline queue** — plays/likes taken offline are currently lost. A Background Sync
-   (`SyncManager.requestSync`, already available per the capability probe) that replays
-   them on reconnect would make the app feel finished on a bad connection.
-3. **Quota honesty** — `navigator.storage.persist()` is already requested; it should be
-   verified (`persisted()`) and surfaced somewhere, because evicting the shell is
-   invisible until it happens offline.
+   job (`SyncManager.requestSync`) that replays them on reconnect would make the app
+   feel finished on a bad connection. Nothing in the tree references `SyncManager` or
+   `requestSync` today — there is no capability probe for it to "already pass", so the
+   feature detect is part of the work.
+3. **Quota honesty** — `navigator.storage.persist()` is requested and the grant is now
+   verified with `persisted()` (`public/pwa.js`, around the service-worker
+   registration), but the outcome only reaches `console.debug`: nothing surfaces it in
+   the UI and nothing shows quota, so evicting the shell stays invisible until it
+   happens offline.
 
-### 3.3 Touch targets: the landscape topbar arrows are 36 dp
+### 3.3 Fixed: the landscape topbar arrows were 36 dp, and now measure 44 dp
 
-Measured on every profile (`layout.json`): everything on the bottom nav, player and
-portrait topbar is ≥44 dp, except the two `Go back` / `Go forward` icon buttons that
-appear in the wide (landscape phone / tablet) layout at **36×36 dp**. Android's own
-guidance is 48 dp, WCAG 2.2's enhanced target is 44 dp. Worth 44×44 with the icon
-unchanged.
+`layout.json` from the last run reports the smallest measured target as 44×44 dp and
+`targetsUnder44` as empty: every button on the bottom nav, the player and the topbar
+clears WCAG 2.2's enhanced target, including the two `Go back` / `Go forward` icon
+buttons in the wide (landscape phone / tablet) layout, which are the pair that used to
+be 36 dp. Android's own guidance is still 48 dp, so this clears the accessibility floor
+without yet meeting Google's.
+
+The suite enforces it: `test/android-pwa.test.js` fails any target under **44 dp**
+in every measured profile. The floor used to be 36 dp — the same number the arrows
+measured — so it could not have caught the bug this section records; it now matches
+the app.
 
 ### 3.4 A landscape phone gets the desktop sidebar
 
@@ -216,11 +245,21 @@ the same CDP surface these tests use, so most of §2 can be re-pointed at the ph
 Things worth testing (or adding) beyond the lock-screen question. "Covered" means an
 existing or new test asserts it.
 
+CI runs this audit's own file. `.github/workflows/ci.yml` has two test jobs: the offline `unit`
+job (no browser) and the `browser` job, which runs cdp, passkey, ux, layout, safe-area,
+ios-chin, flows, listen-page, listen-venue, player-artist, track-handoff, audio-session,
+media-session, queue, search-ui, share, notifications, pwa, rooms-browser, android-pwa,
+queue-stream-handoff and track-version. The browser job installs `ffmpeg` and `dbus` so the
+stream fixtures and the private D-Bus session bus the MPRIS check reads are present rather
+than assumed; without the bus that one check skips with a named reason rather than failing.
+`lockscreen` and `latency` need the live network as well as a browser, so both stay
+developer-run — the table below says what is asserted, and which suite it is asserted in.
+
 | Area | State | Notes |
 | --- | --- | --- |
 | Installability gate, manifest fields, maskable icon | covered | §2.2 |
 | Standalone layout at 320–915 dp, landscape, safe areas | covered | §2.7 |
-| Service worker install/activate/precache, update offer, no mid-track swap | covered | `test/pwa.test.js` (36 tests) |
+| Service worker install/activate/precache, update offer, no mid-track swap | covered | `test/pwa.test.js` (in CI's `browser` job) |
 | Offline shell + offline deep link | covered | §2.8 |
 | **Offline *playback*** | **missing feature** | §3.2 — the biggest one |
 | Media Session metadata/artwork/position/actions | covered | §2.3, `test/media-session.test.js`, `test/lockscreen.test.js` |
@@ -230,15 +269,15 @@ existing or new test asserts it.
 | Notification **badge** on the app icon | **not implemented** | `navigator.setAppBadge` is absent; the unread bell could drive it with one call |
 | Web **Share Target** (share a YouTube link into sonora → search) | **not implemented** | `share_target` is absent from the manifest; the app already has the search page to receive it |
 | Web Push for followed-artist releases | **not implemented** | alerts only exist while the app is open (stated honestly in the UI); a phone with the app closed gets nothing |
-| Background Sync for offline likes/plays | **not implemented** | `SyncManager` is available; see §3.2 |
+| Background Sync for offline likes/plays | **not implemented** | nothing in the tree probes or uses `SyncManager`; see §3.2 |
 | Shortcuts / deep links / share cards | covered | §2.9, `test/share.test.js` |
 | Back gesture stays in the app | covered | §2.9 |
 | Passkeys in the installed app | covered | §2.12 |
 | Session survives a relaunch | covered | §2.1 |
-| Storage persistence / eviction | partial | `persist()` is requested; nothing verifies the grant or shows quota |
-| Autoplay policy (gesture required) | partial | the harness clicks play; `test/ux.test.js` has the strict-policy case |
-| Reduced motion | partial | `prefers-reduced-motion` is wired in `emulateAndroid`; no assertion uses it yet |
+| Storage persistence / eviction | partial | `persist()` is requested and the `persisted()` grant is checked in `public/pwa.js`, but only into `console.debug`; nothing in the UI shows the grant or the quota |
+| Autoplay policy (gesture required) | partial | the harness clicks play; `test/rooms-browser.test.js` and `test/listen-venue.test.js` relaunch with `autoplayPolicy: 'document-user-activation-required'` and assert the start overlay survives the refusal |
+| Reduced motion | covered | `test/ux.test.js` case "G" asserts `prefers-reduced-motion:reduce` removes page/card/sheet animation; `test/pwa.test.js` asserts the CSS block ships |
 | Android font scaling / `text-size-adjust` | **untested** | needs `font-size` overrides or a phone |
 | RTL / other locales | **untested** | manifest declares `en`/`ltr`; no RTL audit |
-| Screenshots in the manifest (richer install sheet) | **absent** | `pwa.test.js` only lists them if the files exist |
+| Screenshots in the manifest (richer install sheet) | covered | `public/screenshots/narrow.png` and `wide.png` are declared in the manifest and present; `pwa.test.js` only lists them if the files exist |
 | Long queues / memory over an album | **untested** | `take_heap_snapshot` exists in the harness tooling; nothing asserts a bound |

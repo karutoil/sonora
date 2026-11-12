@@ -1,5 +1,16 @@
 # Sonora · Sleeve-first UI direction
 
+**Status: implemented.** This brief is kept so the intent survives the code, not as
+work to do. What the interface *is* now is recorded in [`ui.md`](ui.md); the shared
+class vocabulary that carried this direction into every page is in
+[`sleeve-first-v2.md`](sleeve-first-v2.md). The tokens and the radius scale named
+below were re-checked against `public/app.css` on 2026-11-12 and all still exist
+(`--bg:#111215`, `--panel`, `--card`, `--white`, `--text-2`, `--muted`,
+`--accent:#ff997b`, and the 8/12/16/22 `--r-xs`/`--r-sm`/`--r-md`/`--r-lg` scale);
+the hero this brief asked for is `.sleeve-hero` with its art edge-to-edge under one
+directional scrim (`.hero-fade`), and the "recent records" it describes render as
+`.sleeve-tile` sleeves in a fixed-width `.shelf`.
+
 This is the implementation brief for Direction 01 in [`ui-concepts.html`](ui-concepts.html). It is a **design direction**, not a new theme or a literal reproduction of the illustrative phone mock.
 
 ## Thesis

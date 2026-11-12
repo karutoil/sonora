@@ -101,7 +101,7 @@ after(() => {
 const hostCookie = async () => {
   const res = await fetch(`${BASE}/api/auth/login`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2', deviceId: 'listen-page', deviceName: 'Chromium' }),
+    body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2', deviceId: 'listen-page', deviceName: 'Chromium' }),
   });
   assert.equal(res.status, 200, 'the host signs in');
   return (res.headers.getSetCookie?.()[0] ?? res.headers.get('set-cookie')).split(';')[0];
@@ -188,7 +188,7 @@ test('the listener page reads as a room: current, up next, played and the facts'
     assert.equal(v.index, 'Track 4 of 8', 'the position in the set is stated');
     assert.equal(v.nextTitle, 'Epsilon Song', 'the player side names what follows');
     assert.equal(v.nextHidden, false, 'and shows it');
-    assert.equal(v.host, 'toil', 'the room names its host');
+    assert.equal(v.host, 'admin', 'the room names its host');
     assert.equal(v.control, 'Everyone', 'and its control policy');
     assert.match(v.opened, /Just now|min ago/, 'and how long it has been open');
     assert.equal(v.end, true, 'no end-of-queue note while there is more');

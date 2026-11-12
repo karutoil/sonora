@@ -40,6 +40,12 @@ jobs:
   # inverted ranges, the 416-with-content-range reply) — the seek path that has
   # silently broken twice — and it is offline by construction: a synthetic 3 MiB
   # file in the cache dir, no yt-dlp, no bot gate, no network.
+  #
+  # queue-stream.test.js belongs here for the same reason: it serves its own
+  # ffmpeg-cut fixtures off disk, so it is offline, and it is the only coverage of
+  # the hidden-playback plan/segment/DELETE contract, including the per-user
+  # stream cap. It needs ffmpeg (on the runner image, and installed explicitly in
+  # the browser job); without it those cases skip rather than fail.
   unit:
     name: Unit tests (offline)
     runs-on: ubuntu-latest
@@ -63,6 +69,16 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # ffmpeg generates the synthetic offline audio fixtures queue-stream.test.js
+      # cuts and verifies. It is already on GitHub's ubuntu-latest runners;
+      # installing it explicitly turns a missing tool into a clear build step
+      # rather than seven silent skips.
+      - name: Install ffmpeg
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
       - name: Run offline tests
         env:
           SONORA_FOLLOWS_OFFLINE: '1'
@@ -82,6 +98,7 @@ jobs:
             test/ratelimit.test.js \
             test/playback.test.js \
             test/media-session.test.js \
+            test/queue-stream.test.js \
             test/container.test.js \
             test/proxy.test.js \
             test/youtube.test.js \
@@ -94,14 +111,17 @@ jobs:
   # The suites that drive a real Chromium over CDP, which is most of the biggest
   # test files: passkeys (virtual authenticator), the UX/layout/safe-area sweeps,
   # the PWA service-worker lifecycle, rooms in two tabs, the queue and the player
-  # handoffs. They are fixture-driven — they boot the server against a temp DB and
-  # keep yt-dlp out of the path — so they need a browser and nothing else. None of
-  # them could run in CI before, which is how that much of the codebase ended up
-  # executing only on a developer's laptop.
+  # handoffs, the installed-Android device pass, and the iOS queue-stream handoff
+  # and track-version harnesses. They are fixture-driven — they boot the server
+  # against a temp DB and keep yt-dlp out of the path — so they need a browser,
+  # plus ffmpeg for the stream fixtures and a D-Bus session bus for android-pwa's
+  # MPRIS check, both installed in the Chromium step below. None of them could run
+  # in CI before, which is how that much of the codebase ended up executing only on
+  # a developer's laptop.
   #
   # Left out because they need the live internet, which would make this job flaky
-  # rather than informative: e2e, library, follows, search-types and
-  # station-endless (live YouTube metadata), latency (the real artwork CDN) and
+  # rather than informative: e2e, library, the live half of follows, search-types
+  # and station-endless (live YouTube metadata), latency (the real artwork CDN) and
   # lockscreen (drives a live search, then decodes real audio).
   #
   # media-session.test.js runs in *both* jobs: its node half pins the module's
@@ -141,7 +161,12 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends wget ca-certificates fonts-liberation
+          # ffmpeg cuts the audio fixtures the stream suites play; dbus-daemon +
+          # dbus-send give android-pwa a private session bus to read MPRIS from.
+          # Both are already on the runner image; installing them makes it explicit
+          # instead of an undocumented dependency of a release gate.
+          sudo apt-get install -y --no-install-recommends \
+            wget ca-certificates fonts-liberation ffmpeg dbus
           wget -q -O /tmp/chrome.deb \
             https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
           sudo apt-get install -y --no-install-recommends /tmp/chrome.deb
@@ -185,7 +210,10 @@ jobs:
             test/share.test.js \
             test/notifications.test.js \
             test/pwa.test.js \
-            test/rooms-browser.test.js
+            test/rooms-browser.test.js \
+            test/android-pwa.test.js \
+            test/queue-stream-handoff.test.js \
+            test/track-version.test.js
 
   # Build and smoke-test without registry credentials on every event, including
   # pull requests. Publication is a separate, explicitly gated job below.

@@ -70,7 +70,7 @@ const TRACK = (videoId, title, durationS = 214) => ({
   videoId, title, channel: 'Room Test', durationS, thumb: null,
 });
 
-let toil; let ana; let ben; let carl;
+let admin; let ana; let ben; let carl;
 
 before(async () => {
   PORT = await freePort();
@@ -100,11 +100,11 @@ before(async () => {
     } catch {}
     await new Promise((r) => setTimeout(r, 200));
   }
-  toil = await login('toil', 'hunter2hunter2');
+  admin = await login('admin', 'hunter2hunter2');
   // Accounts other than the bootstrap one are created through the admin API,
   // exactly as an owner would.
   for (const name of ['ana', 'ben', 'carl']) {
-    const r = await req('/api/admin/users', { jar: toil, method: 'POST', body: { name, passphrase: `${name}-passphrase`, role: 'user' } });
+    const r = await req('/api/admin/users', { jar: admin, method: 'POST', body: { name, passphrase: `${name}-passphrase`, role: 'user' } });
     assert.ok(r.status < 300, `create ${name}: ${r.status} ${JSON.stringify(r.body)}`);
   }
   ana = await login('ana', 'ana-passphrase');

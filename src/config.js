@@ -239,7 +239,7 @@ export const config = {
   loginRateMax: positiveInt('SONORA_LOGIN_RATE_MAX', 10),
   loginRateWindow: loginWindowSetting('SONORA_LOGIN_RATE_WINDOW'),
   // Bootstrap user, created only when the users table is empty.
-  bootstrapUser: (process.env.SONORA_USER ?? 'toil').trim(),
+  bootstrapUser: (process.env.SONORA_USER ?? 'admin').trim(),
   bootstrapPass: process.env.SONORA_PASSPHRASE ?? '',
   // Stream URL lifetime, reported to the admin panel. The Innertube-resolved
   // URL cache this used to bound is gone: audio is fetched once into the local

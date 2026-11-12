@@ -108,7 +108,7 @@ before(async () => {
   }
   const res = await fetch(`${BASE}/api/auth/login`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+    body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
   });
   cookie = res.headers.getSetCookie()[0].split(';')[0];
 });
@@ -274,7 +274,7 @@ test('the stored jar is used for playback and survives a restart', async () => {
   }
   const res = await fetch(`${BASE}/api/auth/login`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+    body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
   });
   cookie = res.headers.getSetCookie()[0].split(';')[0];
 
@@ -387,7 +387,7 @@ async function withCookieServer({ extraEnv = {}, stub = STUB }, run) {
     let cookie = '';
     const login = await fetch(`${base}/api/auth/login`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+      body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
     });
     assert.equal(login.status, 200);
     cookie = login.headers.getSetCookie()[0].split(';')[0];

@@ -73,7 +73,7 @@ before(async () => {
     } catch {}
     await new Promise((r) => setTimeout(r, 250));
   }
-  adminCookie = await login('toil', 'hunter2hunter2');
+  adminCookie = await login('admin', 'hunter2hunter2');
 });
 
 after(() => {
@@ -144,7 +144,7 @@ test('the users list includes the admin and the created account', async () => {
   assert.equal(res.status, 200);
   assert.equal(body.me, body.users.find((u) => u.role === 'admin').id);
   const names = body.users.map((u) => u.name);
-  assert.deepEqual(names.sort(), ['listener', 'toil']);
+  assert.deepEqual(names.sort(), ['admin', 'listener']);
   assert.ok(body.users.every((u) => u.pass_hash === undefined));
 });
 
@@ -334,7 +334,7 @@ test('a consistent database backup can be downloaded and reopened', async () => 
     restored = new DatabaseSync(file, { readOnly: true });
     assert.deepEqual(restored.prepare('PRAGMA quick_check').all().map((row) => ({ ...row })), [{ quick_check: 'ok' }]);
     assert.deepEqual(restored.prepare('PRAGMA foreign_key_check').all().map((row) => ({ ...row })), []);
-    assert.equal(restored.prepare("SELECT role FROM users WHERE name = 'toil'").get().role, 'admin');
+    assert.equal(restored.prepare("SELECT role FROM users WHERE name = 'admin'").get().role, 'admin');
     assert.ok(restored.prepare("SELECT 1 AS present FROM users WHERE name = 'listener'").get());
     assert.ok(restored.prepare("SELECT 1 AS present FROM playlists WHERE title = 'Admin test'").get());
     assert.deepEqual({ ...restored.prepare(`
@@ -441,7 +441,7 @@ test('destructive actions are recorded in the audit log', async () => {
   for (const expected of ['user.create', 'user.update', 'user.signout', 'user.delete']) {
     assert.ok(actions.includes(expected), `audit contains ${expected}`);
   }
-  assert.ok(body.entries.every((e) => e.actorName === 'toil'));
+  assert.ok(body.entries.every((e) => e.actorName === 'admin'));
 });
 
 test('a rejected change does not partially apply', async () => {
@@ -554,7 +554,7 @@ test('CLI role changes are atomic, audited, last-admin safe, and revoke remember
     assert.equal(db.prepare("SELECT role FROM users WHERE name = 'cli-account'").get().role, role);
     db.close();
   }
-  const onlyAdmin = runCli('demote', 'toil');
+  const onlyAdmin = runCli('demote', 'admin');
   assert.notEqual(onlyAdmin.status, 0);
   assert.match(`${onlyAdmin.stdout}\n${onlyAdmin.stderr}`, /only active admin/);
   assert.equal((await req('/api/admin/overview', { cookie: adminCookie })).res.status, 200);
@@ -583,7 +583,7 @@ test('CLI role changes are atomic, audited, last-admin safe, and revoke remember
     child.on('error', reject);
     child.on('close', (code) => resolve({ code, output }));
   });
-  const concurrent = await Promise.all([runAsync('toil'), runAsync('cli-account')]);
+  const concurrent = await Promise.all([runAsync('admin'), runAsync('cli-account')]);
   assert.deepEqual(concurrent.map((r) => r.code).sort(), [0, 1],
     `one demotion must win and the other must retain one admin: ${concurrent.map((r) => r.output).join('\n')}`);
   const final = new DatabaseSync(DB, { readOnly: true });

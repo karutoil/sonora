@@ -1,21 +1,44 @@
-# sonora — personal YouTube music PWA with a learning recommender
+# sonora — engineering plan and measurements record
 
-Status: **P0–P2 working and tested** (2026-10-18). Decisions: iOS, Cloudflare Tunnel,
-fresh build (does **not** use the Discord bot), multi-user from day one.
+**What this file is.** The working plan and dated measurement log for sonora, kept in
+the order it was written (documents are appended with their own top-level heading).
+It is not user documentation: `README.md` says what the app does today,
+`docs/auth.md`, `docs/rooms.md` and `docs/ui.md` describe the shipped subsystems, and
+`.env.example` is the reference for settings. Where a later section supersedes an
+earlier one it says so in place; nothing below has been rewritten to look prescient.
 
-Everything in "Measured" below was verified on this host, not assumed.
+**Status — last tree change 2026-11-12.** The plan at the top was written on 2026-10-18
+against a P0–P2 skeleton. Since then these shipped and are covered by tests: disk-cached
+audio served as ranges (findings #1–#2), the hidden HLS queue stream that keeps a locked
+iPhone playing (finding #6), the four-lane station (`src/station.js`), accounts with short
+access tokens, rotating refresh tokens, remembered devices and passkeys, Listen Together
+rooms, artist follows with a notification bell, the instance admin panel
+(`scripts/set-role.js`) and the YouTube cookie-jar import. The tree is Node 22 + Fastify 5
++ `node:sqlite`, with `public/` served as-is and no build step. The endpoint table under
+"Architecture" lists the P0–P2 surface only; rooms, follows and `/api/admin/*` were added
+after it was written.
+
+**Historical, not current.** "Decisions still needed", "Next" and "The recommender (not
+built yet)" are the plan as of 2026-10-20. The recommender's graph, embedding and bandit
+layers are **not** built; no tunnel configuration ships in this repository; live YouTube
+broadcasts (24/7 radio) are still refused with a clear error. Measurements throughout
+(latencies, test counts, packet captures, device behaviour) were taken on the author's own
+host and phone on the dates given. They are the evidence behind the decisions made then,
+not a claim about another machine or a later YouTube release; where a number was specific
+to that environment the surrounding text says so.
 
 ## Run it
 
 ```bash
-cd ~/projects/muse-pwa
+cd ~/projects/sonora          # or wherever this checkout lives
 SONORA_SECRET=$(openssl rand -hex 32) SONORA_PASSPHRASE='your-passphrase' \
   npm start            # http://127.0.0.1:8130
-npm test               # 143 tests, hits live YouTube, ~40s
+npm test               # full suite; needs network + a browser (see README → Testing)
 ```
 
-First run creates user `toil` with `SONORA_PASSPHRASE`. yt-dlp is already installed at
-`~/.local/share/sonora-venv/bin/yt-dlp`.
+First run creates the bootstrap account (`SONORA_USER`, `admin` in `.env.example`) with
+`SONORA_PASSPHRASE`. yt-dlp is autodetected from `~/.local/share/sonora-venv`, then from
+`PATH`.
 
 ### In a container (podman)
 
@@ -50,7 +73,7 @@ entrypoint, not there.
 Deciphered URLs embed the resolving host's IP in `sparams` and expire in ~6h:
 
 ```
-ip= 2600:1700:b230:6da0::32    sparams= expire,ei,ip,id,itag,...
+ip= 2001:db8::1    sparams= expire,ei,ip,id,itag,...
 ```
 
 The phone can never play a URL the server resolved. Everything goes through
@@ -429,7 +452,7 @@ its plan arrives.
 (2026-11-10, evening).** The reports from `queue-stream-5` finally showed the stream
 reaching the phone and dying there: `live-enter ok:true at:168571`, then four seconds later
 `live-stalled {readyState:1, time:0, error:null}` — AVFoundation accepted the connection
-and starved on an *indefinite* MP3 response; my health check reverted, the convergence
+and starved on an *indefinite* MP3 response; the health check reverted, the convergence
 re-entered, and the page ping-ponged until it froze. An endless HTTP body is not a shape
 the iOS media pipeline schedules in the background.
 
@@ -664,8 +687,8 @@ path for "large-file or high-traffic workloads" — i.e. `cloudflared` + WARP, n
 public hostname.
 
 Recommendation: use a **private route** (WARP on the phone) and skip the public
-hostname. Tell me which you want and I'll wire it up — `cloudflared` 2026.8.3 is
-already installed but logged out.
+hostname. This stayed an open decision: the repository ships no tunnel configuration,
+and the `cloudflared` setup used while testing lived outside it.
 
 Also: live streams (24/7 radio) are refused with a clear message. Supporting them
 needs the HLS pump from the Discord bot, or just accept songs.
@@ -678,8 +701,8 @@ Single-user collaborative filtering is degenerate — there is no user-user sign
 1. **Graph (free, strong, day one).** `yt.music.getUpNext` returns 50 related tracks;
    persist as weighted edges and random-walk with restart from recent positives.
 2. **Embeddings.** CLAP/MERT on 30 s previews → vectors in `sqlite-vec`, kNN. This is
-   what separates "same texture" from "same artist". Nightly CPU batch (the RX 6600 is
-   gfx1032 — no ROCm).
+   what separates "same texture" from "same artist". Nightly CPU batch (the GPU used
+   while testing had no ROCm support).
 3. **Contextual bandit.** Thompson sampling over three generators (graph / kNN /
    explore) with a ranker over: decayed artist affinity, embedding cosine to recent
    positives *and negatives*, graph proximity, completion rate, recency penalty.
@@ -853,15 +876,16 @@ home makes 6 image requests, all 6 served from the browser cache.
   be loopback (the exact regression that caused this).
 
 Note for anyone touching the browser tests: the **first** http navigation in a fresh
-headless Chromium profile stalls 25 s on this host (reproduced against a plain
-`python3 -m http.server`, so it is the browser, not the app). `latency.test.js`
+headless Chromium profile stalls 25 s on one developer machine (reproduced against a plain
+`python3 -m http.server`, so it is the browser, not the app; recorded 2026-10-20). `latency.test.js`
 absorbs it in `before()` so it cannot be mistaken for an app regression.
 
 ---
 
 # sonora — design implementation (2026-10-19)
 
-The concept file `~/projects/sonora_music_ui.html` is now the real UI. The design
+The concept mock (`sonora_music_ui.html`, a design file that was never committed to this
+repository) is now the real UI. The design
 system is taken **verbatim** (36 KB stylesheet, 31-symbol icon sprite, identical
 class names and layout), and the fictional data layer is replaced with live data.
 
@@ -923,21 +947,23 @@ one account cannot read another's playlist.
 
 ## Tests
 
-55 tests: 48 pass, 0 fail, 7 skipped.
+A run on 2026-10-19: 55 tests, 48 pass, 0 fail, 7 skipped. That is a dated run, not a
+description of the current suite, which has grown since.
 
-- `proxy.test.js` — 12 offline, deterministic tests for range/seek/chunking,
-  using a synthetic 3 MiB file. No network, no yt-dlp. This is the part that
+- `proxy.test.js` — 37 offline, deterministic tests for range/seek/chunking (count as of
+  2026-11-12), using a synthetic 3 MiB file. No network, no yt-dlp. This is the part that
   broke twice, so it must never depend on YouTube.
-- `library.test.js` — 17 tests for playlists, isolation, lyrics, browse, artwork,
-  and that the served CSS/HTML still carries the concept's design tokens.
+- `library.test.js` — 32 tests (as of 2026-11-12) for playlists, isolation, lyrics, browse,
+  artwork, and that the served CSS/HTML still carries the concept's design tokens.
 - `e2e.test.js` — live tests; the streaming ones now **skip with a reason** when
   YouTube gates the IP, instead of failing.
 
 ## Known blocker (external, not a bug)
 
-From 2026-10-19 this host gets `LOGIN_REQUIRED: "Sign in to confirm you're not a
-bot"` on **every** YouTube client (IOS/ANDROID/TV/WEB/MWEB/YTMUSIC) for both
-youtubei.js and yt-dlp. Search, radio, lyrics, thumbnails and the whole UI still
+From 2026-10-19 the host used for development was getting `LOGIN_REQUIRED: "Sign in to
+confirm you're not a bot"` on **every** YouTube client (IOS/ANDROID/TV/WEB/MWEB/YTMUSIC) for
+both youtubei.js and yt-dlp. That is an environment observation, not a claim about every
+host. Search, radio, lyrics, thumbnails and the whole UI still
 work; audio download does not.
 
 Wired and ready:
@@ -1015,7 +1041,7 @@ Cookies are equivalent to a password, so:
 
 ## Tests
 
-`cookies.test.js` — 11 tests, fully offline via a stub yt-dlp whose behaviour is
+`cookies.test.js` — 26 tests as of this tree (11 when the section was written), fully offline via a stub yt-dlp whose behaviour is
 selected by a marker inside the jar. Covers: auth required, empty/JSON input,
 missing sign-in cookie, a jar YouTube rejects (rollback + no file left behind),
 a working jar, `0600` permissions, encryption at rest, survival across a restart
@@ -1055,7 +1081,7 @@ popular extensions produce JSON rather than Netscape.
 ## Switching libraries would not help: the suggested repo *is* the current library
 
 `github.com/LuanRT/YouTube.js` is **youtubei.js** — the package already in
-`package.json`, already at the newest release (18.2.0, npm latest = 18.2.0).
+`package.json`, already at the newest release then (18.2.0).
 So there was nothing to switch to. What *was* worth testing is whether its own
 PO-token path beats yt-dlp, so I built that test.
 
@@ -1068,8 +1094,8 @@ cannot fix an IP-level block.
 
 | Mitigation | Effect | Status |
 |---|---|---|
-| **PO-token provider** (bgutil container, port 4416) | defeats *client-level* checks | installed, running, `restart=always` |
-| **JS runtime** (deno) | yt-dlp needs it; was warning on every run | installed at `~/.deno/bin/deno`, auto-detected |
+| **PO-token provider** (bgutil container, port 4416) | defeats *client-level* checks | a separate container outside this repository |
+| **JS runtime** (deno) | yt-dlp needs it; was warning on every run | autodetected from `~/.deno/bin/deno` or PATH |
 | **Proxy** (`SONORA_YTDLP_PROXY`) | the only thing that changes the IP | wired, not configured |
 | **Cookies** | account-level identity | wired (needs a google.com export) |
 
@@ -1183,7 +1209,7 @@ gets 403 on all of them.
 
 ## Tests
 
-`test/admin.test.js` — 16 tests over the real HTTP surface: bootstrap is admin,
+`test/admin.test.js` — 21 tests as of this tree (16 when written) over the real HTTP surface: bootstrap is admin,
 403 for anonymous and normal users on every admin route, input validation,
 duplicate names, self-lockout refusals, password reset + session revocation,
 disable/enable, admin sign-out, history clearing that keeps likes, track
@@ -1192,7 +1218,7 @@ that really starts with `SQLite format 3`, a system payload that does not leak
 the session secret, role changes taking effect on the *same* cookie, user
 deletion, and the audit trail.
 
-`test/migration.test.js` — 4 tests for the upgrade path described above.
+`test/migration.test.js` — 20 tests as of this tree (4 when written) for the upgrade path described above.
 
 `test/db.test.js` — role assignment, admin counting, and cascading user
 deletion.
@@ -1267,6 +1293,6 @@ account cannot quietly renew itself.
 
 ## Tests
 
-`test/auth.test.js` (14 HTTP tests) and `test/passkey.test.js` (7 tests in real
+`test/auth.test.js` (28 HTTP tests) and `test/passkey.test.js` (10 tests in real
 Chromium with a CDP virtual authenticator, including a full register → sign in →
 sign out everywhere → remove round trip through the actual UI).

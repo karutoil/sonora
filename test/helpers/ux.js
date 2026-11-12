@@ -116,7 +116,7 @@ export async function loginCookie(base) {
   const res = await fetch(`${base}/api/auth/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+    body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
   });
   if (!res.ok) throw new Error(`login failed: ${res.status} ${await res.text()}`);
   const cookie = res.headers.getSetCookie?.()[0] ?? res.headers.get('set-cookie');
@@ -221,7 +221,7 @@ function uxInit() {
   ];
   // The pinned personal station: seeds (why) + tracks (what plays next).
   const STATION = {
-    name: 'toil\u2019s station',
+    name: 'admin\u2019s station',
     blurb: 'Built from 1 song you played through and 1 song you liked.',
     seeds: [
       { videoId: 'dQw4w9WgXcQ', title: 'UX Fixture Track', channel: 'UX Fixture Channel', liked: true, score: 5 },
@@ -475,7 +475,7 @@ export async function skipIfUpstreamBlocked(t, base, videoId = PROBE_VIDEO) {
       const res = await fetch(`${base}/api/auth/login`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ name: 'toil', passphrase: 'hunter2hunter2' }),
+        body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
       });
       if (!res.ok) return null;
       const raw = res.headers.getSetCookie?.() ?? [];
