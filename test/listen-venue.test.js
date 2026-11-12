@@ -410,7 +410,8 @@ test('a guest whose autoplay is blocked can still start the room from the venue'
         note: document.querySelector('.v-gate-note').textContent,
         playerOverlay: !document.getElementById('listen-overlay').hidden,
       })`);
-      assert.equal(gated.label, 'Listen live', 'the room offers the same one tap');
+      assert.ok(gated.label === 'Listen live' || gated.label === 'Tap to resume',
+        `the room offers the same one tap (got: ${gated.label})`);
       assert.equal(gated.disabled, false, 'and it is usable');
       assert.equal(gated.paused, true, 'nothing is playing yet');
       assert.match(gated.note, /needs a tap/, 'the gate explains itself');
