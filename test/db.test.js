@@ -300,7 +300,7 @@ test('hot SQL aggregates before metadata joins and room visibility uses its thre
   }
   const roomPlan = rooms.detail.join(' | ');
   assert.match(roomPlan, /CO-ROUTINE visible/);
-  assert.match(roomPlan, /UNION USING TEMP B-TREE/, 'overlapping access paths are de-duplicated');
+  assert.match(roomPlan, /(?:UNION USING TEMP B-TREE|MERGE \(UNION\))/, 'overlapping access paths are de-duplicated');
   for (const index of ['rooms_host', 'room_members_user', 'room_invites_user']) {
     assert.match(roomPlan, new RegExp(`SEARCH .* USING (?:COVERING )?INDEX ${index}`),
       `${index} serves its visibility branch: ${roomPlan}`);
