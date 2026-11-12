@@ -99,7 +99,7 @@ export async function launch(port, {
   try {
     proc = spawn(CHROME, [
       '--headless=new', `--remote-debugging-port=${port}`, `--user-data-dir=${dir}`,
-      '--no-sandbox', '--disable-gpu', '--hide-scrollbars', '--mute-audio',
+      '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--hide-scrollbars', '--mute-audio',
       // Playback is started from script, not a trusted gesture. A test that is
       // *about* the gesture passes 'document-user-activation-required' to make
       // the browser as strict as Safari.
@@ -302,11 +302,47 @@ export async function launch(port, {
       }
       throw new Error(`cdp: the app window never exposed a page target for ${app}`);
     };
-    const targetId = app
+    let targetId = app
       ? await appTarget()
       : (await send('Target.createTarget', { url: 'about:blank' })).targetId;
-    const { sessionId } = await send('Target.attachToTarget', { targetId, flatten: true });
-    const S = (method, params, timeout) => send(method, params, sessionId, timeout);
+    let { sessionId } = await send('Target.attachToTarget', { targetId, flatten: true });
+
+    let reattaching = null;
+    const reattach = async () => {
+      if (reattaching) return reattaching;
+      reattaching = (async () => {
+        try {
+          const { targetInfos } = await send('Target.getTargets');
+          const pages = (targetInfos ?? []).filter((info) => info.type === 'page');
+          const hit = pages.find((info) => info.targetId === targetId) ?? pages[0];
+          if (!hit) {
+            const created = await send('Target.createTarget', { url: 'about:blank' });
+            targetId = created.targetId;
+          } else {
+            targetId = hit.targetId;
+          }
+          const attached = await send('Target.attachToTarget', { targetId, flatten: true });
+          sessionId = attached.sessionId;
+          await send('Page.enable', {}, sessionId);
+          await send('Runtime.enable', {}, sessionId);
+        } finally {
+          reattaching = null;
+        }
+      })();
+      return reattaching;
+    };
+
+    const S = async (method, params, timeout) => {
+      try {
+        return await send(method, params, sessionId, timeout);
+      } catch (err) {
+        if (DETACHED_RE.test(String(err?.message)) && ws?.readyState === WebSocket.OPEN && !exitOutcome) {
+          await reattach();
+          return await send(method, params, sessionId, timeout);
+        }
+        throw err;
+      }
+    };
     await S('Page.enable');
     await S('Runtime.enable');
 
