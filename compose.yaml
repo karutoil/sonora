@@ -32,28 +32,12 @@ services:
     # mem_limit: 2g
     env_file:
       - .env
-    environment:
-      # Every value here is an override of the documented default, not a hard
-      # assignment: `.env` is read for interpolation, so an operator can change
-      # HOST/PORT or point the PO-token provider at another host without editing
-      # this file. `:-` falls back when the variable is unset *or empty*; `-` only
-      # when unset, which is what lets an empty SONORA_POT_PROVIDER/JS_RUNTIME
-      # disable that feature (README documents both as "empty disables it").
-      #
-      # Inside the container the server must listen on all interfaces, not the
-      # loopback default, or the published port has nothing behind it.
-      HOST: "${HOST:-0.0.0.0}"
-      # The host port stays 8130 (the port every URL and bookmark uses); the
-      # container port follows PORT so an override does not silently break the
-      # published mapping below.
-      PORT: "${PORT:-8130}"
-      # The bgutil PO-token provider runs as its own container on the host
-      # (port 4416). 127.0.0.1 inside a container is the container itself.
-      SONORA_POT_PROVIDER: "${SONORA_POT_PROVIDER-http://host.containers.internal:4416}"
-      # yt-dlp 2026.x solves YouTube's JS challenges with a runtime. Config
-      # auto-detects a deno install under $HOME, which does not exist in this
-      # image, so point it at the node binary that is already here.
-      SONORA_JS_RUNTIME: "${SONORA_JS_RUNTIME-node:/usr/local/bin/node}"
+    # Container-specific defaults (HOST=0.0.0.0, SONORA_POT_PROVIDER, and
+    # SONORA_JS_RUNTIME) live in scripts/container-entrypoint.sh rather than an
+    # `environment:` map: podman-compose 1.3 leaves self-referential
+    # `${VAR:-...}` entries unexpanded when `.env` omits them, breaking both
+    # `PORT` mapping and config validation. `.env` overrides and empty-disables
+    # work identically under Docker Compose and Podman Compose.
     ports:
       # Same address and port as dev: loopback only, fronted by the tunnel.
       # Set SONORA_BIND=0.0.0.0 in .env to expose it on the LAN instead.

@@ -17,4 +17,13 @@ if ! node -e 'process.exit((process.env.SONORA_SECRET || "").trim() ? 0 : 1)'; t
   exit 1
 fi
 
+# Container defaults. Applied here rather than compose.yaml `environment:`
+# because podman-compose 1.3 puts self-referential `${VAR:-default}` keys into
+# its own substitution map and leaves them literal when unset in `.env`.
+# `:-` falls back when unset or empty; `-` keeps an explicit empty string so
+# `.env` (`SONORA_POT_PROVIDER=`, `SONORA_JS_RUNTIME=`) disables the feature.
+export HOST="${HOST:-0.0.0.0}"
+export SONORA_POT_PROVIDER="${SONORA_POT_PROVIDER-http://host.containers.internal:4416}"
+export SONORA_JS_RUNTIME="${SONORA_JS_RUNTIME-node:/usr/local/bin/node}"
+
 exec "$@"

@@ -73,32 +73,59 @@ test('compose publishes the same port the dev server uses', async () => {
 
 test('the container listens on all interfaces, not loopback', () => {
   const compose = composeService();
+  // compose.yaml must not shadow .env with self-referential environment entries
+  // (podman-compose 1.3 leaves `${VAR:-...}` literal when unset in .env);
+  // instead, the entrypoint supplies container defaults when unset.
+  assert.doesNotMatch(compose, /^\s{6}PORT:\s*"\$\{PORT/m, 'PORT is not self-referenced in compose environment');
+  assert.doesNotMatch(compose, /^\s{6}HOST:\s*"\$\{HOST/m, 'HOST is not self-referenced in compose environment');
+
+  const script = path.join(ROOT, 'scripts/container-entrypoint.sh');
+  const dump = (extra = {}) => {
+    const env = { ...process.env, SONORA_SECRET: 'valid-secret' };
+    delete env.HOST;
+    delete env.SONORA_POT_PROVIDER;
+    delete env.SONORA_JS_RUNTIME;
+    Object.assign(env, extra);
+    const res = spawnSync('/bin/sh', [script, 'node', '-e', 'console.log(JSON.stringify({HOST:process.env.HOST,POT:process.env.SONORA_POT_PROVIDER,JS:process.env.SONORA_JS_RUNTIME}))'], {
+      env, encoding: 'utf8', timeout: 5_000,
+    });
+    assert.equal(res.status, 0, res.stderr);
+    return JSON.parse(res.stdout);
+  };
+
   // Without this the app binds 127.0.0.1 *inside* the container and the
-  // published port answers nothing — verified by trying it.
-  const { expression, operator, fallback } = composeEnv('HOST');
-  assert.equal(fallback, '0.0.0.0', 'HOST defaults to 0.0.0.0');
-  assert.equal(operator, ':-', 'an empty HOST still falls back to the container default');
-  assert.equal(interpolate(expression, {}), '0.0.0.0');
-  assert.equal(interpolate(expression, { HOST: '127.0.0.1' }), '127.0.0.1', '.env can override HOST');
+  // published port answers nothing.
+  assert.deepEqual(dump(), {
+    HOST: '0.0.0.0',
+    POT: 'http://host.containers.internal:4416',
+    JS: 'node:/usr/local/bin/node',
+  });
+  assert.equal(dump({ HOST: '' }).HOST, '0.0.0.0', 'an empty HOST still falls back to 0.0.0.0');
+  assert.equal(dump({ HOST: '127.0.0.1' }).HOST, '127.0.0.1', '.env can override HOST');
 });
 
 test('the POT provider and JS runtime are wired for the container', () => {
   const compose = composeService();
-  // 127.0.0.1 in a container is the container; the provider is on the host.
-  const pot = composeEnv('SONORA_POT_PROVIDER');
-  assert.equal(pot.fallback, 'http://host.containers.internal:4416');
-  // `-`, not `:-`: README promises that an empty value disables the feature, and
-  // `:-` would silently put the default back.
-  assert.equal(pot.operator, '-', 'an empty SONORA_POT_PROVIDER must disable it, not restore the default');
-  assert.equal(interpolate(pot.expression, {}), pot.fallback);
-  assert.equal(interpolate(pot.expression, { SONORA_POT_PROVIDER: '' }), '');
-  assert.equal(interpolate(pot.expression, { SONORA_POT_PROVIDER: 'http://10.0.0.5:4416' }), 'http://10.0.0.5:4416');
-
-  const runtime = composeEnv('SONORA_JS_RUNTIME');
-  assert.match(runtime.fallback, /^node:/);
-  assert.equal(runtime.operator, '-', 'an empty SONORA_JS_RUNTIME must disable it, not restore the default');
-  assert.equal(interpolate(runtime.expression, { SONORA_JS_RUNTIME: '' }), '');
   assert.match(compose, /host\.containers\.internal:host-gateway/, 'host alias is declared');
+
+  const script = path.join(ROOT, 'scripts/container-entrypoint.sh');
+  const dump = (extra = {}) => {
+    const env = { ...process.env, SONORA_SECRET: 'valid-secret' };
+    delete env.SONORA_POT_PROVIDER;
+    delete env.SONORA_JS_RUNTIME;
+    Object.assign(env, extra);
+    const res = spawnSync('/bin/sh', [script, 'node', '-e', 'console.log(JSON.stringify({POT:process.env.SONORA_POT_PROVIDER,JS:process.env.SONORA_JS_RUNTIME}))'], {
+      env, encoding: 'utf8', timeout: 5_000,
+    });
+    assert.equal(res.status, 0, res.stderr);
+    return JSON.parse(res.stdout);
+  };
+
+  assert.equal(dump().POT, 'http://host.containers.internal:4416');
+  assert.equal(dump({ SONORA_POT_PROVIDER: '' }).POT, '', 'empty SONORA_POT_PROVIDER disables it');
+  assert.equal(dump({ SONORA_POT_PROVIDER: 'http://10.0.0.5:4416' }).POT, 'http://10.0.0.5:4416');
+  assert.match(dump().JS, /^node:/);
+  assert.equal(dump({ SONORA_JS_RUNTIME: '' }).JS, '', 'empty SONORA_JS_RUNTIME disables it');
 });
 
 test('state is a bind mount so the db, cookies and audio survive a rebuild', () => {
