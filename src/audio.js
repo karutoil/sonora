@@ -695,8 +695,14 @@ async function downloadAudio(videoId, signal, gates, job) {
             : 'yt-dlp produced no audio');
         }
         // Salvaging a complete file after cancellation is fine; resolving an
-        // aborted operation as though its waiter completed is not.
-        if (signal.aborted) throw failure?.code === 'ABORTED' ? failure : abortedError();
+        // aborted operation as though its waiter completed is not. The file is
+        // kept, so the cache budget still has to be enforced on the way out —
+        // every other path that leaves bytes behind prunes here, and a
+        // cancelled-but-complete download used to skip it entirely.
+        if (signal.aborted) {
+          await pruneCacheTo(config.cacheBytes).catch(() => {});
+          throw failure?.code === 'ABORTED' ? failure : abortedError();
+        }
         rememberValidatedAudio(file, st);
         result = { file, size: st.size };
         added = true;

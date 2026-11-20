@@ -483,7 +483,18 @@ const rooms = createRoomSync({
     // loaded; seeking a source that is still buffering fights the load.
     isLoaded: (videoId) => current()?.videoId === videoId && audio.readyState >= 1,
     loadTrack: (snapshot) => loadRoomTrack(snapshot),
-    play: () => { claimAudioSession(); state.playing = true; audio.play().catch(() => {}); updatePlayer(); },
+    play: () => {
+      // The shared playhead may not start audio behind the sign-in form: a
+      // session that expired mid-room leaves the client polling, and the next
+      // snapshot would otherwise begin a track for a user who is not signed in
+      // and cannot stop it. Refusing here is honest — the room's state is
+      // unchanged, and signing back in re-syncs to it.
+      if (!$('auth-overlay').hidden) return;
+      claimAudioSession();
+      state.playing = true;
+      audio.play().catch(() => {});
+      updatePlayer();
+    },
     pause: () => { state.playing = false; audio.pause(); updatePlayer(); },
     seek: (seconds) => seekTo(seconds),
     setRate: (rate) => { audio.playbackRate = Math.min(1.5, Math.max(0.5, Number(rate) || 1)); },
@@ -530,13 +541,36 @@ const current = () => state.queue[state.index] ?? null;
 
 // Every rendered track is indexed by id so playback can recover its metadata
 // (title, channel, artwork, duration) no matter which page the user clicked in.
+//
+// It is a *cache*, not a record: a long session can render thousands of rows (an
+// endless station tops itself up forever, and every search result is remembered
+// too), and an unbounded Map of track objects — each holding a thumbnail URL per
+// size — is the one thing here that only grows. The cap is deliberately far
+// above any live queue, so eviction never touches a track the player can still
+// name; when it does fire, the oldest writes go first (see evictTrackIndex).
+const TRACK_INDEX_MAX = 3000;
 const trackIndex = new Map();
+function evictTrackIndex() {
+  if (trackIndex.size <= TRACK_INDEX_MAX) return;
+  // Map iteration order is insertion order, and every write below re-inserts, so
+  // the front of the Map is the least recently *written* entry.
+  for (const videoId of trackIndex.keys()) {
+    if (trackIndex.size <= TRACK_INDEX_MAX) break;
+    trackIndex.delete(videoId);
+  }
+}
 function rememberTracks(list = []) {
   for (const t of list) {
     if (!t?.videoId) continue;
     const prev = trackIndex.get(t.videoId);
-    if (!prev || t.title) trackIndex.set(t.videoId, { ...prev, ...t });
+    if (!prev || t.title) {
+      // Delete before set: without it a re-seen track keeps its original slot
+      // and would be the first thing evicted despite being the one on screen.
+      trackIndex.delete(t.videoId);
+      trackIndex.set(t.videoId, { ...prev, ...t });
+    }
   }
+  evictTrackIndex();
   return list;
 }
 
@@ -624,13 +658,37 @@ function routeFromLocation() {
   const raw = location.hash.replace(/^#\/?/, '');
   if (!raw) return null;
   const [kind, arg] = raw.split('/');
-  if (kind === 'c' && arg) return { page: 'collection', collection: decodeURIComponent(arg) };
-  if (kind === 'artist' && arg) return { page: 'artist', collection: decodeURIComponent(arg) };
-  if (kind === 'mood' && arg) return { page: 'mood', collection: null, mood: decodeURIComponent(arg) };
+  // `decodeURIComponent` throws a URIError on a malformed escape, and `#/c/50%`
+  // is exactly what a half-copied or hand-edited share link looks like. That
+  // throw used to escape into boot() — where the fallback renders Discover —
+  // and into the popstate path, where nothing caught it at all: navigation
+  // simply stopped working and the URL was left as it was. A damaged route is
+  // not a route, and saying so is the whole recovery.
+  const part = (value) => {
+    try { return decodeURIComponent(value); } catch { return null; }
+  };
+  if (kind === 'c' && arg) {
+    const id = part(arg);
+    return id == null ? null : { page: 'collection', collection: id };
+  }
+  if (kind === 'artist' && arg) {
+    const id = part(arg);
+    return id == null ? null : { page: 'artist', collection: id };
+  }
+  if (kind === 'mood' && arg) {
+    const mood = part(arg);
+    return mood == null ? null : { page: 'mood', collection: null, mood };
+  }
   // `#/room/<code>` — the in-app half of a `/l/<code>` share link.
-  if (kind === 'room' && arg) return { page: 'room', collection: decodeURIComponent(arg) };
+  if (kind === 'room' && arg) {
+    const code = part(arg);
+    return code == null ? null : { page: 'room', collection: code };
+  }
   // `#/t/<videoId>` is what "Copy link" writes: open sonora and start the track.
-  if (kind === 't' && arg) return { page: 'track', videoId: decodeURIComponent(arg) };
+  if (kind === 't' && arg) {
+    const videoId = part(arg);
+    return videoId == null ? null : { page: 'track', videoId };
+  }
   if (['home', 'search', 'library', 'radio', 'station', 'admin', 'security'].includes(kind)) {
     return { page: kind, collection: null };
   }
@@ -1073,6 +1131,13 @@ ${sectionHeader('A little discovery', 'Find something you did not know you neede
       Listen now ${icon('arrow-right', 'xs')}</button></div></div>`;
 }
 
+// `#search-results` is the app's only asynchronously-updated *region* without a
+// live role: every shelf (songs, artists, albums, playlists) arrived silently
+// for a screen reader, so `/` → type → Enter changed the screen and announced
+// nothing. Polite, not assertive: a query that is still being refined should not
+// interrupt the field the user is typing into, and `aria-atomic="false"` means
+// only the shelves that actually changed are read — the search field and the
+// filter tabs are outside the region for exactly that reason.
 function searchPage() {
   return `<div class="page-head"><div><span class="page-overline">Explore something new</span>
     <h1 class="page-title">Search the sound<span class="accent">.</span></h1></div>
@@ -1085,7 +1150,7 @@ function searchPage() {
       <button class="search-clear" data-action="clear-search" aria-label="Clear search" ${state.search ? '' : 'hidden'}>${icon('close', 'sm')}</button>
       <span class="kbd-hint">ESC</span></div>
   </div>
-  <div id="search-results">${searchBody()}</div>`;
+  <div id="search-results" aria-live="polite" aria-atomic="false">${searchBody()}</div>`;
 }
 
 const MOODS = [
@@ -1630,7 +1695,7 @@ async function openAlbumFor(videoId, trigger = null) {
     if (known?.artist || known?.channel) q.set('artist', known.artist || known.channel);
     const { albumId } = await api(`/api/album/for/${encodeURIComponent(videoId)}?${q}`);
     if (!albumId) { notify('No album found for this track.', 'info'); return; }
-    if (known) trackIndex.set(videoId, { ...known, albumId });
+    if (known) { trackIndex.set(videoId, { ...known, albumId }); evictTrackIndex(); }
     await openCollection(`a${albumId}`);
   } catch (err) {
     notify(err.message, 'error');
@@ -2289,7 +2354,7 @@ function trackRows(tracks, headers = true, collection = null) {
           aria-label="Open the album ${esc(t.album)}" title="Open album">${esc(t.album)}</button>`
       : '<span class="track-album"></span>';
     return `<div class="track-row ${isNow ? 'active' : ''}" data-track="${esc(t.videoId)}"${collection ? ` data-coll="${esc(collection)}"` : ''}
-        role="row" tabindex="0" aria-label="Play ${esc(label)}"${isNow ? ' aria-current="true"' : ''}>
+        role="listitem" tabindex="0" aria-label="Play ${esc(label)}"${isNow ? ' aria-current="true"' : ''}>
       <div class="track-index"><span>${i + 1}</span>
         <span class="eq" aria-hidden="true"><i></i><i></i><i></i></span>${icon('play', 'xs')}</div>
       <div class="track-details">${cover(null, 'cover', t.thumb, 'lazy')}
@@ -2305,7 +2370,17 @@ function trackRows(tracks, headers = true, collection = null) {
         aria-label="More options for ${esc(t.title ?? '')}" aria-haspopup="menu">${icon('dots', 'sm')}</button>
     </div>`;
   }).join('');
-  return `<div class="track-list ${headers ? '' : 'compact'}">${head}${rows}</div>`;
+  // A list, not a table.
+  //
+  // The rows carried `role="row"` and nothing around them had a table role, so
+  // every track in every list was an orphan row: a required-parent violation on
+  // every page, and a row announced with no column context at all. A real
+  // `<table>`/`role="grid"` was not available without wrapping each cell — the
+  // row is a CSS grid of six columns and three of them *are* the buttons, which
+  // a cell role would strip of their button semantics and a wrapper would
+  // reflow. The list is what the markup actually is: an ordered set of playable
+  // entries, each already carrying its own name in `aria-label`.
+  return `<div class="track-list ${headers ? '' : 'compact'}" role="list">${head}${rows}</div>`;
 }
 
 function collectionSkeleton(type = 'Playlist') {
@@ -3545,6 +3620,12 @@ function overlaySignature() {
 function refreshOverlay({ force = false } = {}) {
   const shell = $('now-overlay');
   if (shell.hidden || shell.classList.contains('closing')) { overlaySig = ''; return; }
+  // A session that expired mid-song puts the sign-in form on top of everything;
+  // repainting the sheet underneath it (what this guard used to do, at the very
+  // end of the function, after every write) would be the one surface able to
+  // appear in front of a form the user has to fill in. The boot path closes the
+  // sheet itself; this is the guard for the tick right after.
+  if (!$('auth-overlay').hidden) return;
   const sig = overlaySignature();
   if (force || sig !== overlaySig) {
     const active = document.activeElement;
@@ -3571,10 +3652,7 @@ function refreshOverlay({ force = false } = {}) {
       b.setAttribute('aria-label', `${liked ? 'Remove from' : 'Add to'} liked songs`);
     });
   }
-  const dur = audio.duration || 0;
-  if (dur) $('now-content').style.setProperty('--progress', `${(audio.currentTime / dur) * 100}%`);
   if (!$('drawer-overlay').hidden) drawerHtml();
-  if (!$('auth-overlay').hidden) return;
 }
 
 async function loadLyrics() {
@@ -3629,6 +3707,7 @@ function queueRow(t, index, { current = false } = {}) {
 }
 
 function drawerHtml() {
+  const drawer = $('queue-drawer');
   const entries = state.queue.map((t, i) => ({ t, i }));
   const playing = state.index >= 0 ? state.queue[state.index] : null;
   // A window, not the whole queue: the drawer is repainted by refreshQueueViews
@@ -3645,7 +3724,16 @@ function drawerHtml() {
   const moreNote = (n, where) => (n
     ? `<p class="drawer-more field-hint">${n} more ${n === 1 ? 'track' : 'tracks'} ${where}</p>` : '');
   const count = `${state.queue.length} ${state.queue.length === 1 ? 'track' : 'tracks'}`;
-  $('queue-drawer').innerHTML = `<div class="drawer-top"><div><h2>Queue <span class="drawer-count">${count}</span></h2></div>
+  // innerHTML is a teardown, and this drawer is rebuilt on every track advance
+  // while it is open: a listener reading "Up next" had the list jump back to the
+  // top (they were sent back to the playing row) and the focused row's control
+  // land on <body> (Tab then restarted at the top of the document) once the
+  // track rolled over. Both are cheap to carry across the rebuild: the scroll
+  // offset is one number, the focus target is the same key every other repaint
+  // already uses (focusKey/restoreFocus, see render()).
+  const scrolled = drawer.scrollTop;
+  const focus = focusKey(document.activeElement);
+  drawer.innerHTML = `<div class="drawer-top"><div><h2>Queue <span class="drawer-count">${count}</span></h2></div>
       <button class="icon-btn" data-action="close-drawer" aria-label="Close queue">${icon('close')}</button></div>
     ${playing ? `<div class="drawer-list">${queueRow(playing, state.index, { current: true })}</div>` : ''}
     <div class="drawer-section"><span class="eyebrow">Up next</span><div class="drawer-list">
@@ -3654,6 +3742,9 @@ function drawerHtml() {
       ${moreNote(aheadMore, 'after these')}</div>
     ${earlier.length ? `<div class="drawer-section"><span class="eyebrow">Earlier</span><div class="drawer-list">${earlier.map(({ t, i }) => queueRow(t, i)).join('')}</div>
       ${moreNote(behindMore, 'before these')}</div>` : ''}`;
+  if (scrolled) drawer.scrollTop = scrolled;
+  restoreFocus(focus);
+  return drawer;
 }
 
 // ── queue reorder ───────────────────────────────────────────────────────
@@ -4698,6 +4789,90 @@ async function revokeOtherDevices() {
   }
 }
 
+// ── signing out ─────────────────────────────────────────────────────────
+//
+// Signing out is an account decision that three different buttons can make, so
+// the account-scoped half of localStorage is cleared in exactly one place. A
+// reload alone used to leave it all behind for whoever signed in next on this
+// browser: the raw search queries they typed, their settings and the two view
+// preferences the app remembers. Device-scoped keys stay, because they identify
+// the browser and not the account — `sonora.deviceId` (the row the device list
+// shows), `sonora.*` PWA install/update snoozes (written by pwa.js) and
+// `sonora.room` (where *this tab* was listening). Clearing those would re-prompt
+// on the very next visit, or silently drop a room the next account was rejoining.
+const ACCOUNT_STORAGE_KEYS = ['searchRecent', 'prefs', 'sort', 'libraryTab'];
+
+/**
+ * Drop every account-scoped key. Never throws: storage can be absent, full or
+ * refused (Safari private mode / a blocked-cookies profile), and signing out is
+ * not allowed to fail because a `removeItem` did.
+ */
+function clearAccountStorage() {
+  for (const key of ACCOUNT_STORAGE_KEYS) store.remove(key);
+}
+
+// One browser, many tabs. Signing out of one tab signs out the *session* — the
+// cookie is shared — but every other tab kept its user, its room and its refresh
+// timer, and simply carried on until its next request 401'd (an audio element
+// never re-asks, so that tab could keep playing). A BroadcastChannel is the
+// direct line; the `storage` event is the fallback, and it is the one that
+// cannot be unavailable, because it needs no API at all.
+const AUTH_CHANNEL = 'sonora-auth';
+const AUTH_STORAGE_KEY = 'sonora.auth';
+let authChannel = null;
+let authSyncBound = false;
+
+/** Create the channel and the storage listener once, on the page that needs it. */
+function authSync() {
+  if (authSyncBound) return authChannel;
+  authSyncBound = true;
+  try {
+    if (typeof BroadcastChannel === 'function') {
+      authChannel = new BroadcastChannel(AUTH_CHANNEL);
+      authChannel.onmessage = (event) => applySignedOut(event.data);
+    }
+  } catch { authChannel = null; }
+  // `storage` only fires in *other* tabs of this origin, which is exactly the
+  // audience: the tab that signed out is about to reload.
+  window.addEventListener('storage', (event) => {
+    if (event.key !== AUTH_STORAGE_KEY || !event.newValue) return;
+    try { applySignedOut(JSON.parse(event.newValue)); } catch {}
+  });
+  return authChannel;
+}
+
+/**
+ * Tell every other tab that this browser is signed out.
+ *
+ * The key carries a kind and a timestamp and nothing else. The write happens
+ * last and synchronously, so it is already queued for the other tabs when the
+ * caller's `location.reload()` runs — `BroadcastChannel.postMessage` alone was
+ * not a safe ordering: a reload can happen before the message is delivered.
+ */
+function broadcastSignOut() {
+  const stamp = { kind: 'signout', at: Date.now() };
+  try { authSync()?.postMessage(stamp); } catch {}
+  try { localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(stamp)); } catch {}
+}
+
+/** Another tab signed this browser out: become that tab. */
+function applySignedOut(message) {
+  if (!message || message.kind !== 'signout') return;
+  // A late delivery (a page restored from the freezer, an event that finally
+  // fired) must not sign out a session started since: the sign-out path writes
+  // its timestamp, so anything older than a minute is history.
+  if (Number.isFinite(message.at) && Date.now() - message.at > 60_000) return;
+  if (!$('auth-overlay').hidden) return;
+  // showAuth() is the whole teardown: it leaves the room, stops the refresh
+  // timer, pauses the element and raises the form.
+  showAuth();
+  notify('Signed out in another tab.', 'info');
+}
+
+// Listen from the moment the app runs, not from the first sign-out: the tab
+// that has to *hear* the news is by definition not the tab that sends it.
+authSync();
+
 async function signOutEverywhere() {
   const ok = await ask({
     title: 'Sign out everywhere?',
@@ -4707,6 +4882,10 @@ async function signOutEverywhere() {
   if (!ok) return;
   try {
     await api('/api/auth/signout-all', { method: 'POST' });
+    // This is the strongest sign-out there is, so it clears the most: every
+    // account-scoped key here, and every open tab told to leave as well.
+    clearAccountStorage();
+    broadcastSignOut();
     location.reload();
   } catch (err) {
     notify(err.message, 'error');
@@ -4808,6 +4987,15 @@ function applyAuthCaps() {
  * index.html and to whoever owns the shell, not here.
  */
 function showAuth() {
+  // A session that expires while a room is live must not leave this tab in it.
+  // The sign-in form is in front of everything, so nothing here can be *used*,
+  // but the room is server state and the shared-playhead client is still
+  // running inside it: its refresh loop would keep asking a 401 to sync, and
+  // the next person at this browser would inherit the room. Leave first (it
+  // fires its own goodbye, which a dead session simply refuses), then stop the
+  // renewal timer that only exists for a remembered device.
+  try { if (rooms.active) void rooms.leave?.(); } catch { /* a teardown never throws */ }
+  keepSessionAlive(false);
   closeOverlay('now-overlay');
   closeOverlay('drawer-overlay');
   closeOverlay('yt-overlay');
@@ -5332,7 +5520,13 @@ document.addEventListener('click', async (e) => {
       // cannot send two hand-overs, and the roster repaints from the snapshot
       // the server returns (which is what flips everyone's policy view).
       if (!rooms.active) break;
-      const who = Number(d.dataset.user);
+      // `d` is already the element's dataset (see `const d = el.dataset`), so
+      // this read used to be `d.dataset.user` — undefined.user, a TypeError on
+      // every tap: "Make host" threw, the hand-over never left the page, and the
+      // only trace was a toast reading "Cannot read properties of undefined
+      // (reading 'user')". Handing the seat over is the one escape from a room
+      // whose host has walked off, so the button has to work.
+      const who = Number(d.user);
       if (!Number.isInteger(who)) break;
       d.disabled = true;
       const label = d.textContent;
@@ -5462,14 +5656,12 @@ document.addEventListener('click', async (e) => {
     case 'logout':
       await api('/api/auth/logout', { method: 'POST' }).catch(() => {});
       // A reload alone leaves the previous account's data sitting in this
-      // browser for whoever signs in next: `sonora.searchRecent` is the raw
-      // queries they typed and `sonora.prefs` is their settings. Both belong to
-      // the account, so they go. Device-scoped keys stay, because they identify
-      // the browser and not the account: `sonora.deviceId` (the row the device
-      // list shows) and the PWA install/update snoozes (`sonora.pwa.*`, written
-      // by pwa.js) — clearing those would re-prompt on the very next visit.
-      store.remove('searchRecent');
-      store.remove('prefs');
+      // browser for whoever signs in next. See clearAccountStorage(): the
+      // account-scoped keys go, the device-scoped ones stay.
+      clearAccountStorage();
+      // Other tabs share this cookie, so they are signed out too — tell them
+      // before the reload (the write is synchronous; see broadcastSignOut()).
+      broadcastSignOut();
       location.reload();
       break;
 
@@ -5562,6 +5754,10 @@ document.addEventListener('click', async (e) => {
       });
       if (!ok) break;
       await api('/api/auth/logout', { method: 'POST' }).catch(() => {});
+      // Same teardown as the account menu's Sign out: this button signs the
+      // same session out and used to leave every account-scoped key behind.
+      clearAccountStorage();
+      broadcastSignOut();
       location.reload();
       break;
     }
@@ -6594,6 +6790,11 @@ async function uninviteById(id) {
 function loadRoomTrack(snapshot) {
   const track = snapshot.track;
   if (!track?.videoId) return;
+  // A snapshot can land after the session died (the room's own polling and the
+  // refresh timer both outlive the cookie for a beat). Loading the track would
+  // set a source and start it under the sign-in form, and the only control that
+  // could stop it is behind that form.
+  if (!$('auth-overlay').hidden) return;
   state.roomApplying = true;
   try {
     rememberTracks(snapshot.queue ?? []);
@@ -7381,27 +7582,28 @@ audio.addEventListener('timeupdate', () => {
   // Keeps the lock-screen scrubber honest while it is visible. Throttled
   // inside the module; this is a no-op when paused.
   if (state.playing) nowPlaying.position();
-  document.querySelectorAll('input[data-slider="progress"]').forEach((x) => {
-    if (document.activeElement === x) return;
-    x.value = String(Math.floor(pos));
-    if (dur) x.style.setProperty('--percent', `${(pos / dur) * 100}%`);
-  });
-  document.querySelectorAll('.elapsed').forEach((x) => { x.textContent = fmt(pos); });
-  const t = current();
+  // Scoped, not document-wide. This runs four times a second for the whole
+  // session, and `querySelectorAll` over the document allocated two NodeLists
+  // and walked every node in the player bar, the whole page and both overlays
+  // for a scrubber that only exists in three places: the player bar, the
+  // expanded sheet, and the room page's own timebar. `#page-root` is searched
+  // only while the room page is up — it is the one page with a playhead of its
+  // own, and the only other page-level list is tracks, which has no slider.
+  const surfaces = [$('player')];
+  if (!$('now-overlay').hidden) surfaces.push($('now-content'));
+  if (state.page === 'room') surfaces.push($('page-root'));
+  for (const root of surfaces) {
+    if (!root) continue;
+    for (const x of root.querySelectorAll('input[data-slider="progress"]')) {
+      if (document.activeElement === x) continue;
+      x.value = String(Math.floor(pos));
+      if (dur) x.style.setProperty('--percent', `${(pos / dur) * 100}%`);
+    }
+    for (const x of root.querySelectorAll('.elapsed')) x.textContent = fmt(pos);
+  }
   // Composited, not a custom-property write: see paintPlayerProgress.
   paintPlayerProgress(pos, dur);
-  // Keep the expanded sheet's scrubber honest without rebuilding it (a rebuild
-  // would fight the user's focus and the lyrics scroll position).
-  if (!$('now-overlay').hidden) {
-    const sheet = $('now-content');
-    const input = sheet.querySelector('[data-slider="progress"]');
-    if (input && document.activeElement !== input) {
-      input.value = String(Math.floor(pos));
-      if (dur) input.style.setProperty('--percent', `${(pos / dur) * 100}%`);
-    }
-    sheet.querySelectorAll('.elapsed').forEach((x) => { x.textContent = fmt(pos); });
-  }
-  if (t && state.playing) saveSession();
+  if (state.playing && current()) saveSession();
 });
 
 audio.addEventListener('loadedmetadata', () => {
@@ -8379,8 +8581,29 @@ async function checkServer() {
 // after coming back online) still gets a fresh one.
 let bootRun = null;
 
+/**
+ * Tell index.html's boot watchdog that the module graph loaded and ran.
+ *
+ * The watchdog covers the one failure a page cannot report about itself: app.js
+ * (or one of its static imports) failing to resolve out of a half-evicted
+ * service-worker cache leaves the skeleton painted and nothing else, forever,
+ * with no error the user can act on. It only needs to know that *this file
+ * executed* — every failure after that has a UI of its own (showAuth,
+ * showOffline, and boot()'s own catch) — so it is cleared here, before boot()
+ * spends its first request.
+ */
+function markBooted() {
+  try {
+    document.documentElement.dataset.sonoraBooted = '1';
+    clearTimeout(window.__sonoraBootWatch);
+    const banner = document.getElementById('boot-recovery');
+    if (banner) banner.hidden = true;
+  } catch { /* a watchdog is not worth failing a boot over */ }
+}
+
 async function boot() {
   if (bootRun) return bootRun;
+  markBooted();
   bootRun = bootOnce()
     .catch(async (err) => {
       // Last resort. boot() is called fire-and-forget, so an unexpected throw

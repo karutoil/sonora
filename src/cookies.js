@@ -305,16 +305,46 @@ export function storedCookiesPath() {
  * Unreadable is *not* implausible: a permissions problem is not evidence about
  * the cookies, and yt-dlp will report the real error itself.
  */
+/** Cached verdict for the stored jar, keyed by the file's (mtimeMs, size). */
+let jarVerdictCache = null;
+
 function storedJarLooksUsable(file) {
+  let meta;
   try {
-    const meta = JSON.parse(dbGet('youtube_cookies_meta') ?? 'null');
-    if (meta?.verdict?.status === 'rejected') return false;
+    meta = JSON.parse(dbGet('youtube_cookies_meta') ?? 'null');
   } catch { /* unreadable metadata: fall through to the file itself */ }
+  // A recorded 'rejected' verdict is a decision, not a measurement of the file:
+  // re-reading a jar that a live probe already refused would only repeat the
+  // probe's answer more slowly.
+  if (meta?.verdict?.status === 'rejected') return false;
+  let stat;
   try {
-    return inspectJar(parseNetscape(fs.readFileSync(file, 'utf8'))).plausible;
+    stat = fs.statSync(file);
   } catch {
     return true;
   }
+  // This runs on every selectedCookieSource() — i.e. on every download, every
+  // Innertube call and every status render — and each run used to read and parse
+  // the whole jar again. The file only changes through saveJar()/clearJar(),
+  // which bump (mtimeMs, size); anything else that touches it lands on a
+  // different key and is simply re-inspected.
+  const key = `${stat.mtimeMs}:${stat.size}`;
+  if (jarVerdictCache?.file === file && jarVerdictCache.key === key) return jarVerdictCache.usable;
+  let usable;
+  try {
+    usable = inspectJar(parseNetscape(fs.readFileSync(file, 'utf8'))).plausible;
+  } catch {
+    // Unreadable is *not* implausible: a permissions problem is not evidence
+    // about the cookies, and yt-dlp will report the real error itself.
+    usable = true;
+  }
+  jarVerdictCache = { file, key, usable };
+  return usable;
+}
+
+/** Drop the memoised verdict; the next check re-reads whatever is on disk now. */
+function forgetJarVerdict() {
+  jarVerdictCache = null;
 }
 
 /**
@@ -374,11 +404,21 @@ export function activeCookieHeader(request) {
 async function writeJarFile(target, text) {
   await fsp.mkdir(path.dirname(target), { recursive: true });
   const tmp = `${target}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  let handle;
   try {
-    await fsp.writeFile(tmp, text, { mode: 0o600 });
-    await fsp.chmod(tmp, 0o600).catch(() => { /* best effort on odd filesystems */ });
+    handle = await fsp.open(tmp, 'w', 0o600);
+    await handle.writeFile(text, 'utf8');
+    await handle.chmod(0o600).catch(() => { /* best effort on odd filesystems */ });
+    // The rename is atomic in the directory, but only for bytes that reached the
+    // disk. Without this fsync a power loss can leave the *renamed* file empty —
+    // yt-dlp then reports an authentication failure that is indistinguishable
+    // from an expired jar, and the encrypted copy is the only thing left.
+    await handle.sync();
+    await handle.close();
+    handle = null;
     await fsp.rename(tmp, target);
   } catch (err) {
+    await handle?.close().catch(() => {});
     await fsp.unlink(tmp).catch(() => {});
     throw err;
   }
@@ -419,7 +459,11 @@ export async function saveJar(cookies, text, verdict = null) {
   // Normalise before writing: `text` may be a JSON export (see parseJsonCookies),
   // and only Netscape cookies.txt is usable by yt-dlp.
   const jarText = toNetscape(normalised);
-  await writeJarFile(storedCookiesPath(), jarText);
+  // The encrypted row goes first: the plaintext jar is the convenience copy (it
+  // is what yt-dlp reads), while the row is the one that survives a lost file.
+  // Writing it second meant a failed INSERT left a working-looking cookies.txt
+  // with no recovery copy and no import metadata — and restoreJar() would find
+  // nothing to restore.
   dbSet('youtube_cookies', encrypt(jarText));
   dbSet('youtube_cookies_meta', JSON.stringify({
     importedAt: new Date().toISOString(),
@@ -427,6 +471,8 @@ export async function saveJar(cookies, text, verdict = null) {
     expiresAt: info.expiresAt,
     ...(verdict ? { verdict } : {}),
   }));
+  await writeJarFile(storedCookiesPath(), jarText);
+  forgetJarVerdict();
   return info;
 }
 
@@ -442,6 +488,7 @@ export async function clearJar() {
   // remaining row can be restored/retried rather than leaving an active secret.
   dbDel('youtube_cookies');
   dbDel('youtube_cookies_meta');
+  forgetJarVerdict();
 }
 
 /** Re-materialise the jar at boot so a restart does not lose the session. */

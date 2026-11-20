@@ -162,8 +162,10 @@ function rankForSort(v, wantsCleanEdit) {
  * was always documented to mean — it used to be a score bonus only, so a
  * 15-second teaser scored exactly like a song.
  */
-export function isSongDuration({ durationS } = {}) {
-  const d = secondsOf(durationS);
+export function isSongDuration(track = {}) {
+  // A null/undefined row is "no metadata", not a crash: callers pass whatever a
+  // parser produced, and this used to throw on `isSongDuration(null)`.
+  const d = secondsOf(track?.durationS);
   if (d == null) return true;
   return d >= MIN_SONG_SECONDS && d <= MAX_SONG_SECONDS;
 }
@@ -252,16 +254,21 @@ export function isOfficialChannel(channel, artist) {
 }
 
 /** A 4-hour "playlist" video, a full-album upload, a non-stop megamix. */
-export function isCompilation({ title, durationS } = {}) {
-  const seconds = secondsOf(durationS);
+export function isCompilation(track = {}) {
+  // Same guard as isSongDuration: a missing row has no duration and no title, so
+  // it is not a compilation — it used to throw when destructured from null.
+  const seconds = secondsOf(track?.durationS);
   if (seconds != null && seconds > MAX_SONG_SECONDS) return true;
-  const t = String(title ?? '');
+  const t = String(track?.title ?? '');
   if (/\b(?:\d+\s*(?:hours?|hrs?)|hours?\s+of)\b/i.test(t)) return true;
   return /\b(?:full\s+album|non[- ]?stop|mixtape|megamix)\b/i.test(t);
 }
 
 export function toCount(v) {
-  if (typeof v === 'number') return v;
+  // A number is only a count when it is finite: `NaN`/`Infinity` (an unparsed
+  // metric, or 1e400 out of JSON) used to be returned as-is and then sorted
+  // arbitrary pages against each other.
+  if (typeof v === 'number') return Number.isFinite(v) ? v : 0;
   const m = /([\d.]+)\s*([KMB])?/i.exec(String(v ?? '').replace(/,/g, ''));
   if (!m) return 0;
   const n = Number(m[1]);
@@ -471,9 +478,13 @@ export function rankTracks(tracks, { query = '', limit = 20, maxPerTitle = 3 } =
   const perTitle = new Map();
   const out = [];
   const stamp = (t) => {
+    // Never write to the caller's row: the same objects come from a cached
+    // upstream answer and are shared with other callers (search results, the
+    // station, share cards). Marking a version on them would leak one page's
+    // decision into every later one. A copy is returned only when there is
+    // something to add; otherwise the row is already correct.
     const v = trackVersion(t);
-    if (v && !t.version) t.version = v;
-    return t;
+    return v && !t.version ? { ...t, version: v } : t;
   };
   for (const { t, described } of prepared) {
     const version = trackVersion(t);

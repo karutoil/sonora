@@ -381,6 +381,32 @@ test('listen pages are precached best-effort but never required', () => {
   }
 });
 
+test('the launcher shortcut icons are precached best-effort, never required', () => {
+  // A phone that installs sonora and goes offline the first time it opens the
+  // launcher menu drew four blank tiles: the shortcut icons are in the manifest
+  // and nowhere in the shell. They belong in the install, and they belong in it
+  // as *optional* entries — a cosmetic bitmap must never be able to refuse an
+  // install the way a boot module can.
+  const block = SW.match(/const PRECACHE_OPTIONAL = \[([\s\S]*?)\];/);
+  assert.ok(block, 'sw.js has no PRECACHE_OPTIONAL list');
+  const optional = [...block[1].matchAll(/'([^']+)'/g)].map((m) => m[1]);
+  const required = requiredList();
+  const wanted = (manifest.shortcuts ?? []).flatMap((s) => (s.icons ?? []).map((i) => i.src));
+  assert.equal(wanted.length, 4, 'the manifest lost a shortcut icon');
+  for (const url of wanted) {
+    assert.ok(optional.includes(url), `PRECACHE_OPTIONAL is missing ${url} (an offline launcher tile has no icon)`);
+    assert.ok(!required.includes(url), `${url} is required: one missing tile would refuse the whole install`);
+    assert.ok(fs.existsSync(path.join(PUB, url.replace(/^\//, ''))),
+      `PRECACHE_OPTIONAL lists a 404: ${url} — every install would spend a request on it`);
+  }
+  // Fetched one URL at a time, each failure swallowed: `addAll` would let the
+  // first 404 reject the batch and leave the other three uncached.
+  assert.match(SW, /PRECACHE_OPTIONAL\.map\(async \(url\) => \{[\s\S]{0,400}?catch/,
+    'the optional list is not fetched per-URL with its own failure path');
+  assert.doesNotMatch(SW, /cache\.addAll\(PRECACHE_OPTIONAL/,
+    'addAll on the optional list is all-or-nothing, which is the bug this list exists to avoid');
+});
+
 test('service worker never caches API responses, streams or non-GET', () => {
   assert.match(SW, /request\.method !== 'GET'\) return/);
   assert.match(SW, /\^\\\/api\\\//);
@@ -585,6 +611,38 @@ test('the offline page says it is retrying instead of reloading silently', () =>
   assert.match(OFFLINE, /retry\.disabled = true/);
   assert.match(OFFLINE, /Retrying…/);
   assert.match(OFFLINE, /location\.reload\(\)/);
+});
+
+test('the offline page leaves by itself when the connection comes back', () => {
+  // Nothing on this page polls, and the worker serves it for "the origin did
+  // not answer", so a page that only offered a button sat there claiming there
+  // was no connection while the connection was back.
+  assert.match(OFFLINE, /addEventListener\('online'/,
+    'the offline page does not listen for the connection returning');
+  assert.match(OFFLINE, /addEventListener\('online'[\s\S]{0,200}location\.reload\(\)/,
+    'the online listener must reload, and the reload is the whole recovery');
+  assert.match(OFFLINE, /navigator\.onLine/,
+    'a reload while still offline only serves this page again');
+});
+
+test('index.html explains a dead script instead of showing a blank app forever', () => {
+  // With scripting off, or with app.js unable to resolve out of a half-evicted
+  // shell, this document painted a header, a player bar and an empty page root
+  // — and never said why.
+  assert.match(INDEX, /<noscript>/);
+  assert.match(INDEX, /needs JavaScript/);
+  // The watchdog: inline (it must run when nothing else can), 5 s, and a banner
+  // that carries the reload itself rather than depending on app.js for it.
+  assert.match(INDEX, /id="boot-recovery"/);
+  assert.match(INDEX, /id="boot-recovery"[\s\S]{0,400}role="alert"/);
+  assert.match(INDEX, /setTimeout\(function \(\) \{[\s\S]{0,200}\}, 5000\)/,
+    'the boot watchdog is not a 5 s timer');
+  assert.match(INDEX, /<a href="\/" id="boot-recovery-reload"/,
+    'the recovery banner needs a reload that works with scripting already broken');
+  // The page that *does* boot must clear it, or every slow boot grows a banner.
+  const APP = read('public/app.js');
+  assert.match(APP, /document\.documentElement\.dataset\.sonoraBooted = '1'/);
+  assert.match(APP, /clearTimeout\(window\.__sonoraBootWatch\)/);
 });
 
 test('install copy promises the shell, never offline playback', () => {
@@ -892,57 +950,59 @@ test('an offline reload paints the shell, not a browser error', async (t) => {
   const workerOffline = await session.offline(true);
   assert.ok(workerOffline, 'no service_worker target found — cannot emulate a real offline device');
 
-  await browser.goto(`${BASE}/`);
-  const state = await browser.eval(`(() => {
-    const pill = document.querySelector('.pwa-pill[data-kind="offline"]');
-    const player = document.querySelector('.player');
-    const rect = (el) => el ? el.getBoundingClientRect() : null;
-    const p = rect(pill);
-    const pl = rect(player);
-    return {
-      online: navigator.onLine,
-      title: document.title,
-      app: !!document.querySelector('.app'),
-      chromeError: /ERR_INTERNET_DISCONNECTED|No internet/.test(document.body.innerText || ''),
-      pill: pill ? pill.textContent : null,
-      pillRect: p ? { top: p.top, bottom: p.bottom, left: p.left, right: p.right } : null,
-      playerRect: pl ? { top: pl.top } : null,
-      vh: innerHeight,
-      vw: innerWidth,
-    };
-  })()`);
+  try {
+    await browser.goto(`${BASE}/`);
+    const state = await browser.eval(`(() => {
+      const pill = document.querySelector('.pwa-pill[data-kind="offline"]');
+      const player = document.querySelector('.player');
+      const rect = (el) => el ? el.getBoundingClientRect() : null;
+      const p = rect(pill);
+      const pl = rect(player);
+      return {
+        online: navigator.onLine,
+        title: document.title,
+        app: !!document.querySelector('.app'),
+        chromeError: /ERR_INTERNET_DISCONNECTED|No internet/.test(document.body.innerText || ''),
+        pill: pill ? pill.textContent : null,
+        pillRect: p ? { top: p.top, bottom: p.bottom, left: p.left, right: p.right } : null,
+        playerRect: pl ? { top: pl.top } : null,
+        vh: innerHeight,
+        vw: innerWidth,
+      };
+    })()`);
 
-  assert.equal(state.online, false, 'the page should know it is offline');
-  assert.equal(state.app, true, 'the cached shell did not render');
-  assert.equal(state.chromeError, false, 'Chromium rendered its own network error page');
-  assert.match(state.title, /sonora/);
-  assert.match(state.pill ?? '', /offline/i, 'no offline pill was announced');
-  assert.ok(state.pillRect, 'the offline pill has no box');
-  // The pill has to sit above the mini player and inside the viewport.
-  assert.ok(state.pillRect.bottom <= state.playerRect.top,
-    `pill ends at ${state.pillRect.bottom}px, over the player starting at ${state.playerRect.top}px`);
-  assert.ok(state.pillRect.top >= 0 && state.pillRect.left >= 0 && state.pillRect.right <= state.vw,
-    'offline pill is clipped by the viewport');
+    assert.equal(state.online, false, 'the page should know it is offline');
+    assert.equal(state.app, true, 'the cached shell did not render');
+    assert.equal(state.chromeError, false, 'Chromium rendered its own network error page');
+    assert.match(state.title, /sonora/);
+    assert.match(state.pill ?? '', /offline/i, 'no offline pill was announced');
+    assert.ok(state.pillRect, 'the offline pill has no box');
+    // The pill has to sit above the mini player and inside the viewport.
+    assert.ok(state.pillRect.bottom <= state.playerRect.top,
+      `pill ends at ${state.pillRect.bottom}px, over the player starting at ${state.playerRect.top}px`);
+    assert.ok(state.pillRect.top >= 0 && state.pillRect.left >= 0 && state.pillRect.right <= state.vw,
+      'offline pill is clipped by the viewport');
 
-  // The shell is not the document alone: app.js is an ES module graph, and a
-  // static import that is not in PRECACHE fails *after* the page paints — the
-  // app then never boots while every "does it render" check still passes. A
-  // dynamic import is the honest witness: it resolves for a module the worker
-  // served from the cache and rejects for one it had to answer with its 503.
-  // (Resource Timing cannot tell the two apart: a 503 is still an entry.)
-  const graph = await browser.eval(`(async () => {
-    const out = {};
-    for (const url of ['/app.js', '/audio-session.js', '/media-session.js', '/playback.js', '/rooms.js']) {
-      out[url] = await import(url).then(() => true).catch(() => false);
+    // The shell is not the document alone: app.js is an ES module graph, and a
+    // static import that is not in PRECACHE fails *after* the page paints — the
+    // app then never boots while every "does it render" check still passes. A
+    // dynamic import is the honest witness: it resolves for a module the worker
+    // served from the cache and rejects for one it had to answer with its 503.
+    // (Resource Timing cannot tell the two apart: a 503 is still an entry.)
+    const graph = await browser.eval(`(async () => {
+      const out = {};
+      for (const url of ['/app.js', '/audio-session.js', '/media-session.js', '/playback.js', '/rooms.js']) {
+        out[url] = await import(url).then(() => true).catch(() => false);
+      }
+      return out;
+    })()`);
+    for (const [url, ok] of Object.entries(graph)) {
+      assert.equal(ok, true, `${url} did not load offline: the app.js module graph is broken`);
     }
-    return out;
-  })()`);
-  for (const [url, ok] of Object.entries(graph)) {
-    assert.equal(ok, true, `${url} did not load offline: the app.js module graph is broken`);
+  } finally {
+    // Coming back online recovers by itself.
+    await session.offline(false).catch(() => {});
   }
-
-  // Coming back online recovers by itself.
-  await session.offline(false);
   await browser.eval(`window.dispatchEvent(new Event('online'))`);
   await browser.waitFor(`!document.querySelector('.pwa-pill[data-kind="offline"]')`, 6000);
 });
@@ -967,21 +1027,23 @@ test('with no cached shell the worker serves the branded offline page', async (t
   })()`);
 
   await session.offline(true);
-  await browser.goto(`${BASE}/`);
-  const state = await browser.eval(`({
-    retry: !!document.getElementById('retry'),
-    app: !!document.querySelector('.app'),
-    text: (document.body.innerText || '').toLowerCase(),
-    reload: document.querySelector('a.reload')?.getAttribute('href'),
-    title: document.title,
-  })`);
-  assert.equal(state.retry, true, 'offline page has no Retry button');
-  assert.equal(state.app, false, 'served the app shell even though it is not cached');
-  assert.match(state.text, /offline|connection/);
-  assert.equal(state.reload, '/');
-  assert.match(state.title, /offline/);
-
-  await session.offline(false);
+  try {
+    await browser.goto(`${BASE}/`);
+    const state = await browser.eval(`({
+      retry: !!document.getElementById('retry'),
+      app: !!document.querySelector('.app'),
+      text: (document.body.innerText || '').toLowerCase(),
+      reload: document.querySelector('a.reload')?.getAttribute('href'),
+      title: document.title,
+    })`);
+    assert.equal(state.retry, true, 'offline page has no Retry button');
+    assert.equal(state.app, false, 'served the app shell even though it is not cached');
+    assert.match(state.text, /offline|connection/);
+    assert.equal(state.reload, '/');
+    assert.match(state.title, /offline/);
+  } finally {
+    await session.offline(false).catch(() => {});
+  }
 
   // The test above deleted '/' from the shell cache to simulate a missing
   // shell; put it back (we are online again) so the navigation test below
@@ -1007,45 +1069,47 @@ test('offline deep links get the offline page, the app root gets the shell', asy
   // isolated name-pattern run nothing has installed one yet. Wait for it here
   // rather than depending on a previous test's side effects.
   await browser.waitFor(`navigator.serviceWorker.ready.then(() => true)`, 20000);
+  await browser.waitFor(`navigator.serviceWorker.controller !== null`, 20000);
   await browser.waitFor(`${shellPaths}.then((paths) => !!paths && paths.includes('/') && paths.includes('/offline.html'))`, 30000);
 
   await session.offline(true);
+  try {
+    // /l/<code> is a real server route (Listen Together guest page), not an app
+    // hash route. The cached shell cannot render it, so the worker must answer
+    // with the self-explanatory offline page rather than the signed-in app.
+    await browser.goto(`${BASE}/l/xyz`);
+    const link = await browser.eval(`({
+      retry: !!document.getElementById('retry'),
+      app: !!document.querySelector('.app'),
+      title: document.title,
+    })`);
+    assert.equal(link.app, false, 'an offline /l/<code> deep link was served the app shell');
+    assert.equal(link.retry, true, 'an offline /l/<code> deep link did not get the offline page');
+    assert.match(link.title, /offline/);
 
-  // /l/<code> is a real server route (Listen Together guest page), not an app
-  // hash route. The cached shell cannot render it, so the worker must answer
-  // with the self-explanatory offline page rather than the signed-in app.
-  await browser.goto(`${BASE}/l/xyz`);
-  const link = await browser.eval(`({
-    retry: !!document.getElementById('retry'),
-    app: !!document.querySelector('.app'),
-    title: document.title,
-  })`);
-  assert.equal(link.app, false, 'an offline /l/<code> deep link was served the app shell');
-  assert.equal(link.retry, true, 'an offline /l/<code> deep link did not get the offline page');
-  assert.match(link.title, /offline/);
+    // The app root is the offline app itself: the cached shell (plus the offline
+    // pill pwa.js raises) is still the right answer there.
+    await browser.goto(`${BASE}/`);
+    const root = await browser.eval(`({
+      app: !!document.querySelector('.app'),
+      title: document.title,
+    })`);
+    assert.equal(root.app, true, 'an offline / was not served the cached shell');
+    assert.match(root.title, /sonora/);
 
-  // The app root is the offline app itself: the cached shell (plus the offline
-  // pill pwa.js raises) is still the right answer there.
-  await browser.goto(`${BASE}/`);
-  const root = await browser.eval(`({
-    app: !!document.querySelector('.app'),
-    title: document.title,
-  })`);
-  assert.equal(root.app, true, 'an offline / was not served the cached shell');
-  assert.match(root.title, /sonora/);
-
-  // /index.html is the same document as '/', not a deep link: a bookmark or a
-  // QR code that spells it out must still get the app offline.
-  await browser.goto(`${BASE}/index.html`);
-  const spelled = await browser.eval(`({
-    app: !!document.querySelector('.app'),
-    retry: !!document.getElementById('retry'),
-    title: document.title,
-  })`);
-  assert.equal(spelled.app, true, 'an offline /index.html got the offline page instead of the app');
-  assert.equal(spelled.retry, false, 'an offline /index.html was treated as a deep link');
-
-  await session.offline(false);
+    // /index.html is the same document as '/', not a deep link: a bookmark or a
+    // QR code that spells it out must still get the app offline.
+    await browser.goto(`${BASE}/index.html`);
+    const spelled = await browser.eval(`({
+      app: !!document.querySelector('.app'),
+      retry: !!document.getElementById('retry'),
+      title: document.title,
+    })`);
+    assert.equal(spelled.app, true, 'an offline /index.html got the offline page instead of the app');
+    assert.equal(spelled.retry, false, 'an offline /index.html was treated as a deep link');
+  } finally {
+    await session.offline(false).catch(() => {});
+  }
 });
 
 test('a gateway 502 falls back to the cached shell, not Cloudflare', async (t) => {
@@ -1397,7 +1461,15 @@ test('an idle page takes a waiting update itself; a playing one is asked', async
     proxy.setVersion('v9');
     await updateBrowser.eval(`window.__beforeUpdate = true`);
     await updateBrowser.eval(`navigator.serviceWorker.getRegistration().then((registration) => registration.update())`);
+    // A `window` marker disappears the moment the old document is replaced, which
+    // is well before the new one has parsed: the assertions below read `#audio`
+    // and the player, so wait for the document they actually need. (Under load
+    // this ran against a partially parsed page and `Object.defineProperty` got a
+    // null element.)
     await updateBrowser.waitFor(`window.__beforeUpdate === undefined`, 30000);
+    await updateBrowser.waitFor(
+      `document.readyState === 'complete' && !!document.getElementById('audio')`, 20_000,
+    );
 
     const after = await updateBrowser.eval(`(async () => ({
       caches: await caches.keys(),
@@ -1433,6 +1505,9 @@ test('an idle page takes a waiting update itself; a playing one is asked', async
     await updateBrowser.eval(`window.__beforeUpdate2 = true`);
     await updateBrowser.eval(`document.querySelector('.pwa-pill[data-kind="update"] .pwa-pill-action').click()`);
     await updateBrowser.waitFor(`window.__beforeUpdate2 === undefined`, 20000);
+    await updateBrowser.waitFor(
+      `document.readyState === 'complete' && !!document.getElementById('audio')`, 20_000,
+    );
     const after2 = await updateBrowser.eval(`(async () => ({ caches: await caches.keys() }))()`);
     assert.ok(after2.caches.includes('sonora-shell-v10'), `tap did not reach v10: ${after2.caches.join(', ')}`);
   } finally {
@@ -1804,6 +1879,108 @@ test('iOS Safari offers a Home Screen sheet that is keyboard operable', async (t
   await iosBrowser.waitFor(`!document.querySelector('.pwa-banner')`, 3000);
   const until = await iosBrowser.eval(`Number(localStorage.getItem('sonora.pwa.install-snoozed-until'))`);
   assert.ok(until > Date.now() + 13 * 86_400_000);
+});
+
+test('the offline page reloads itself the moment the connection returns', async (t) => {
+  if (!browser) return t.skip('no chromium available; set CHROME_BIN to enable');
+
+  await browser.goto(`${BASE}/offline.html`);
+  // A marker on `window` cannot survive a document load, so its disappearance
+  // is the proof that the `online` event really reloaded the page (and not
+  // that something merely repainted).
+  await browser.eval(`(() => { window.__offlineDoc = true; return true; })()`);
+  await browser.eval(`window.dispatchEvent(new Event('online'))`);
+  await browser.waitFor(`window.__offlineDoc === undefined`, 10_000);
+  const after = await browser.eval(`({
+    title: document.title,
+    retry: !!document.getElementById('retry'),
+  })`);
+  assert.match(after.title, /offline|sonora/i, 'the reload landed on a real document');
+  assert.equal(after.retry, true, 'and it is the same offline page (this origin is still answering)');
+});
+
+test('a boot whose module never loads says so instead of showing a blank app', async (t) => {
+  if (!browser) return t.skip('no chromium available; set CHROME_BIN to enable');
+
+  // A fresh profile, so /app.js is a real network request (no worker, no HTTP
+  // cache), and that request is refused: the document paints its skeleton and
+  // nothing else ever runs. This is the state a half-evicted offline cache
+  // leaves a phone in.
+  const dead = await launch(await freePort());
+  try {
+    await dead.send('Network.enable');
+    await dead.send('Network.setBlockedURLs', { urls: ['*app.js*'] });
+    await dead.goto(`${BASE}/`);
+    await dead.waitFor(`document.getElementById('boot-recovery')?.hidden === false`, 20_000);
+    const banner = await dead.eval(`(() => {
+      const box = document.getElementById('boot-recovery');
+      return {
+        text: box.textContent.replace(/\\s+/g, ' ').trim(),
+        role: box.getAttribute('role'),
+        reload: document.getElementById('boot-recovery-reload')?.getAttribute('href'),
+        app: !!document.querySelector('#mobile-nav button'),
+      };
+    })()`);
+    assert.match(banner.text, /did not finish loading/i, 'the banner names the failure');
+    assert.equal(banner.role, 'alert', 'it is announced, not just drawn');
+    assert.equal(banner.reload, '/', 'and it carries a reload that needs no script');
+    assert.equal(banner.app, false, 'the module really did not run');
+  } finally {
+    dead.close();
+  }
+});
+
+test('a browser that refuses localStorage still boots and can sign out', async (t) => {
+  if (!browser) return t.skip('no chromium available; set CHROME_BIN to enable');
+
+  // Safari private mode (and a blocked-cookies profile) throws on every write
+  // to localStorage. Every write in the app is already wrapped; this is the
+  // behavioural proof, because the failure mode is silent — one unwrapped
+  // removeItem in the sign-out path and the user is left signed in with the
+  // next account's settings in place, or a click that does nothing at all.
+  const priv = await launch(await freePort());
+  try {
+    await priv.addInitScript(`
+      for (const method of ['setItem', 'removeItem']) {
+        const original = Storage.prototype[method];
+        Storage.prototype[method] = function () {
+          if (this === window.localStorage) {
+            const err = new Error('QuotaExceededError: storage is disabled');
+            err.name = 'QuotaExceededError';
+            throw err;
+          }
+          return original.apply(this, arguments);
+        };
+      }
+    `);
+    await priv.goto(`${BASE}/`);
+    const status = await priv.eval(`fetch('/api/auth/login', { method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }) }).then((r) => r.status)`);
+    assert.equal(status, 200, 'this profile can sign in');
+    await priv.goto(`${BASE}/?priv=${Date.now()}`);
+    await priv.waitFor(`!!document.querySelector('#mobile-nav button')
+      && document.getElementById('auth-overlay').hidden === true`, 20_000);
+    assert.equal(await priv.eval(`document.getElementById('auth-overlay').hidden`), true,
+      'the app boots with a storage that throws on every write');
+
+    // Sign out through the real button: the account-scoped cleanup runs before
+    // the reload, and a throw there would leave the marker (and this page) up.
+    await priv.eval(`(() => { window.__beforeSignOut = true; return true; })()`);
+    await priv.eval(`document.querySelector('[data-action="logout"]').click()`);
+    await priv.waitFor(`window.__beforeSignOut === undefined`, 15_000);
+    await priv.waitFor(`document.getElementById('auth-overlay').hidden === false`, 15_000);
+    const after = await priv.eval(`({
+      overlay: document.getElementById('auth-overlay').hidden,
+      form: !!document.getElementById('auth-form'),
+      nav: !!document.querySelector('#mobile-nav button'),
+    })`);
+    assert.equal(after.overlay, false, 'the reload did not land on the sign-in screen');
+    assert.equal(after.form, true, 'and the sign-in form is painted');
+    assert.equal(after.nav, false, 'a signed-out page must not paint the signed-in navigation');
+  } finally {
+    priv.close();
+  }
 });
 
 // The browser lane above must actually run on a machine that claims to be a

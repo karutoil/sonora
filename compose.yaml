@@ -33,21 +33,32 @@ services:
     env_file:
       - .env
     environment:
+      # Every value here is an override of the documented default, not a hard
+      # assignment: `.env` is read for interpolation, so an operator can change
+      # HOST/PORT or point the PO-token provider at another host without editing
+      # this file. `:-` falls back when the variable is unset *or empty*; `-` only
+      # when unset, which is what lets an empty SONORA_POT_PROVIDER/JS_RUNTIME
+      # disable that feature (README documents both as "empty disables it").
+      #
       # Inside the container the server must listen on all interfaces, not the
       # loopback default, or the published port has nothing behind it.
-      HOST: 0.0.0.0
-      PORT: "8130"
+      HOST: "${HOST:-0.0.0.0}"
+      # The host port stays 8130 (the port every URL and bookmark uses); the
+      # container port follows PORT so an override does not silently break the
+      # published mapping below.
+      PORT: "${PORT:-8130}"
       # The bgutil PO-token provider runs as its own container on the host
       # (port 4416). 127.0.0.1 inside a container is the container itself.
-      SONORA_POT_PROVIDER: http://host.containers.internal:4416
+      SONORA_POT_PROVIDER: "${SONORA_POT_PROVIDER-http://host.containers.internal:4416}"
       # yt-dlp 2026.x solves YouTube's JS challenges with a runtime. Config
       # auto-detects a deno install under $HOME, which does not exist in this
       # image, so point it at the node binary that is already here.
-      SONORA_JS_RUNTIME: node:/usr/local/bin/node
+      SONORA_JS_RUNTIME: "${SONORA_JS_RUNTIME-node:/usr/local/bin/node}"
     ports:
       # Same address and port as dev: loopback only, fronted by the tunnel.
       # Set SONORA_BIND=0.0.0.0 in .env to expose it on the LAN instead.
-      - "${SONORA_BIND:-127.0.0.1}:8130:8130"
+      # Host 8130 is fixed; the container side follows a PORT override.
+      - "${SONORA_BIND:-127.0.0.1}:8130:${PORT:-8130}"
     # Rootless podman adds the keep-id mapping via compose.podman.yaml. It stays
     # out of this file because Docker uses ordinary host uid/gid ownership instead.
     volumes:
@@ -78,6 +89,9 @@ services:
       start_period: 25s
       retries: 3
     logging:
+      # journald is Linux-only. On Docker Desktop (macOS/Windows) the daemon has
+      # no journald socket and `docker compose up` fails; comment this block out
+      # there to fall back to Docker's default json-file driver.
       driver: journald
       options:
         tag: sonora

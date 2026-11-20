@@ -23,8 +23,13 @@
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const ROOT = new URL('..', import.meta.url).pathname;
+// fileURLToPath, not `.pathname`: pathname is percent-encoded, so a checkout in
+// a directory with a space or a non-ASCII character ("/home/me/my repo") turned
+// into a path `node --check` could not open. This is also why the script no
+// longer depends on the caller's working directory.
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 // test/ is not swept on purpose: it is 40 files of fixture-heavy code, and a
 // syntax error there fails the test job within seconds anyway with a far better
@@ -52,7 +57,7 @@ function jsFiles(dir, out = []) {
 
 const files = ROOTS.flatMap((rel) => jsFiles(path.join(ROOT, rel))).sort();
 if (!files.length) {
-  console.error('check-syntax: no files found — run this from the repo root');
+  console.error('check-syntax: no files found — the src/, public/ and scripts/ directories are missing next to this script');
   process.exit(1);
 }
 

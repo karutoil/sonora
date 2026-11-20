@@ -31,6 +31,27 @@ function composeService() {
   return text.slice(start);
 }
 
+/**
+ * The compose interpolation this file relies on, implemented for `${VAR:-def}`
+ * (unset *or empty* -> default) and `${VAR-def}` (unset -> default, empty kept).
+ * Tests use it to prove both the documented default and an .env override,
+ * instead of asserting on the literal text of one line.
+ */
+function interpolate(value, env = {}) {
+  return value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)(:?-)([^}]*)\}/g, (_, name, op, fallback) => {
+    const set = Object.prototype.hasOwnProperty.call(env, name);
+    if (op === ':-') return set && env[name] !== '' ? env[name] : fallback;
+    return set ? env[name] : fallback;
+  });
+}
+
+/** One `NAME: "${NAME...}"` environment entry, with its operator and default. */
+function composeEnv(name) {
+  const m = new RegExp(`^\\s{6}${name}:\\s*"(\\$\\{${name}(:?-)([^}]*)\\})"`, 'm').exec(composeService());
+  assert.ok(m, `compose.yaml declares ${name} as an interpolated environment value`);
+  return { expression: m[1], operator: m[2], fallback: m[3] };
+}
+
 test('compose publishes the same port the dev server uses', async () => {
   const { config } = await import('../src/config.js');
   const compose = composeService();
@@ -38,25 +59,45 @@ test('compose publishes the same port the dev server uses', async () => {
   // The dev default lives in src/config.js; the container must agree with it.
   assert.equal(config.port, 8130, 'dev default port is 8130');
 
-  const mapping = /-\s*"\$\{SONORA_BIND:-[^}]+\}:(\d+):(\d+)"/.exec(compose);
+  const mapping = /-\s*"(\$\{SONORA_BIND:-[^}]+\}):(\d+):(\$\{PORT(:?-)(\d+)\})"/.exec(compose);
   assert.ok(mapping, 'compose.yaml has a host:container port mapping');
-  const [, hostPort, containerPort] = mapping;
+  const [, bind, hostPort, portExpression, , containerDefault] = mapping;
   assert.equal(hostPort, String(config.port), 'host port matches the dev port');
-  assert.equal(containerPort, String(config.port), 'container port matches the dev port');
+  assert.equal(containerDefault, String(config.port), 'container port matches the dev port');
+  // The expression keeps the published host port stable while letting .env move
+  // the container's listener; both sides resolve to the dev port by default.
+  assert.equal(interpolate(portExpression, {}), String(config.port));
+  assert.equal(interpolate(portExpression, { PORT: '9000' }), '9000');
+  assert.equal(interpolate(bind, {}), '127.0.0.1');
 });
 
 test('the container listens on all interfaces, not loopback', () => {
   const compose = composeService();
   // Without this the app binds 127.0.0.1 *inside* the container and the
   // published port answers nothing — verified by trying it.
-  assert.match(compose, /HOST:\s*0\.0\.0\.0/, 'HOST is overridden to 0.0.0.0');
+  const { expression, operator, fallback } = composeEnv('HOST');
+  assert.equal(fallback, '0.0.0.0', 'HOST defaults to 0.0.0.0');
+  assert.equal(operator, ':-', 'an empty HOST still falls back to the container default');
+  assert.equal(interpolate(expression, {}), '0.0.0.0');
+  assert.equal(interpolate(expression, { HOST: '127.0.0.1' }), '127.0.0.1', '.env can override HOST');
 });
 
 test('the POT provider and JS runtime are wired for the container', () => {
   const compose = composeService();
   // 127.0.0.1 in a container is the container; the provider is on the host.
-  assert.match(compose, /SONORA_POT_PROVIDER:\s*http:\/\/host\.containers\.internal:4416/);
-  assert.match(compose, /SONORA_JS_RUNTIME:\s*node:/);
+  const pot = composeEnv('SONORA_POT_PROVIDER');
+  assert.equal(pot.fallback, 'http://host.containers.internal:4416');
+  // `-`, not `:-`: README promises that an empty value disables the feature, and
+  // `:-` would silently put the default back.
+  assert.equal(pot.operator, '-', 'an empty SONORA_POT_PROVIDER must disable it, not restore the default');
+  assert.equal(interpolate(pot.expression, {}), pot.fallback);
+  assert.equal(interpolate(pot.expression, { SONORA_POT_PROVIDER: '' }), '');
+  assert.equal(interpolate(pot.expression, { SONORA_POT_PROVIDER: 'http://10.0.0.5:4416' }), 'http://10.0.0.5:4416');
+
+  const runtime = composeEnv('SONORA_JS_RUNTIME');
+  assert.match(runtime.fallback, /^node:/);
+  assert.equal(runtime.operator, '-', 'an empty SONORA_JS_RUNTIME must disable it, not restore the default');
+  assert.equal(interpolate(runtime.expression, { SONORA_JS_RUNTIME: '' }), '');
   assert.match(compose, /host\.containers\.internal:host-gateway/, 'host alias is declared');
 });
 
@@ -190,6 +231,11 @@ test('release publication is gated and PR builds have no package-write token', (
     assert.match(job('unit'), new RegExp(`test/${name}\\.test\\.js`), `${name} gates publication`);
   }
   assert.doesNotMatch(job('browser'), /continue-on-error/);
+  // Dependency probes: a missing ffmpeg or D-Bus turns into skipped cases, which
+  // in a release gate is a green run that tested less. Both jobs must prove them.
+  assert.match(job('unit'), /ffmpeg -version/, 'the offline job proves ffmpeg exists');
+  assert.match(job('browser'), /ffmpeg -version/, 'the browser job proves ffmpeg exists');
+  assert.match(job('browser'), /dbus-daemon --version/, 'the browser job proves the MPRIS bus dependency exists');
   for (const name of ['unit', 'browser', 'build', 'publish']) {
     assert.match(job(name), /timeout-minutes: \d+/, `${name} has a timeout`);
   }
@@ -231,4 +277,170 @@ test('.env is gitignored and an example is provided', () => {
   assert.match(example, /^SONORA_SECRET=/m);
   // The example must not carry a working secret.
   assert.doesNotMatch(example, /^SONORA_SECRET=.+$/m);
+});
+
+test('the healthcheck explains a body without pinning its shape', async () => {
+  // Importing the module must not probe a port or exit: only running it as a
+  // program does that. If this import ran the main block, node:test would die here.
+  const { explain } = await import('../scripts/healthcheck.js');
+
+  assert.equal(explain(null), '');
+  assert.equal(explain('not a body'), '');
+
+  // A machine-readable reason is translated for the operator.
+  assert.equal(
+    explain({ ok: false, reason: 'database-unreadable' }),
+    'the database cannot be read (locked, corrupt, or on a full disk)',
+  );
+  // An unrecognised reason is printed verbatim, never swallowed.
+  assert.equal(explain({ ok: false, reason: 'mystery-failure' }), 'mystery-failure');
+
+  // A summary plus a failing probe that has its own detail.
+  assert.equal(
+    explain({ ok: false, error: 'boot failed', checks: { db: { ok: false, detail: 'disk full' } } }),
+    'boot failed; db failed: disk full',
+  );
+  // A summary already names the fault, so detail-less cascade failures are not
+  // repeated ("reason no-account" also fails signIn).
+  assert.equal(
+    explain({ ok: false, reason: 'no-account', checks: { signIn: { ok: false }, db: false } }),
+    'there is no account and no SONORA_PASSPHRASE, so nobody can sign in',
+  );
+  // Array-shaped checks are read too.
+  assert.equal(
+    explain({ ok: false, checks: [{ name: 'db', ok: false, detail: 'locked' }] }),
+    'db failed: locked',
+  );
+  // Nothing readable still beats "unexpected body".
+  assert.equal(explain({ unexpected: true }), '{"unexpected":true}');
+
+  // And the CLI seam: importing works, running reports the port.
+  const probe = spawnSync(process.execPath, ['--input-type=module', '-e',
+    "import('./scripts/healthcheck.js').then((m) => process.stdout.write(`${typeof m.explain} ${typeof m.main}`))",
+  ], { cwd: ROOT, encoding: 'utf8', timeout: 10_000 });
+  assert.equal(probe.status, 0, probe.stderr);
+  assert.equal(probe.stdout, 'function function');
+});
+
+/** Serve one fixed response on a loopback port and run healthcheck.js against it. */
+async function runHealthcheckAgainst(status, body) {
+  const http = await import('node:http');
+  const { spawn } = await import('node:child_process');
+  const server = http.createServer((req, res) => {
+    res.writeHead(status, { 'content-type': 'application/json' });
+    res.end(body);
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const { port } = server.address();
+    // spawn, not spawnSync: the stub server lives in this process, so blocking
+    // the event loop would make the child's fetch time out instead of testing it.
+    return await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ['--no-warnings', 'scripts/healthcheck.js'], {
+        cwd: ROOT,
+        env: { ...process.env, PORT: String(port) },
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (data) => { stdout += data; });
+      child.stderr.on('data', (data) => { stderr += data; });
+      child.on('error', reject);
+      child.on('close', (code) => resolve({ status: code, stdout, stderr }));
+    });
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+test('the healthcheck command accepts only a body that reports ok', async () => {
+  const healthy = await runHealthcheckAgainst(200, '{"ok":true}');
+  assert.equal(healthy.status, 0, healthy.stderr);
+  assert.equal(healthy.stdout, '');
+
+  // The finding this guards: HTTP 200 alone used to be enough, so an instance
+  // nobody could sign into reported healthy forever.
+  const unhealthy200 = await runHealthcheckAgainst(200, '{"ok":false,"reason":"database-unreadable"}');
+  assert.equal(unhealthy200.status, 1, 'a 200 with ok:false must fail');
+  assert.match(unhealthy200.stderr, /not healthy/);
+  assert.match(unhealthy200.stderr, /the database cannot be read/, 'the failing reason reaches the log');
+
+  const unhealthy503 = await runHealthcheckAgainst(503, '{"ok":false,"checks":{"db":{"ok":false,"detail":"disk full"}}}');
+  assert.equal(unhealthy503.status, 1);
+  assert.match(unhealthy503.stderr, /HTTP 503/);
+  assert.match(unhealthy503.stderr, /db failed: disk full/);
+
+  // Something else listening on the port is its own diagnosis, not "unhealthy".
+  const notJson = await runHealthcheckAgainst(200, 'hello from another server');
+  assert.equal(notJson.status, 1);
+  assert.match(notJson.stderr, /the response was not JSON/);
+});
+
+test('install.sh keeps secrets private and cannot report success for an unhealthy server', () => {
+  const script = read('install.sh');
+  const syntax = spawnSync('/bin/sh', ['-n', path.join(ROOT, 'install.sh')], { encoding: 'utf8' });
+  assert.equal(syntax.status, 0, syntax.stderr);
+
+  // Portable rewrite: `sed -i` is GNU-only and mangles macOS/BSD/BusyBox.
+  assert.doesNotMatch(script, /^\s*sed -i\b/m, 'install.sh must not invoke GNU-only sed -i');
+  assert.match(script, /\.env\.tmp/);
+
+  // .env holds SONORA_SECRET and SONORA_PASSPHRASE.
+  const copy = script.indexOf('cp .env.example .env');
+  const tighten = script.indexOf('chmod 600 .env');
+  assert.ok(copy >= 0 && tighten > copy, 'the created .env is made owner-only');
+  assert.match(script, /umask 077/, 'the .env temp file is created under a restrictive umask');
+
+  // Health must mean /api/health's own verdict, not any HTTP 200.
+  assert.match(script, /\/api\/health/);
+  assert.match(script, /\[\[:space:\]\]\*:\[\[:space:\]\]\*true/, 'install.sh parses "ok":true');
+  assert.match(script, /exec -T sonora node scripts\/healthcheck\.js/,
+    'without a host HTTP client it runs the container healthcheck');
+
+  // The success banner is behind the health gate, and an unhealthy stack prints
+  // logs and exits non-zero instead.
+  const gate = script.indexOf('if [ "$HEALTHY" -ne 1 ]');
+  const banner = script.indexOf('Sonora is up and running!');
+  assert.ok(gate >= 0 && banner > gate, 'the success banner is gated on HEALTHY');
+  const failure = script.slice(gate, banner);
+  assert.match(failure, /logs sonora/, 'an unhealthy install prints the container logs');
+  assert.match(failure, /err "Refusing to report success/, 'and exits non-zero');
+  assert.doesNotMatch(script, /Server did not answer \/api\/health within 30s/,
+    'the old warning-after-success path is gone');
+
+  // Docker's uid/gid mismatch is the read-only-database failure; say so up front.
+  assert.match(script, /\[ "\$ENGINE_TYPE" = "docker" \]/);
+  assert.match(script, /id -u/);
+  assert.match(script, /chown -R 1000:1000/);
+
+  // A pre-existing .env without a passphrase leaves a fresh instance unusable.
+  assert.match(script, /grep -Eq '\^SONORA_PASSPHRASE=/);
+});
+
+test('committed icons pass their own size and opacity check', () => {
+  const result = spawnSync(process.execPath, ['--no-warnings', 'scripts/make-icons.js', '--check'], {
+    cwd: ROOT,
+    encoding: 'utf8',
+    timeout: 20_000,
+  });
+  assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
+  assert.match(result.stdout, /all icons match their sources/);
+  // Full-bleed icons must have no transparent pixel (iOS composites alpha onto
+  // black; launchers crop maskable icons).
+  for (const name of ['icon-180.png', 'icon-maskable-512.png']) {
+    assert.match(result.stdout, new RegExp(`${name}: .*\\(opaque\\)`), `${name} is verified opaque`);
+  }
+  // The manifest's purpose:any marks stay the rounded plate: opaque body, and
+  // the transparent corners icon.svg actually draws.
+  for (const name of ['icon-192.png', 'icon-512.png']) {
+    assert.match(result.stdout, new RegExp(`${name}: .*plate-opaque`), `${name} has an opaque plate`);
+  }
+});
+
+test('build scripts resolve their own directory without a percent-encoded pathname', () => {
+  for (const file of ['scripts/check-syntax.js', 'scripts/make-icons.js']) {
+    const source = read(file);
+    assert.doesNotMatch(source, /import\.meta\.url\)\.pathname/, `${file} must not use URL.pathname`);
+    assert.match(source, /fileURLToPath\(new URL\('\.\.', import\.meta\.url\)\)/,
+      `${file} resolves the repo root with fileURLToPath`);
+  }
 });

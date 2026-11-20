@@ -81,6 +81,7 @@ git clone https://github.com/karutoil/sonora.git
 cd sonora
 
 cp .env.example .env
+chmod 600 .env
 # Edit .env and set the two required values:
 #   SONORA_SECRET      (required)    -> the output of:  openssl rand -hex 32
 #   SONORA_PASSPHRASE  (first run)   -> a passphrase you will remember
@@ -94,6 +95,14 @@ docker compose up -d --build
 podman compose -f compose.yaml -f compose.podman.yaml up -d --build
 podman compose -f compose.yaml -f compose.podman.yaml logs -f
 ```
+
+`.env` holds the cookie-signing secret and the bootstrap passphrase, so keep it owner-only (`chmod 600`,
+as `install.sh` does). Compose reads it for interpolation: `HOST`, `PORT`, `SONORA_POT_PROVIDER` and
+`SONORA_JS_RUNTIME` are overridable there without editing `compose.yaml`.
+
+> **Docker Desktop (macOS/Windows):** `compose.yaml` logs through `journald`, which is Linux-only and
+> has no socket on Docker Desktop. Comment out the `logging:` block there (or switch the driver to
+> `json-file`); otherwise `docker compose up` fails to start the container.
 
 Open **http://127.0.0.1:8130** and sign in with the `SONORA_USER` / `SONORA_PASSPHRASE` you set.
 The first account is created only while the database has no users, and is an admin.

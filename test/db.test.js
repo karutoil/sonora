@@ -1,5 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 // Tests run against a throwaway DB and a fixed secret so sessions survive
 // across imports; set before anything reads config.
@@ -780,4 +784,162 @@ test('a nested transaction joins the outer one instead of rolling it back', () =
   });
   assert.equal(db.db.prepare('SELECT COUNT(*) AS n FROM plays WHERE user_id = ?').get(u.id).n, 0);
   assert.equal(db.knownReleases('UCnested').length, 1);
+});
+
+// ── the audit fixes ─────────────────────────────────────────────────────
+
+test('an equal-timestamp like/dislike pair cannot leave a contradictory state', () => {
+  // Migration 2 decides which of two contradictory actions wins. With a strict
+  // `>` on one side and `>=` on the other, an equal created_at made the
+  // statements disagree, and a `kind='like'` play row could outlive the like it
+  // described. This drives the migration itself, in its own process, because
+  // db.js opens its database at import and this file's copy has already run it.
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'sonora-tie2-')), 'tie.db');
+  const run = (code) => {
+    const res = spawnSync(process.execPath, ['--no-warnings', '-e', code], {
+      cwd: new URL('..', import.meta.url).pathname,
+      env: { ...process.env, SONORA_DB: file, SONORA_SECRET: 'db-tie-test', SONORA_PASSPHRASE: 'hunter2hunter2' },
+      encoding: 'utf8',
+    });
+    assert.equal(res.status, 0, `child failed:\n${res.stdout}\n${res.stderr}`);
+    const line = res.stdout.split('\n').find((l) => l.startsWith('@@'));
+    assert.ok(line, `no @@ marker:\n${res.stdout}`);
+    return JSON.parse(line.slice(2));
+  };
+  const T = '2026-01-01T00:00:00.000Z';
+  run(`
+    const db = await import('./src/db.js');
+    const u = db.createUser('tie-owner', 'pw');
+    const sql = (q, ...args) => db.db.prepare(q).run(...args);
+    sql('INSERT INTO likes (user_id, video_id, created_at) VALUES (?, ?, ?)', u.id, 'tie00000001', ${JSON.stringify(T)});
+    sql('INSERT INTO dislikes (user_id, video_id, created_at) VALUES (?, ?, ?)', u.id, 'tie00000001', ${JSON.stringify(T)});
+    sql("INSERT INTO plays (user_id, video_id, kind, created_at) VALUES (?, ?, 'like', ?)", u.id, 'tie00000001', ${JSON.stringify(T)});
+    sql("INSERT INTO plays (user_id, video_id, kind, created_at) VALUES (?, ?, 'start', ?)", u.id, 'tie00000001', ${JSON.stringify(T)});
+    db.db.exec('PRAGMA user_version = 1');
+    console.log('@@' + JSON.stringify({ userId: u.id }));
+  `);
+  const got = run(`
+    const db = await import('./src/db.js');
+    const rows = (q) => db.db.prepare(q).all().map((r) => ({ ...r }));
+    console.log('@@' + JSON.stringify({
+      likes: rows('SELECT video_id, created_at FROM likes'),
+      dislikes: rows('SELECT video_id, created_at FROM dislikes'),
+      plays: rows('SELECT video_id, kind FROM plays ORDER BY kind'),
+      conflicting: rows('SELECT l.video_id FROM likes l JOIN dislikes d USING (user_id, video_id)'),
+      orphanLikePlays: rows("SELECT p.video_id FROM plays p WHERE p.kind = 'like'"
+        + ' AND NOT EXISTS (SELECT 1 FROM likes l'
+        + ' WHERE l.user_id = p.user_id AND l.video_id = p.video_id)'),
+    }));
+  `);
+  // Exactly one of the two contradictory rows survives — never both.
+  assert.equal(got.likes.length + got.dislikes.length, 1, JSON.stringify(got));
+  assert.deepEqual(got.conflicting, []);
+  // And the play log agrees with whatever won: no `kind='like'` row is left
+  // behind for a like the migration deleted, and the listening history survives.
+  assert.deepEqual(got.orphanLikePlays, []);
+  assert.equal(got.plays.filter((p) => p.kind === 'start').length, 1, 'listening history is untouched');
+  assert.equal(got.plays.filter((p) => p.kind === 'like').length, got.likes.length);
+});
+
+test('unfollowing the last follower drops the artist’s release bookkeeping', () => {
+  const a = db.createUser('unfollow-a', 'pw');
+  const b = db.createUser('unfollow-b', 'pw');
+  const artistId = 'UCunfollowed1';
+  db.followArtist(a.id, { artistId, name: 'Unfollowed' });
+  db.followArtist(b.id, { artistId, name: 'Unfollowed' });
+  db.recordReleases(artistId, [{ releaseId: 'rel1', title: 'One' }]);
+  db.markArtistReleaseInitialized(artistId);
+  const releases = () => db.db.prepare('SELECT COUNT(*) AS n FROM artist_releases WHERE artist_id = ?')
+    .get(artistId).n;
+  const state = () => db.db.prepare('SELECT COUNT(*) AS n FROM artist_release_state WHERE artist_id = ?')
+    .get(artistId).n;
+
+  // One follower leaving is not the end of the artist: r2 still needs the
+  // baseline, or the next sweep would announce every old release to them.
+  assert.equal(db.unfollowArtist(a.id, artistId), true);
+  assert.equal(releases(), 1);
+  assert.equal(state(), 1);
+  // The last one leaving takes the artist-keyed rows with them, so a future
+  // follower starts from a real baseline instead of a stale "initialized".
+  assert.equal(db.unfollowArtist(b.id, artistId), true);
+  assert.equal(releases(), 0);
+  assert.equal(state(), 0);
+  // Not following is a no-op, not a second delete.
+  assert.equal(db.unfollowArtist(b.id, artistId), false);
+});
+
+test('room policy columns only accept their enum values', () => {
+  const host = db.createUser('room-meta-host', 'pw');
+  db.createRoomRow({ code: 'META01', hostId: host.id, state: { index: 0 } });
+  const row = () => db.getRoomRow('META01');
+
+  assert.equal(db.updateRoomMeta('META01', { visibility: 'private' }), true);
+  assert.equal(row().visibility, 'private');
+  assert.equal(db.updateRoomMeta('META01', { control: 'host' }), true);
+  assert.equal(row().control, 'host');
+  // The exact enums the routes accept: `anyone` is not one of them.
+  assert.throws(() => db.updateRoomMeta('META01', { control: 'anyone' }), /everyone or host/);
+  assert.throws(() => db.updateRoomMeta('META01', { visibility: 'friends' }), /public or private/);
+  assert.equal(row().visibility, 'private', 'a rejected write changes nothing');
+  assert.equal(row().control, 'host', 'a rejected control value cannot fail open');
+  // Nothing to change is not an error, and an unknown room still reports false.
+  assert.equal(db.updateRoomMeta('META01', {}), false);
+  assert.equal(db.updateRoomMeta('NOPE01', { visibility: 'public' }), false);
+  // The route layer keeps working unchanged.
+  db.updateRoomMeta('META01', { visibility: 'public', control: 'everyone' });
+  assert.equal(row().visibility, 'public');
+  assert.equal(row().control, 'everyone');
+});
+
+test('reading an expired cache row does not write', () => {
+  db.cacheSet('readonly:dead', { x: 1 }, -1);
+  db.cacheSet('readonly:live', { x: 2 }, 60_000);
+  assert.equal(db.cacheGet('readonly:dead'), null);
+  // The row is still there: the read path returned null without a DELETE.
+  assert.equal(db.db.prepare('SELECT COUNT(*) AS n FROM upstream_cache WHERE key = ?')
+    .get('readonly:dead').n, 1);
+  // The sweeper is the one owner of that deletion.
+  assert.ok(db.pruneExpiredCache() >= 1);
+  assert.equal(db.db.prepare('SELECT COUNT(*) AS n FROM upstream_cache WHERE key = ?')
+    .get('readonly:dead').n, 0);
+  assert.deepEqual(db.cacheGet('readonly:live'), { x: 2 });
+});
+
+test('unreferenced old track metadata is pruned; anything referenced survives', () => {
+  const u = db.createUser('prune-tracks', 'pw');
+  const old = new Date(Date.now() - 400 * 86_400_000).toISOString();
+  const fresh = new Date().toISOString();
+  const add = (videoId, seen) => db.db.prepare(`
+    INSERT INTO tracks (video_id, title, channel, duration_s, thumb, first_seen, last_seen)
+    VALUES (?, ?, NULL, NULL, NULL, ?, ?)
+  `).run(videoId, videoId, old, seen);
+  add('prunestale1', old);      // unreferenced and old: goes
+  add('prunektorre1', old);     // older than the window but played
+  add('prunektorre2', old);     // older than the window but liked
+  add('prunektorre3', old);     // older than the window but disliked
+  add('prunektorre4', old);     // older than the window but in a playlist
+  add('prunekepme1', fresh);    // unreferenced but seen just now: stays
+  db.recordPlay({ userId: u.id, videoId: 'prunektorre1', kind: 'start' });
+  db.toggleLike(u.id, 'prunektorre2', true);
+  db.toggleDislike(u.id, 'prunektorre3', true);
+  const playlistId = db.createPlaylist(u.id, { title: 'Kept' });
+  db.addPlaylistItem(u.id, playlistId, { videoId: 'prunektorre4' });
+
+  const remaining = () => db.db.prepare('SELECT video_id FROM tracks ORDER BY video_id').all()
+    .map((r) => r.video_id)
+    .filter((id) => id.startsWith('prune'));
+  assert.deepEqual(remaining(), [
+    'prunekepme1', 'prunektorre1', 'prunektorre2', 'prunektorre3', 'prunektorre4', 'prunestale1',
+  ]);
+
+  const removed = db.pruneStaleTracks(180 * 86_400_000);
+  assert.equal(removed, 1, 'only the unreferenced old row is deleted');
+  assert.deepEqual(remaining(), [
+    'prunekepme1', 'prunektorre1', 'prunektorre2', 'prunektorre3', 'prunektorre4',
+  ]);
+  // Nothing referenced was harmed.
+  assert.equal(db.listLikes(u.id).some((l) => l.videoId === 'prunektorre2'), true);
+  assert.equal(db.getPlaylist(u.id, playlistId).tracks.some((i) => i.videoId === 'prunektorre4'), true);
+  assert.equal(db.pruneStaleTracks(0) >= 0, true, 'a zero window is allowed');
+  assert.equal(db.pruneStaleTracks(Number.NaN), 0, 'junk windows delete nothing');
 });

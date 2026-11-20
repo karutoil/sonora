@@ -43,20 +43,48 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { audioPath, cachedAudio, ensureAudio } from './audio.js';
+import { config } from './config.js';
 
 /** A valid YouTube video id, as src/audio.js defines it. */
 const VIDEO_ID = /^[A-Za-z0-9_-]{11}$/;
 /** Tracks in one plan. At ~4 min each this is well over two hours per pass. */
 export const MAX_TRACKS = 48;
-/** How far ahead the repeated list must reach, so a locked phone never runs out. */
-const COVER_MS = (() => {
+/**
+ * How far ahead the repeated list must reach, so a locked phone never runs out.
+ * `config.queueCoverMs` wins when the configuration profile defines it; the
+ * environment variable stays as the fallback this module shipped with, and the
+ * day-long default is only used when neither says anything.
+ */
+function coverMs() {
+  const fromConfig = Number(config?.queueCoverMs);
+  if (Number.isFinite(fromConfig) && fromConfig > 0) return fromConfig;
   const raw = Number(process.env.SONORA_QUEUE_COVER_MS);
   return Number.isFinite(raw) && raw > 0 ? raw : 24 * 60 * 60 * 1000;
-})();
+}
 /** A plan outlives any plausible single lock, and is dropped by TTL after. */
 const PLAN_TTL_MS = 8 * 60 * 60 * 1000;
 const MAX_PLANS = 64;
+/** One account's ceiling; a re-planning client must not evict other listeners. */
+const MAX_PLANS_PER_USER = 4;
 const DURATION_CACHE_MAX = 2048;
+
+/**
+ * How long any one ffmpeg/ffprobe child may run before it is killed.
+ *
+ * Every one of these is a sub-second local decode of a few seconds of audio, so
+ * a child that is still alive after this has wedged. Without a deadline it holds
+ * one of the six `takeCutSlot()` permits — and its session's temp dir — for the
+ * life of the process, so six wedged cuts stop every stream on the host.
+ * Overridable only so a test can prove the kill without waiting 15 s.
+ */
+const CHILD_TIMEOUT_MS = (() => {
+  const raw = Number(process.env.SONORA_QUEUE_CHILD_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 15_000;
+})();
+/** Segment files kept per session: 24 min of audio, enough for any wake window. */
+const MAX_SESSION_SEGMENTS = 240;
+/** Concurrent cuts one session may run, so a scrubber cannot take every permit. */
+const MAX_CUTS_PER_SESSION = 2;
 
 /** Segment length. 6 s is the HLS sweet spot: few requests, small join latency. */
 export const SEGMENT_MS = 6000;
@@ -89,6 +117,79 @@ function bin(name) {
   return env && String(env).trim() ? String(env).trim() : name;
 }
 
+/** Every live ffmpeg/ffprobe child, so a shutdown can reap them (see closeQueueStreams). */
+const children = new Set();
+
+/**
+ * Kill a child and everything it forked.
+ *
+ * They are spawned `detached`, i.e. as leaders of their own process group, so
+ * the group kill reaches a wrapper script's children too — a plain
+ * `child.kill()` leaves those running and holding the stdout pipe open. The
+ * fallback covers a group that already went away (ESRCH) and platforms without
+ * process groups.
+ */
+function killTree(child) {
+  if (!child || child.pid == null || child.exitCode != null || child.signalCode != null) return;
+  try {
+    process.kill(-child.pid, 'SIGKILL');
+    return;
+  } catch { /* no such group (already reaped) or unsupported: fall back */ }
+  try { child.kill('SIGKILL'); } catch { /* already gone */ }
+}
+
+/**
+ * Run one ffmpeg/ffprobe to completion, bounded in time and memory.
+ *
+ * Resolves `{ code, out }` where `out` is the collected output of `stream`, or
+ * `null` when the child could not be started or had to be killed at the
+ * deadline. Never rejects: every caller here treats a failed child as a missing
+ * segment rather than as an error to propagate.
+ */
+function runChild(binName, args, { stream = 'stdout', maxBytes = 8192 } = {}) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(bin(binName), args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        // Its own process group, so the deadline kill reaches any child of it.
+        detached: true,
+      });
+    } catch {
+      resolve(null);
+      return;
+    }
+    children.add(child);
+    let out = '';
+    let settled = false;
+    let timer = null;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      children.delete(child);
+      resolve(result);
+    };
+    timer = setTimeout(() => {
+      killTree(child);
+      finish(null);
+    }, CHILD_TIMEOUT_MS);
+    timer.unref?.();
+
+    const sink = stream === 'stderr' ? child.stderr : child.stdout;
+    const other = stream === 'stderr' ? child.stdout : child.stderr;
+    // Drain the pipe nobody reads: a child that fills it blocks instead of
+    // exiting, which is the same wedge as a hung process.
+    other?.resume();
+    sink?.on('data', (chunk) => {
+      out += chunk;
+      if (out.length > maxBytes) killTree(child);
+    });
+    child.on('error', () => finish(null));
+    child.on('close', (code) => finish({ code, out }));
+  });
+}
+
 /**
  * One track's playable length, from the file itself.
  *
@@ -102,27 +203,20 @@ function probeDuration(videoId, meta) {
   const key = `${meta.size}`;
   const known = durations.get(videoId);
   if (known && known.key === key) return Promise.resolve(known.durationMs);
-  return new Promise((resolve) => {
-    const child = spawn(bin('ffprobe'), [
-      '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', meta.file,
-    ], { stdio: ['ignore', 'pipe', 'pipe'] });
-    let out = '';
-    let settled = false;
-    const finish = (durationMs) => {
-      if (settled) return;
-      settled = true;
-      if (durationMs > 0) {
-        durations.set(videoId, { key, durationMs });
-        if (durations.size > DURATION_CACHE_MAX) {
-          const oldest = durations.keys().next().value;
-          durations.delete(oldest);
-        }
+  return runChild('ffprobe', [
+    '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', meta.file,
+  ]).then((result) => {
+    // A killed probe answers 0, which the plan builder drops: the track is not
+    // worth listing if its length is unknown.
+    const durationMs = Math.round((Number.parseFloat(result?.out?.trim()) || 0) * 1000);
+    if (durationMs > 0) {
+      durations.set(videoId, { key, durationMs });
+      if (durations.size > DURATION_CACHE_MAX) {
+        const oldest = durations.keys().next().value;
+        durations.delete(oldest);
       }
-      resolve(durationMs);
-    };
-    child.stdout.on('data', (chunk) => { out += chunk; if (out.length > 4096) child.kill('SIGKILL'); });
-    child.on('error', () => finish(0));
-    child.on('close', () => finish(Math.round((Number.parseFloat(out.trim()) || 0) * 1000)));
+    }
+    return durationMs;
   });
 }
 
@@ -204,11 +298,43 @@ export function getPlan(token, userId) {
   return plan;
 }
 
+/**
+ * Bound the plan map without evicting a live listener's plan.
+ *
+ * The old sweep evicted the globally oldest token whenever the map passed its
+ * ceiling, so a client that re-planned in a loop could push out another
+ * listener's plan — including the one their currently playing stream was
+ * opened from. Now each account keeps a bounded set of its own plans, and only
+ * tokens no open session depends on are ever evicted.
+ */
 function prunePlans(now = Date.now()) {
+  /** userId -> tokens, oldest first (Map iteration is insertion order). */
+  const byUser = new Map();
   for (const [token, plan] of plans) {
-    if (now - plan.at > PLAN_TTL_MS) plans.delete(token);
+    if (now - plan.at > PLAN_TTL_MS && !sessions.has(token)) {
+      plans.delete(token);
+      continue;
+    }
+    const list = byUser.get(plan.userId);
+    if (list) list.push(token);
+    else byUser.set(plan.userId, [token]);
   }
-  while (plans.size > MAX_PLANS) plans.delete(plans.keys().next().value);
+  for (const tokens of byUser.values()) {
+    let excess = tokens.length - MAX_PLANS_PER_USER;
+    if (excess <= 0) continue;
+    for (const token of tokens) {
+      if (excess <= 0) break;
+      if (sessions.has(token)) continue;
+      plans.delete(token);
+      excess -= 1;
+    }
+  }
+  if (plans.size <= MAX_PLANS) return;
+  for (const [token] of plans) {
+    if (plans.size <= MAX_PLANS) break;
+    if (sessions.has(token)) continue;
+    plans.delete(token);
+  }
 }
 
 /** A path inside a single-quoted ffmpeg concat-list line. */
@@ -342,7 +468,7 @@ export async function openQueueStream(tracks, atMs, userId = null) {
   if (activeStreams >= MAX_ACTIVE_STREAMS) {
     throw busy(`Already producing ${MAX_ACTIVE_STREAMS} streams.`);
   }
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'sonora-queue-'));
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), QUEUE_DIR_PREFIX));
   activeStreams += 1;
   if (userId != null) streamsByUser.set(userId, (streamsByUser.get(userId) ?? 0) + 1);
   const anchor = ((Math.round(Number(atMs) || 0) % total) + total) % total;
@@ -351,7 +477,7 @@ export async function openQueueStream(tracks, atMs, userId = null) {
     dir,
     tracks: list,
     total,
-    coverEnd: Math.ceil(COVER_MS / SEGMENT_MS) * SEGMENT_MS,
+    coverEnd: Math.ceil(coverMs() / SEGMENT_MS) * SEGMENT_MS,
     createdAt: Date.now(),
     /** The position the current element load began at (open or seek). */
     anchorMs: anchor,
@@ -366,6 +492,8 @@ export async function openQueueStream(tracks, atMs, userId = null) {
     lastK: null,
     /** Bumped on every re-anchor: in-flight cuts from the old anchor are stale. */
     gen: 0,
+    /** Per-session cut permits, in front of the six host-wide ones. */
+    cutGate: createGate(MAX_CUTS_PER_SESSION),
     evictedThrough: -1,
     closed: false,
     cleanup: null,
@@ -447,6 +575,29 @@ function freeCutSlot() {
 }
 
 /**
+ * A counting gate: at most `limit` holders at once, FIFO.
+ *
+ * The six global cut permits are a host-wide resource; without a per-session
+ * ceiling one client seeking across a long plan could hold all six and starve
+ * every other listener, so each session gets its own smaller gate in front.
+ */
+function createGate(limit) {
+  let active = 0;
+  const waiting = [];
+  return {
+    take() {
+      if (active < limit) { active += 1; return Promise.resolve(); }
+      return new Promise((resolve) => waiting.push(resolve));
+    },
+    release() {
+      active = Math.max(0, active - 1);
+      const next = waiting.shift();
+      if (next) { active += 1; next(); }
+    },
+  };
+}
+
+/**
  * Produce one segment if it is not on disk already, and return its metadata.
  *
  * Independent ffmpeg runs, one per segment, each with `-output_ts_offset` at
@@ -455,20 +606,19 @@ function freeCutSlot() {
  * tags entirely.
  */
 function probeFileDuration(file) {
-  return new Promise((resolve) => {
-    const child = spawn(bin('ffprobe'), [
-      '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', file,
-    ], { stdio: ['ignore', 'pipe', 'pipe'] });
-    let out = '';
-    child.stdout.on('data', (c) => { out += c; if (out.length > 4096) child.kill('SIGKILL'); });
-    child.on('error', () => resolve(0));
-    child.on('close', () => resolve(Math.round((Number.parseFloat(out.trim()) || 0) * 1000)));
-  });
+  return runChild('ffprobe', [
+    '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', file,
+  ]).then((result) => Math.round((Number.parseFloat(result?.out?.trim()) || 0) * 1000));
+}
+
+/** The serving name of one session segment. */
+function segFile(session, seq) {
+  return path.join(session.dir, `seg${String(seq).padStart(6, '0')}.ts`);
 }
 
 export async function ensureSegment(session, seq) {
   const known = session.segMeta.get(seq);
-  const file = path.join(session.dir, `seg${String(seq).padStart(6, '0')}.ts`);
+  const file = segFile(session, seq);
   if (known) {
     try {
       await fsp.access(file);
@@ -489,11 +639,14 @@ export async function ensureSegment(session, seq) {
     const listFile = path.join(session.dir, `cut${String(seq).padStart(6, '0')}.txt`);
     const tmpFile = path.join(session.dir, `cut${String(seq).padStart(6, '0')}.ts`);
     await fsp.writeFile(listFile, concatSlice(session.tracks, start, end), { mode: 0o600 });
-    await takeCutSlot();
     let ok = false;
+    // Two permits per session, then one of the six host-wide ones: a client
+    // seeking across a long plan can only ever hold its own share of the farm.
+    await session.cutGate.take();
     try {
-      ok = await new Promise((resolve) => {
-        const child = spawn(bin('ffmpeg'), [
+      await takeCutSlot();
+      try {
+        const result = await runChild('ffmpeg', [
           '-hide_banner', '-loglevel', 'error', '-y',
           '-f', 'concat', '-safe', '0', '-i', listFile,
           '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',
@@ -519,14 +672,16 @@ export async function ensureSegment(session, seq) {
           // audio into `seq+1`; the sliver then fails the sub-second guard and
           // the playlist comes back empty (measured on the device).
           '-f', 'mpegts', tmpFile,
-        ], { stdio: ['ignore', 'ignore', 'pipe'] });
-        let stderr = '';
-        child.stderr.on('data', (c) => { stderr += c; if (stderr.length > 8192) child.kill('SIGKILL'); });
-        child.on('error', () => resolve(false));
-        child.on('close', (code) => resolve(code === 0));
-      });
+        ], { stream: 'stderr' });
+        // A killed or failed child is a missing segment, never a wedged slot:
+        // runChild's deadline has already SIGKILLed the process group, and the
+        // permit is released below either way.
+        ok = result?.code === 0;
+      } finally {
+        freeCutSlot();
+      }
     } finally {
-      freeCutSlot();
+      session.cutGate.release();
       void fsp.rm(listFile, { force: true }).catch(() => {});
     }
     if (!ok) { void fsp.rm(tmpFile, { force: true }).catch(() => {}); return null; }
@@ -538,14 +693,8 @@ export async function ensureSegment(session, seq) {
     }
     // A reposition while this cut was in flight invalidates it: its PTS is
     // relative to the *old* anchor, and serving it would restart the media
-    // timeline at the wrong place.
-    if (gen !== session.gen) {
-      void fsp.rm(tmpFile, { force: true }).catch(() => {});
-      return null;
-    }
-    // A re-anchor while this cut was running makes its PTS relative to a
-    // position nobody is listening from any more: drop it rather than serve a
-    // segment whose clock starts in the wrong place.
+    // timeline at the wrong place. Checked once here (cheap early out) and once
+    // more after the rename, which is the only place the answer cannot go stale.
     if (gen !== session.gen) {
       void fsp.rm(tmpFile, { force: true }).catch(() => {});
       return null;
@@ -553,8 +702,22 @@ export async function ensureSegment(session, seq) {
     // Rename into place last: a concurrent playlist build must never see a
     // half-written segment under its serving name.
     await fsp.rename(tmpFile, file);
+    // The rename is the moment the file becomes servable, so it is the moment a
+    // re-anchor (maybeReposition bumps `gen` and deletes the cache) must be
+    // honoured: a cut that finished during the seek used to be renamed in
+    // afterwards, reviving a stale segment the seek had just deleted — with PTS
+    // relative to the old anchor — after the playlist had already listed it.
+    if (gen !== session.gen) {
+      await fsp.rm(file, { force: true }).catch(() => {});
+      return null;
+    }
     const meta = { startMs: start, endMs: start + durationMs };
     session.segMeta.set(seq, meta);
+    // Keep the session's disk bounded as segments are produced, not only when
+    // the 30 s sweeper happens to run: a far seek used to leave both windows on
+    // disk until then.
+    evictSegments(session);
+    evictExcessSegments(session);
     return meta;
   })();
   session.producing.set(seq, job);
@@ -723,14 +886,40 @@ function evictSegments(session) {
   const floor = seqAt(session.nowMs) - EVICT_BEHIND;
   for (let seq = session.evictedThrough + 1; seq < floor; seq += 1) {
     if (seq === session.anchorSeq) continue;
-    void fsp.rm(path.join(session.dir, `seg${String(seq).padStart(6, '0')}.ts`), { force: true }).catch(() => {});
+    void fsp.rm(segFile(session, seq), { force: true }).catch(() => {});
+    session.segMeta.delete(seq);
   }
   if (floor > session.evictedThrough) session.evictedThrough = floor - 1;
 }
 
+/**
+ * Hard per-session ceiling on segment files.
+ *
+ * A plan covers a day, so a client that seeks all over it can name a segment in
+ * every part of the timeline: without a count limit the session's temp dir grows
+ * with how far it has scrubbed, not with how long it listens. The victims are
+ * the segments farthest from the playhead, and the anchor's own segment is never
+ * one of them (it is what the next playlist starts from).
+ */
+function evictExcessSegments(session) {
+  const excess = session.segMeta.size - MAX_SESSION_SEGMENTS;
+  if (excess <= 0) return;
+  const now = seqAt(session.nowMs);
+  const victims = [...session.segMeta.keys()]
+    .filter((seq) => seq !== session.anchorSeq)
+    .sort((a, b) => Math.abs(b - now) - Math.abs(a - now));
+  let removed = 0;
+  for (const seq of victims) {
+    if (removed >= excess) break;
+    session.segMeta.delete(seq);
+    void fsp.rm(segFile(session, seq), { force: true }).catch(() => {});
+    removed += 1;
+  }
+}
+
 // A listener that never comes back (phone unlocked elsewhere, tab closed) must
 // not leave a temp dir behind. One sweeper for everything.
-const sweeper = setInterval(() => {
+let sweeper = setInterval(() => {
   const now = Date.now();
   for (const [token, session] of sessions) {
     if (now - (session.lastFetch ?? session.createdAt) > SESSION_IDLE_MS) closeSession(token);
@@ -741,6 +930,43 @@ const sweeper = setInterval(() => {
   }
 }, 30_000);
 sweeper.unref?.();
+
+/** The temp-dir prefix this module owns (see openQueueStream). */
+const QUEUE_DIR_PREFIX = 'sonora-queue-';
+
+/**
+ * Shut the queue-stream subsystem down: stop the sweeper, kill every live
+ * ffmpeg/ffprobe child, tear every session down and remove its temp dir, then
+ * sweep any `sonora-queue-*` directory a previous process left behind.
+ *
+ * This is the process shutdown seam (tests and a clean restart). Without it a
+ * server exit leaves muxers and a `/tmp` full of segments behind, and the six
+ * cut permits die with the process while the children do not.
+ */
+export async function closeQueueStreams() {
+  clearInterval(sweeper);
+  sweeper = null;
+  for (const child of [...children]) killTree(child);
+  children.clear();
+  for (const token of [...sessions.keys()]) {
+    const session = sessions.get(token);
+    if (!session) continue;
+    // Awaited rather than fire-and-forget: this is an exit path, and the rm has
+    // to have happened before the caller believes the temp dirs are gone.
+    await session.cleanup().catch(() => {});
+  }
+  sessions.clear();
+  plans.clear();
+  let names = [];
+  try {
+    names = await fsp.readdir(os.tmpdir());
+  } catch {
+    return;
+  }
+  await Promise.all(names
+    .filter((name) => name.startsWith(QUEUE_DIR_PREFIX))
+    .map((name) => fsp.rm(path.join(os.tmpdir(), name), { recursive: true, force: true }).catch(() => {})));
+}
 
 /** Test seam: forget every plan and tear every session down. */
 export function forgetPlans() {

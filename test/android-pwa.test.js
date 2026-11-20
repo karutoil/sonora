@@ -61,6 +61,29 @@ let BASE;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * Wait until a condition has held for `stableFor` ms, then return.
+ *
+ * A fixed sleep hopes the app has settled by an arbitrary deadline; this
+ * observes that it has, using the same 100 ms poll cadence, and fails with the
+ * expression (rather than a later, confusing assertion) when it never does.
+ * Used for routes the app rewrites a beat after boot.
+ */
+async function waitForStable(b, expression, { timeout = 15_000, stableFor = 400 } = {}) {
+  const started = Date.now();
+  let since = 0;
+  while (Date.now() - started < timeout) {
+    if (await b.eval(expression)) {
+      if (!since) since = Date.now();
+      if (Date.now() - since >= stableFor) return;
+    } else {
+      since = 0;
+    }
+    await sleep(100);
+  }
+  throw new Error(`timed out waiting for a stable condition: ${expression}`);
+}
+
+/**
  * Chromium's OS media service on this platform is MPRIS over D-Bus, and it is
  * fed by the same `media_session::MediaSessionImpl` state that Android's media
  * notification is drawn from. Querying it is the closest thing to reading the
@@ -499,9 +522,32 @@ test('freezing the app does not lose the session, and waking it does not double-
   await play(bg);
 
   // Doze / App Standby for a silent page: the renderer is frozen, JS stops.
+  // Instrument it rather than sleeping for a guessed duration: the page reports
+  // its own `freeze`/`resume` lifecycle events, and a 50 ms heartbeat proves its
+  // timers really were suspended while the host held it frozen. CDP evaluations
+  // still run against a frozen renderer; page timers do not, which is what makes
+  // the heartbeat meaningful.
+  await bg.eval(`(() => {
+    window.__freezeProbe = { ticks: 0, freezes: 0, resumes: 0 };
+    setInterval(() => { window.__freezeProbe.ticks += 1; }, 50);
+    document.addEventListener('freeze', () => { window.__freezeProbe.freezes += 1; });
+    document.addEventListener('resume', () => { window.__freezeProbe.resumes += 1; });
+    return true;
+  })()`);
   await freeze(bg);
-  await new Promise((r) => setTimeout(r, 1500));
+  await bg.waitFor(`window.__freezeProbe.freezes >= 1`, 5_000);
+  const ticksAtFreeze = await bg.eval(`window.__freezeProbe.ticks`);
+  // Hold the freeze for a real interval, polling (not sleeping) that the
+  // heartbeat did not advance while the renderer was frozen.
+  const frozenAt = Date.now();
+  while (Date.now() - frozenAt < 750) {
+    assert.equal(await bg.eval(`window.__freezeProbe.ticks`), ticksAtFreeze,
+      'page timers ran while the renderer was frozen');
+    await sleep(100);
+  }
   await thaw(bg);
+  await bg.waitFor(`window.__freezeProbe.resumes >= 1`, 5_000);
+  await bg.waitFor(`window.__freezeProbe.ticks > ${ticksAtFreeze}`, 5_000);
 
   const thawed = await readMediaSession(bg);
   assert.ok(thawed.log.metadata.at(-1)?.title, 'the media session was empty after the app woke up');
@@ -645,9 +691,16 @@ test('the shell installs itself, boots with no network, and says what still need
     await shot('offline-shell');
 
     // The queue lives on the server's disk, not on the phone, so pressing play
-    // offline can only fail — it must fail visibly and leave the shell up.
+    // offline can only fail — it must fail visibly and leave the shell up. Wait
+    // for that outcome to hold (shell, offline narration, and an audio element
+    // that is not playing) instead of sampling after a guessed 2.5 s.
     await browser.eval(`document.querySelector('#player [data-action="playpause"]')?.click()`);
-    await new Promise((r) => setTimeout(r, 2500));
+    await waitForStable(browser, `(() => {
+      const pill = document.querySelector('.pwa-pill[data-kind="offline"] .pwa-pill-text');
+      const audio = document.getElementById('audio');
+      return !!document.querySelector('.app') && !!pill && /offline/i.test(pill.textContent ?? '')
+        && (!audio || audio.paused || !!audio.error);
+    })()`, { stableFor: 600 });
     const offlinePlay = await audioState(browser);
     assert.ok(offlinePlay.pill, 'the offline narration disappeared as soon as play was pressed');
     assert.ok(await browser.eval(`!!document.querySelector('.app')`),
@@ -684,7 +737,12 @@ test('a home-screen shortcut and a shared link both land inside the installed ap
   // instead of the settled one hid that (this assertion is the regression).
   await browser.goto(`${BASE}/?page=search`);
   await browser.waitFor(`!!document.getElementById('primary-search')`, 20_000);
-  await new Promise((r) => setTimeout(r, 800));
+  // The shortcut is consumed (and the route rewritten) a beat after boot, so
+  // wait for the settled state rather than sampling after a fixed 800 ms: the
+  // hash, the consumed query and the title must all hold together.
+  await waitForStable(browser,
+    `location.hash === '#/search' && location.search === '' && /^Search/.test(document.title)`,
+    { stableFor: 400 });
   const search = await browser.eval(`({ search: location.search, hash: location.hash,
     input: !!document.getElementById('primary-search'), title: document.title })`);
   assert.equal(search.input, true, `the Search shortcut did not open Search (${search.hash} ${search.title})`);
@@ -695,7 +753,11 @@ test('a home-screen shortcut and a shared link both land inside the installed ap
   // "Liked songs" is the other shortcut shape: it has no ?page.
   await browser.goto(`${BASE}/?collection=liked`);
   await browser.waitFor(`location.hash === '#/c/liked'`, 20_000);
-  await new Promise((r) => setTimeout(r, 500));
+  // Same settle rule as the Search shortcut: the query is consumed and the
+  // collection title lands after the hash does.
+  await waitForStable(browser,
+    `location.hash === '#/c/liked' && location.search === '' && /liked/i.test(document.title)`,
+    { stableFor: 400 });
   // This app files collections under Library, so the *Library* nav item is the
   // one marked current; the assertion is that the shortcut opened the
   // collection itself, not that a particular button lit up.

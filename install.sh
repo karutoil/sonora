@@ -146,6 +146,20 @@ fi
 
 info "Detected container engine: $ENGINE_TYPE ($COMPOSE_CMD)"
 
+# Docker runs the image as uid/gid 1000, never as the invoking user. A `./data`
+# created by a 1001+ host account then cannot be written inside the container, and
+# SQLite reports it as "attempt to write a readonly database" rather than as the
+# ownership problem it is. Rootless Podman's keep-id override handles this itself.
+if [ "$ENGINE_TYPE" = "docker" ]; then
+  HOST_UID=$(id -u)
+  if [ "$HOST_UID" != "1000" ]; then
+    warn "This shell runs as uid $HOST_UID, but Docker runs the container as uid/gid 1000."
+    warn "If ./data (or this checkout) is owned by uid $HOST_UID, the first boot fails with"
+    warn "'attempt to write a readonly database'. Repair it with:"
+    warn "  sudo chown -R 1000:1000 \"$(pwd)/data\""
+  fi
+fi
+
 # ── 3. Configure .env ───────────────────────────────────────────────────────
 
 mkdir -p data/audio
@@ -157,6 +171,10 @@ BIND_ADDR="${SONORA_BIND:-}"
 
 if [ ! -f .env ]; then
   info "Creating .env configuration..."
+  # .env carries SONORA_SECRET and SONORA_PASSPHRASE. Create both it and the
+  # temporary rewrite file owner-only; `cp` otherwise inherits the umask.
+  ENV_UMASK=$(umask)
+  umask 077
   cp .env.example .env
 
   # Generate random 32-byte hex secret
@@ -193,9 +211,14 @@ if [ ! -f .env ]; then
     /^SONORA_BIND=/ { if (bind != "") print "SONORA_BIND=" bind; else print; next }
     { print }
   ' .env.example > .env.tmp && mv .env.tmp .env
+  chmod 600 .env
+  umask "$ENV_UMASK"
 
 else
   info "Found existing .env file. Preserving existing settings."
+  # Existing files from an older install may still be world-readable; tighten them
+  # even when nothing else changes.
+  chmod 600 .env 2>/dev/null || warn "Could not restrict .env permissions; it contains secrets."
   # Ensure SONORA_SECRET is populated if empty
   if grep -q "^SONORA_SECRET=[[:space:]]*$" .env; then
     if command -v openssl >/dev/null 2>&1; then
@@ -203,7 +226,20 @@ else
     else
       SECRET=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
     fi
-    sed -i "s|^SONORA_SECRET=.*|SONORA_SECRET=$SECRET|" .env
+    # `sed -i` is GNU-only (macOS/BSD sed needs an argument, BusyBox differs).
+    # Rewrite through a temp file instead; it is created owner-only.
+    ( umask 077; awk -v secret="$SECRET" '
+      /^SONORA_SECRET=[[:space:]]*$/ { print "SONORA_SECRET=" secret; next }
+      { print }
+    ' .env > .env.tmp ) && mv .env.tmp .env
+    chmod 600 .env
+  fi
+  # An .env that predates the passphrase prompt can leave a fresh database with no
+  # way to sign in. Say so before the user discovers it at the login screen.
+  if ! grep -Eq '^SONORA_PASSPHRASE=[^[:space:]]' .env; then
+    warn "The existing .env sets no SONORA_PASSPHRASE."
+    warn "If the database has no account yet, nobody can sign in: add"
+    warn "SONORA_PASSPHRASE=... to .env and restart before the first boot."
   fi
   # Read existing user/pass for summary display if available
   EXISTING_USER=$(grep -E "^SONORA_USER=" .env | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
@@ -227,21 +263,42 @@ $COMPOSE_CMD up -d --build
 # ── 5. Healthcheck ──────────────────────────────────────────────────────────
 
 info "Waiting for sonora to become healthy..."
+# A 200 alone proves only that HTTP answered: /api/health returns 503 (with a
+# reason) for an instance whose database, sign-in path or audio directory is
+# broken. Accept only the body's own `"ok":true` verdict, exactly like the
+# container's own healthcheck. If the host has no HTTP client, ask the container
+# to run scripts/healthcheck.js, which is the same check from the inside.
+health_probe() {
+  if command -v curl >/dev/null 2>&1; then
+    body=$(curl -sS --max-time 3 http://127.0.0.1:8130/api/health 2>/dev/null) || return 1
+  elif command -v wget >/dev/null 2>&1; then
+    body=$(wget -q -T 3 -O - http://127.0.0.1:8130/api/health 2>/dev/null) || return 1
+  elif [ -n "$COMPOSE_CMD" ]; then
+    $COMPOSE_CMD exec -T sonora node scripts/healthcheck.js >/dev/null 2>&1 || return 1
+    return 0
+  else
+    return 1
+  fi
+  printf '%s' "$body" | grep -Eq '"ok"[[:space:]]*:[[:space:]]*true'
+}
+
 HEALTHY=0
 for i in $(seq 1 30); do
-  if command -v curl >/dev/null 2>&1; then
-    if curl -fsS http://127.0.0.1:8130/api/health >/dev/null 2>&1; then
-      HEALTHY=1
-      break
-    fi
-  elif command -v wget >/dev/null 2>&1; then
-    if wget -q -O /dev/null http://127.0.0.1:8130/api/health >/dev/null 2>&1; then
-      HEALTHY=1
-      break
-    fi
+  if health_probe; then
+    HEALTHY=1
+    break
   fi
   sleep 1
 done
+
+if [ "$HEALTHY" -ne 1 ]; then
+  # Never print the success banner for an instance that cannot serve a listener:
+  # that banner is what sends people to a broken URL with no clue.
+  warn "sonora did not report /api/health ok within 30s."
+  warn "Last 80 log lines:"
+  $COMPOSE_CMD logs sonora 2>&1 | tail -n 80 >&2 || true
+  err "Refusing to report success. Inspect the logs above, fix the cause, then run: $COMPOSE_CMD up -d"
+fi
 
 # ── 6. Completion banner ────────────────────────────────────────────────────
 
@@ -269,8 +326,3 @@ printf "    %s down        # Stop server (data kept in ./data)\n" "$COMPOSE_CMD"
 printf "    %s up -d       # Start server\n" "$COMPOSE_CMD"
 printf "\n"
 printf "${GREEN}============================================================${RESET}\n\n"
-
-if [ "$HEALTHY" -eq 0 ]; then
-  warn "Server did not answer /api/health within 30s."
-  warn "Check logs with: $COMPOSE_CMD logs"
-fi

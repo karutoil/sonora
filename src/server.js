@@ -50,7 +50,7 @@ import {
   normalizeStationCursor, advanceStationCursor,
 } from './station.js';
 import { songKey, cardMetadata } from './search-rank.js';
-import { checkArtist, pollFollows } from './follows.js';
+import { checkArtist, pollFollows, forgetEmptyCatalogueWarning } from './follows.js';
 import {
   searchTracks, upNext, isLive, fetchLyrics, searchAlbums, searchArtists, searchMoodPlaylists,
   searchPlaylists,
@@ -68,6 +68,8 @@ import {
   sessionNow, playlistFor, readSegment, closeSession, windowSeqs, seqAt,
   ensureSegments, ensureSegment, noteSegmentFetch, maybeReposition,
 } from './queue-stream.js';
+// The module namespace, for the optional bulk cleanup at shutdown (see close()).
+import * as queueStream from './queue-stream.js';
 import {
   parseNetscape, parseAny, inspectJar, saveJar, clearJar, restoreJar, jarStatus,
   activeCookiesPath,
@@ -318,7 +320,9 @@ bootstrapUser();
 await restoreJar();
 
 const app = Fastify({
-  logger: { level: process.env.SONORA_LOG_LEVEL ?? 'info' },
+  // Validated at boot (config.logLevel), so a typo names SONORA_LOG_LEVEL instead
+  // of surfacing as a pino constructor error — or a logger that drops every line.
+  logger: { level: config.logLevel },
   trustProxy: config.trustProxy,
   bodyLimit: 64 * 1024,
 });
@@ -542,7 +546,12 @@ app.addHook('preValidation', async (req, reply) => {
 
     const origin = req.headers.origin;
     if (origin !== undefined) {
-      const expected = requestOrigin(req);
+      // Which origins count as "us". The request's own origin is the common case;
+      // SONORA_ORIGIN is the deployment's public origin, and behind a TLS
+      // terminating proxy (or a tunnel that does not forward the scheme) the two
+      // differ — every mutation from the real browser then looked cross-site and
+      // answered 403. Both are trusted answers to the same question.
+      const expected = new Set([requestOrigin(req), config.origin].filter(Boolean));
       let actual = null;
       try {
         const parsed = new URL(String(origin));
@@ -552,7 +561,7 @@ app.addHook('preValidation', async (req, reply) => {
       } catch {
         // Handled by the comparison below; never reflect the supplied value.
       }
-      if (String(origin) === 'null' || !expected || actual !== expected) {
+      if (String(origin) === 'null' || !expected.size || !expected.has(actual)) {
         return reply.code(403).send({ error: 'Request origin does not match.' });
       }
     }
@@ -827,6 +836,13 @@ function startSession(req, reply, user, device, remember, refresh = null) {
     ...(remember ? { maxAge: Math.floor(ttlMs / 1000) } : {}),
   });
   if (remember) {
+    // A fresh sign-in for this device retires whatever the browser held before.
+    // Without this every sign-in minted another live refresh token for the same
+    // device, so an old cookie stayed valid for its whole lifetime even after the
+    // user signed in again — one leaked token outliving the session it belonged
+    // to. Rotation is the exception: it already names its successor (see above),
+    // and revoking there would break the rotation chain it is preserving.
+    if (!refresh) revokeDeviceTokens(device.id);
     const issued = refresh ?? issueRefreshToken({
       deviceId: device.id, userId: user.id, ttlMs: config.refreshDays * 86_400_000,
     });
@@ -1649,7 +1665,10 @@ function coalesce(inFlight, key, load) {
  */
 const UPSTREAM_BOT_GATE = /sign in to confirm|not a bot|login_required|bot gate/i;
 const UPSTREAM_TIMEOUT = /timed out|timeout|aborted/i;
-const UPSTREAM_MISSING = /\bnot found\b|does not exist|unavailable|404/i;
+// Deliberately narrow: "unavailable" and "not found" are not the same answer. A
+// dead album is permanent; a 503 is a temporary fault the client should retry.
+const UPSTREAM_MISSING = /\bnot found\b|does not exist|\b404\b/i;
+const UPSTREAM_UNAVAILABLE = /\bunavailable\b|\bbad gateway\b|\bgateway time-?out\b|\bservice error\b/i;
 const UPSTREAM_RATE_LIMIT = /\b429\b|too many requests|rate[- ]limit/i;
 
 /** Sanitize an upstream error once; partial search responses use the same body. */
@@ -1692,7 +1711,20 @@ function classifyUpstreamFailure(err, label) {
       body: { error: `YouTube did not answer for ${label}. Try again.`, code: 'UPSTREAM_TIMEOUT' },
     };
   }
-  if (UPSTREAM_MISSING.test(message) || statuses.includes(404)) {
+  // An explicit upstream 5xx is an outage, whatever the body happens to say.
+  // This used to be decided by the message alone, and youtubei.js answers a 503
+  // with "service unavailable" — which the old `\bunavailable\b` pattern put in
+  // the *missing* bucket, so an outage was reported as "YouTube has no album for
+  // that id" (and a client that caches 404s kept saying it after the outage).
+  if (statuses.some((code) => Number.isFinite(code) && code >= 500)
+    || UPSTREAM_UNAVAILABLE.test(message)) {
+    return {
+      status: 503,
+      retryAfterMs: retry,
+      body: { error: `YouTube is unavailable for ${label}. Try again shortly.`, code: 'UPSTREAM_UNAVAILABLE' },
+    };
+  }
+  if (UPSTREAM_MISSING.test(message) || statuses.includes(404) || statuses.includes(410)) {
     return { status: 404, retryAfterMs: retry, body: { error: `YouTube has no ${label} for that id.`, code: 'NOT_FOUND' } };
   }
   return {
@@ -1948,6 +1980,27 @@ async function stationPool(load) {
   }
 }
 
+/**
+ * The excluded ids as stored rows, for buildStation's song-level refusal.
+ *
+ * `exclude` reaches the route as bare ids (the query string), and an id says
+ * nothing about the song it belongs to — so an extension could hand back the
+ * same track from a different upload and look like a new discovery. The library
+ * already knows the title and channel of everything it has served, so the rows
+ * are read back and given to buildStation, which derives `excludeSongs` from them.
+ */
+function excludedRows(ids) {
+  const rows = [];
+  for (const id of ids ?? []) {
+    // Only ids: `seen` elsewhere may also hold rows, and those are already the
+    // thing buildStation reads song keys from.
+    if (typeof id !== 'string') continue;
+    const row = getTrack(id);
+    if (row) rows.push(row);
+  }
+  return rows;
+}
+
 async function stationPageAttempt(userId, {
   cursor = 0, exclude = new Set(), limit = STATION_LIMIT, includeSeeds = true,
 } = {}) {
@@ -2021,6 +2074,8 @@ async function stationPageAttempt(userId, {
   const seen = new Set(exclude);
   for (const id of rejected) seen.add(id);
   if (!includeSeeds) for (const s of seeds) seen.add(s.videoId);
+  // Plus the rows behind those ids, so the same song cannot return as an upload.
+  for (const row of excludedRows(exclude)) seen.add(row);
 
   const tracks = buildStation({
     seeds: includeSeeds ? picked : [],
@@ -2086,6 +2141,10 @@ async function stationPage(userId, options = {}) {
   const seen = new Set(options.exclude ?? []);
   for (const id of rejected) seen.add(id);
   if (!includeSeeds) for (const seed of seeds) seen.add(seed.videoId);
+  // The rows this page already delivered are handed over as rows, not only ids:
+  // buildStation derives their song keys from them, so the fallback draw cannot
+  // re-offer the same song from a different upload.
+  for (const track of page.tracks ?? []) seen.add(track);
   const picked = rotateSeeds(seeds, { cursor, count: 3 });
   const tracks = buildStation({
     seeds: includeSeeds ? picked : [],
@@ -2771,7 +2830,15 @@ app.delete('/api/artists/:id/follow', async (req, reply) => {
   const user = requireUser(req, reply);
   if (!user) return;
   const artistId = String(req.params.id ?? '').trim();
+  // Same shape check as the follow route: an id that is not a channel id can
+  // never be a row this user follows, and echoing an arbitrary path segment back
+  // in the answer made the verb a reflector. "Not following" stays idempotent for
+  // every *valid* id, which is the contract the client relies on.
+  if (!ARTIST_ID.test(artistId)) return reply.code(400).send({ error: 'Not a channel id.' });
   unfollowArtist(user.id, artistId);
+  // Unfollowing is the end of this artist's story for this account: the
+  // once-per-artist warning is useless once nobody follows it.
+  forgetEmptyCatalogueWarning(artistId);
   // Deliberately not a 404 for an unknown id: the desired state is "not
   // following", and that is what the client gets either way.
   return { following: false, artistId };
@@ -4683,6 +4750,15 @@ app.get('/api/admin/backup', {
   // an operator saves would be a gzip stream with a `.db` name.
   compress: false,
 }, async (req, reply) => {
+  // A download is a GET carrying ambient admin cookies, so it is exactly the
+  // shape a cross-site link, image or navigation can trigger — and the answer is
+  // the whole database. Fetch Metadata is the honest signal: the admin panel's own
+  // <a download> sends `same-origin`, a typed/bookmarked URL sends `none`, and a
+  // non-browser client (tests, curl) sends nothing at all; all three stay allowed.
+  const site = String(req.headers['sec-fetch-site'] ?? '').toLowerCase();
+  if (site && site !== 'same-origin' && site !== 'none') {
+    return reply.code(403).send({ error: 'Cross-site request refused.' });
+  }
   const admin = requireAdmin(req, reply);
   if (!admin) return;
 
@@ -4789,10 +4865,10 @@ function imageHostAllowed(hostname) {
 // Host the id-based cover routes fetch from. Overridable (with an optional
 // scheme) so a test can pin the upstream to a local plain-HTTP fixture and
 // reason about the proxy's own behaviour — caching, limiting — without
-// YouTube, DNS or TLS on the path.
-const IMG_UPSTREAM = /^https?:\/\//.test(process.env.SONORA_YTIMG_HOST ?? '')
-  ? process.env.SONORA_YTIMG_HOST.replace(/\/+$/, '')
-  : `https://${process.env.SONORA_YTIMG_HOST || 'i.ytimg.com'}`;
+// YouTube, DNS or TLS on the path. Parsed and validated in config.js, so it is
+// always a plain origin here and a bad value fails at boot rather than at the
+// first image request.
+const IMG_UPSTREAM = config.ytimgHost;
 // cacheKey -> { body, type, at } on a hit, or { miss: true, at } after proved absence.
 const imgCache = new Map();
 const imgInFlight = new Map();
@@ -5214,7 +5290,11 @@ app.get('/api/rooms/:code/state', roomRoute(async (req, reply, user) => {
   // the next poll answered 404. Only after viewRoom() has authorised the caller,
   // so a stranger probing codes cannot keep someone else's room alive.
   const snapshot = viewRoom(req.params.code, user);
-  touchRoomPresence(req.params.code);
+  // Only a member's poll is presence: a signed-in stranger may read a public
+  // room's snapshot, and letting that read refresh `updated_at` kept a room
+  // alive that nobody was actually in — the exact opposite of what housekeeping
+  // is asked to reap.
+  if (snapshot.joined) touchRoomPresence(req.params.code);
   return snapshot;
 }));
 
@@ -5282,9 +5362,13 @@ app.post('/api/rooms/:code/invite', roomRoute(async (req, reply, user) => {
   });
 }));
 
-app.delete('/api/rooms/:code/invite/:userId', roomRoute(async (req, reply, user) => (
-  uninviteUser(req.params.code, user, Number(req.params.userId))
-)));
+app.delete('/api/rooms/:code/invite/:userId', roomRoute(async (req, reply, user) => {
+  // A non-numeric segment used to reach uninviteUser() as NaN, which answered a
+  // 500-shaped failure for something the client can see is malformed.
+  const targetId = positiveSafeId(req.params.userId);
+  if (targetId === null) return reply.code(400).send({ error: 'Bad user id.' });
+  return uninviteUser(req.params.code, user, targetId);
+}));
 
 app.get('/api/rooms/:code/events', roomRoute(async (req, reply, user) => {
   // Validate before hijacking: a 403/404 must still be an ordinary JSON reply.
@@ -6449,6 +6533,48 @@ app.setErrorHandler((err, req, reply) => {
   reply.code(code).send({ error: code === 500 ? 'Internal error.' : err.message });
 });
 
+/**
+ * Remove temp directories a previous process left behind.
+ *
+ * The queue stream and the backup download each rent a directory under the
+ * system temp dir and remove it on the way out. A crash or a SIGKILL skips that
+ * cleanup, and these are the largest things this process writes outside its own
+ * data directory (audio segments; a full copy of the database), so they
+ * accumulate silently across restarts until the filesystem is full.
+ *
+ * Only names this app creates are touched, and only once they are old enough
+ * that no live owner can still be writing to them: a second instance (or a
+ * backup download in flight) keeps a fresh directory, and its own boot will not
+ * sweep it either.
+ */
+const TEMP_DIR_PREFIXES = ['sonora-queue-', 'sonora-backup-'];
+const STALE_TEMP_MS = 60 * 60_000;
+
+function sweepStaleTempDirs() {
+  const dir = os.tmpdir();
+  let names;
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return 0;
+  }
+  const cutoff = Date.now() - STALE_TEMP_MS;
+  let removed = 0;
+  for (const name of names) {
+    if (!TEMP_DIR_PREFIXES.some((prefix) => name.startsWith(prefix))) continue;
+    const target = path.join(dir, name);
+    try {
+      const stat = fs.lstatSync(target);
+      if (!stat.isDirectory() || stat.mtimeMs > cutoff) continue;
+      fs.rmSync(target, { recursive: true, force: true });
+      removed += 1;
+    } catch {
+      // Raced with its owner (or another instance swept it): nothing to do.
+    }
+  }
+  return removed;
+}
+
 const close = async (exitCode = 0) => {
   if (closing) return;
   closing = true;
@@ -6465,6 +6591,10 @@ const close = async (exitCode = 0) => {
   // cancelled through ensureAudio's subscriber signal, and every registered job
   // gets a chance to finish its SQLite/filesystem cleanup before db.close().
   await drainJobs();
+  // Hidden-playback sessions own temp segment directories and ffmpeg children;
+  // the module's own shutdown seam reaps both, and it is awaited so the temp
+  // directories are really gone before the process exits.
+  try { await queueStream.closeQueueStreams?.(); } catch { /* best effort at shutdown */ }
   try {
     await app.close();
   } catch (err) {
@@ -6492,6 +6622,10 @@ process.on('uncaughtException', (err) => {
 await app.listen({ port: config.port, host: config.host });
 console.log(`[sonora] http://${config.host}:${config.port} (pid ${process.pid}, ${API_FEATURES.length} api features)`);
 await pruneCache();
+const sweptTemp = sweepStaleTempDirs();
+if (sweptTemp) {
+  console.log(`[sonora] removed ${sweptTemp} stale temp director${sweptTemp === 1 ? 'y' : 'ies'} from a previous run`);
+}
 // Session housekeeping: expired refresh tokens and stale WebAuthn ceremonies are
 // dead weight, and a device unseen for two months is a device the user has long
 // since replaced. Cheap to run once at boot; nothing here is on a hot path.
@@ -6523,8 +6657,16 @@ function sweepExpired() {
     // answer: a track's depth is the deepest fraction heard, and that is either
     // recent or already lost.
     const oldPlays = prunePlays();
-    if (tokens || ceremonies || devices || roomsGone || cacheRows || orphanRows || oldPlays) {
-      console.log(`[sonora] pruned ${tokens} refresh token(s), ${ceremonies} ceremony(s), ${devices} stale device(s), ${roomsGone} room(s), ${cacheRows} cache row(s), ${orphanRows} orphan cache row(s), ${oldPlays} old play(s)`);
+    // Catalogue rows that nothing refers to (delivered by a station page, never
+    // played, never liked) grow the same table the station aggregates. db.js only
+    // exports the retention rule in builds that have it, so this is defensive: an
+    // absent helper is not a failure, and the sweep still runs.
+    const staleTracks = typeof db.pruneStaleTracks === 'function'
+      ? (db.pruneStaleTracks() ?? 0)
+      : 0;
+    if (tokens || ceremonies || devices || roomsGone || cacheRows || orphanRows || oldPlays
+      || staleTracks) {
+      console.log(`[sonora] pruned ${tokens} refresh token(s), ${ceremonies} ceremony(s), ${devices} stale device(s), ${roomsGone} room(s), ${cacheRows} cache row(s), ${orphanRows} orphan cache row(s), ${oldPlays} old play(s), ${staleTracks} stale track(s)`);
     }
   } catch (err) {
     console.warn('[sonora] session housekeeping failed:', err.message);

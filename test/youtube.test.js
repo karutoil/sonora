@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 // src/youtube.js is the only module that reads YouTube's scraped payloads, and
 // every screen depends on it. A renderer that changes shape (a shelf arriving as
@@ -1315,4 +1316,180 @@ test('clearing the override restores the real session factory', async () => {
   // The bot gate is decided by yt-dlp's exit code now (see src/audio.js), not by
   // inspecting a youtubei.js playability_status, so there is nothing to assert
   // about it here.
+});
+// ── the audit fixes: bot gate vs rate limit, and a bounded scheduler ─────
+
+test('a bot gate is reported as a gate, and its backoff is still armed', async () => {
+  // "Sign in to confirm you're not a bot" is not a rate limit: it needs cookies,
+  // not patience. Answering with YT_RATE_LIMIT told the UI to retry sooner for
+  // the wrong reason, while the process-wide backoff is still what keeps one
+  // gate from becoming a storm of requests from the same IP.
+  let calls = 0;
+  const gated = () => { calls += 1; return new Error("Sign in to confirm you're not a bot"); };
+  setSessionOverride(realisticSession({
+    music: { search: async () => { throw gated(); } },
+    search: async () => { calls += 1; return { contents: [] }; },
+  }));
+  try {
+    await assert.rejects(() => searchTracks('creep', 5), (err) => {
+      assert.equal(err.code, 'YT_BOT_GATED', 'the accurate condition, not YT_RATE_LIMIT');
+      assert.ok(err.retryAfterMs > 0);
+      assert.match(err.message, /not a bot/i);
+      return true;
+    });
+    assert.equal(calls, 1, 'a policy answer is never retried through the fallback');
+    // The armed gate must still be reported as a gate (the route classifies the
+    // two differently) and must still short-circuit every public call.
+    await assert.rejects(() => yt.getYT(), (err) => {
+      assert.equal(err.code, 'YT_BOT_GATED');
+      assert.ok(err.retryAfterMs > 0);
+      assert.match(err.message, /sign in|not a bot/i);
+      return true;
+    });
+    await assert.rejects(() => searchTracks('creep', 5), (err) => err.code === 'YT_BOT_GATED');
+    assert.equal(calls, 1, 'the armed gate sends no request at all');
+  } finally {
+    setSessionOverride(null);
+  }
+});
+
+test('a wedged task cannot hold a scheduler slot forever', async () => {
+  // Four non-cooperative operations used to own all four slots for the life of
+  // the process: every later screen waited behind work that would never finish.
+  const TMP2 = fs.mkdtempSync(path.join(os.tmpdir(), 'sonora-youtube-slot-'));
+  const code = `
+    const yt = await import('./src/youtube.js');
+    // Every deadline in the scheduler is unref'd, so keep this process alive
+    // while the waves finish.
+    const keep = setInterval(() => {}, 1000);
+    const hang = () => new Promise(() => {});
+    let n = 0;
+    yt.setSessionOverride(() => ({
+      music: {
+        search: async () => {
+          n += 1;
+          if (n <= 4) return hang();
+          return { songs: { contents: [{ video_id: 'dQw4w9WgXcQ', title: 'Creep', artists: [{ name: 'Radiohead' }] }] } };
+        },
+        getUpNext: async () => hang(),
+      },
+      search: async () => hang(),
+    }));
+    const wedged = [0, 1, 2, 3].map((i) => yt.searchTracks('w' + i, 1));
+    wedged.forEach((p) => p.catch(() => {}));
+    const t0 = Date.now();
+    const fifth = await yt.searchTracks('fifth', 1);
+    clearInterval(keep);
+    console.log('@@' + JSON.stringify({ elapsed: Date.now() - t0, found: fifth.length, started: n }));
+  `;
+  const res = spawnSync(process.execPath, ['--no-warnings', '-e', code], {
+    cwd: new URL('..', import.meta.url).pathname,
+    env: {
+      ...process.env,
+      SONORA_DB: path.join(TMP2, 'slot.db'),
+      SONORA_SECRET: 'youtube-slot-test',
+      // The watchdog fires in 120 ms; the operations' own deadline stays at five
+      // seconds, so only a released slot can explain a fast answer.
+      SONORA_RESOLVE_TIMEOUT_MS: '5000',
+      SONORA_YT_SLOT_MAX_MS: '120',
+    },
+    encoding: 'utf8',
+  });
+  try {
+    assert.equal(res.status, 0, `child failed:\n${res.stdout}\n${res.stderr}`);
+    const line = res.stdout.split('\n').find((l) => l.startsWith('@@'));
+    assert.ok(line, `no @@ marker:\n${res.stdout}`);
+    const got = JSON.parse(line.slice(2));
+    assert.ok(got.started >= 5, 'the fifth operation really ran while four were wedged');
+    assert.equal(got.found, 1);
+    assert.ok(got.elapsed < 2_000, `the fifth call waited ${got.elapsed} ms for a slot`);
+  } finally {
+    fs.rmSync(TMP2, { recursive: true, force: true });
+  }
+});
+
+test('an oversized fan-out is refused at the ceiling, and the queue recovers', async () => {
+  // MAX_QUEUE is a ceiling on live work, not an ever-growing array of closures.
+  // An aborted entry also stops occupying its place immediately (see
+  // scheduleUpstream), so a burst that goes away cannot saturate the queue for
+  // the requests behind it.
+  const previous = config.resolveTimeoutMs;
+  const hang = () => new Promise(() => {});
+  // Every deadline in the scheduler is unref'd, so hold the loop open while
+  // the burst is being waited out.
+  const keep = setInterval(() => {}, 1_000);
+  try {
+    setSessionOverride(realisticSession({
+      music: { search: async () => hang() },
+      search: async () => hang(),
+    }));
+    config.resolveTimeoutMs = 60;
+    const settled = await Promise.allSettled(
+      Array.from({ length: 300 }, (_, i) => searchTracks('q' + i, 1)),
+    );
+    assert.equal(settled.length, 300);
+    // A refusal can arrive directly or, when the catalogue call and its plain
+    // fallback were both refused, inside the AggregateError searchTracks raises.
+    const isOverloaded = (err) => err?.code === 'YT_OVERLOADED'
+      || (Array.isArray(err?.errors) && err.errors.some((e) => e?.code === 'YT_OVERLOADED'));
+    const overloaded = settled.filter((s) => isOverloaded(s.reason)).length;
+    assert.ok(overloaded > 0, 'the ceiling refused the excess instead of queueing it forever');
+    assert.ok(overloaded < 300, 'the slots were used: most operations were queued');
+    // Every queued operation gave up in the queue (its own deadline), and the
+    // scheduler is immediately usable again — nothing dead holds a place.
+    assert.equal(settled.filter((s) => s.status === 'rejected').length, 300);
+    setSessionOverride(realisticSession({
+      music: {
+        search: async () => ({
+          songs: { contents: [{ video_id: VIDEO, title: 'Creep', artists: [{ name: 'Radiohead' }] }] },
+        }),
+      },
+    }));
+    const after = await searchTracks('creep', 1);
+    assert.deepEqual(after.map((t) => t.videoId), [VIDEO], 'the queue drained and answered again');
+  } finally {
+    clearInterval(keep);
+    config.resolveTimeoutMs = previous;
+    setSessionOverride(null);
+  }
+});
+
+test('three concurrent bot gates make the next call build a fresh session', async () => {
+  // A gate is evidence about the session too (rotated visitor data, a jar that
+  // was invalidated, a client build YouTube stopped accepting). The backoff is
+  // kept, but the failures must keep counting, or a session that is the reason
+  // for the gate is reused forever.
+  let builds = 0;
+  const gate = () => new Error("Sign in to confirm you're not a bot");
+  const inFlight = [];
+  let release;
+  const gateOpen = new Promise((resolve) => { release = resolve; });
+  // The scheduler's timers are unref'd; keep the process from exiting early.
+  const keep = setInterval(() => {}, 1_000);
+  setSessionOverride(() => {
+    builds += 1;
+    if (builds > 1) return realisticSession();
+    return realisticSession({
+      music: { search: async () => { inFlight.push(1); await gateOpen; throw gate(); } },
+      search: async () => { await gateOpen; throw gate(); },
+    });
+  });
+  try {
+    const all = Promise.allSettled([searchTracks('a', 5), searchTracks('b', 5), searchTracks('c', 5)]);
+    await waitUntil(() => inFlight.length === 3, 'all three searches reached upstream');
+    // All three are gated before any of them can arm the block: that is the
+    // shape of a real page (about twenty parallel metadata calls).
+    release();
+    const settled = await all;
+    assert.deepEqual(settled.map((s) => s.status), ['rejected', 'rejected', 'rejected']);
+    for (const s of settled) assert.equal(s.reason.code, 'YT_BOT_GATED');
+    assert.equal(builds, 1, 'they shared the first session');
+    // The counter reached SESSION_FAILURE_LIMIT, so the stale session is gone.
+    assert.deepEqual(await searchTracks('d', 5), []);
+    assert.equal(builds, 2, 'the gate rebuilt the session instead of reusing it');
+  } finally {
+    release();
+    clearInterval(keep);
+    setSessionOverride(null);
+  }
 });

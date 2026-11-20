@@ -214,6 +214,25 @@
     // One frame for the label, then the reload.
     setTimeout(function () { location.reload(); }, 60);
   });
+
+  // Coming back online is the retry, without the tap.
+  //
+  // This page is served by the service worker whenever the origin does not
+  // answer, and it is a static document: nothing on it polls, and the browser
+  // fires `online` at the window it already has open. Without this listener the
+  // page sat there saying "no connection" — with a working connection — until
+  // the user reloaded by hand, which is the one thing they should not have to
+  // know to do. The reload is the safe recovery: the worker answers it from the
+  // shell it had, and by then the network is back for everything else.
+  //
+  // `navigator.onLine` is re-checked because a `online` event can arrive before
+  // the flag flips (and a captive portal reports one at all): reloading while
+  // still offline only serves this page again, which looks like the button is
+  // broken.
+  addEventListener('online', function () {
+    if (navigator.onLine === false) return;
+    location.reload();
+  });
 </script>
 </body>
 </html>

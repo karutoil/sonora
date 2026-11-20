@@ -13,9 +13,14 @@
 // Sources live in public/icons/*.svg so the icons can be edited as vectors.
 import fs from 'node:fs';
 import path from 'node:path';
+import zlib from 'node:zlib';
+import { fileURLToPath } from 'node:url';
 import { CHROME, freePort, launch } from '../test/helpers/cdp.js';
 
-const ROOT = new URL('..', import.meta.url).pathname;
+// fileURLToPath, not `.pathname`: the latter is percent-encoded, so a checkout
+// under a directory with a space ("/home/me/my repo") pointed at a path that
+// does not exist and every read/write below failed.
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const ICONS = path.join(ROOT, 'public/icons');
 
 // Chosen so every platform gets a native resolution:
@@ -53,6 +58,106 @@ function pngInfo(file) {
   };
 }
 
+/**
+ * Decode the alpha statistics of one of our PNGs.
+ *
+ * Every bitmap here is a Chromium canvas encode: 8-bit, non-interlaced, RGBA
+ * (or RGB if a future encoder drops a fully opaque alpha channel). Decoding that
+ * narrow subset with node:zlib keeps `--check` dependency-free while letting it
+ * prove opacity instead of trusting `colorType`: Chromium writes RGBA even when
+ * every alpha byte is 255, so the header alone cannot tell an opaque icon from a
+ * transparent one.
+ */
+function pngAlpha(file) {
+  const buf = fs.readFileSync(file);
+  const idat = [];
+  let width = 0;
+  let height = 0;
+  let depth = 0;
+  let colorType = 0;
+  let interlace = 0;
+  let off = 8;
+  while (off + 8 <= buf.length) {
+    const length = buf.readUInt32BE(off);
+    const type = buf.subarray(off + 4, off + 8).toString('latin1');
+    const data = buf.subarray(off + 8, off + 8 + length);
+    off += 12 + length;
+    if (type === 'IHDR') {
+      width = data.readUInt32BE(0);
+      height = data.readUInt32BE(4);
+      depth = data[8];
+      colorType = data[9];
+      interlace = data[12];
+    } else if (type === 'IDAT') {
+      idat.push(data);
+    } else if (type === 'IEND') {
+      break;
+    }
+  }
+  if (depth !== 8 || interlace !== 0 || (colorType !== 6 && colorType !== 2)) {
+    throw new Error(`${file}: unsupported PNG (depth ${depth}, colorType ${colorType}, interlace ${interlace})`);
+  }
+  const bpp = colorType === 6 ? 4 : 3;
+  const stride = width * bpp;
+  const raw = zlib.inflateSync(Buffer.concat(idat));
+  const pixels = Buffer.alloc(height * stride);
+  let pos = 0;
+  for (let y = 0; y < height; y++) {
+    const filter = raw[pos++];
+    const row = raw.subarray(pos, pos + stride);
+    pos += stride;
+    const prev = y ? pixels.subarray((y - 1) * stride, y * stride) : null;
+    const cur = pixels.subarray(y * stride, (y + 1) * stride);
+    for (let x = 0; x < stride; x++) {
+      const a = x >= bpp ? cur[x - bpp] : 0;
+      const b = prev ? prev[x] : 0;
+      const c = prev && x >= bpp ? prev[x - bpp] : 0;
+      let value = row[x];
+      if (filter === 1) value += a;
+      else if (filter === 2) value += b;
+      else if (filter === 3) value += (a + b) >> 1;
+      else if (filter === 4) {
+        const p = a + b - c;
+        const pa = Math.abs(p - a);
+        const pb = Math.abs(p - b);
+        const pc = Math.abs(p - c);
+        value += pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+      }
+      cur[x] = value & 0xff;
+    }
+  }
+  const alphaAt = (x, y) => (colorType === 6 ? pixels[(y * width + x) * 4 + 3] : 255);
+  let minAlpha = 255;
+  if (colorType === 6) {
+    for (let i = 3; i < pixels.length; i += 4) minAlpha = Math.min(minAlpha, pixels[i]);
+  }
+  const cornerAlpha = [
+    alphaAt(0, 0),
+    alphaAt(width - 1, 0),
+    alphaAt(0, height - 1),
+    alphaAt(width - 1, height - 1),
+  ];
+  return {
+    minAlpha,
+    cornerAlpha,
+    minCornerAlpha: Math.min(...cornerAlpha),
+    centerAlpha: alphaAt(Math.floor(width / 2), Math.floor(height / 2)),
+  };
+}
+
+// Icons whose source is a full-bleed plate must have no transparent pixel at
+// all: iOS composites an apple-touch-icon's transparency onto black, and an
+// Android launcher crops a maskable icon to its own shape. These are the icons
+// the renderer also refuses to write with any alpha.
+const OPAQUE_OUTPUTS = new Set(['icon-180.png', 'icon-maskable-512.png']);
+
+// The manifest's `purpose: "any"` icons come from icon.svg, a rounded plate on
+// a transparent field: their corners are transparent by design, but the plate
+// (and therefore the centre) must be fully opaque, with no hollow or washed-out
+// render. Checking both halves of that contract is what an opacity check can
+// honestly assert for this design.
+const ROUNDED_PLATE_OUTPUTS = new Set(['icon-96.png', 'icon-192.png', 'icon-512.png']);
+
 function check() {
   let bad = 0;
   for (const { out, size } of TARGETS) {
@@ -66,9 +171,28 @@ function check() {
     if (width !== size || height !== size || bytes < 400) {
       console.error(`✗ ${out}: ${width}×${height} ${bytes}B colorType=${colorType}`);
       bad++;
-    } else {
-      console.log(`✓ ${out}: ${width}×${height} ${bytes}B colorType=${colorType}`);
+      continue;
     }
+    const alpha = pngAlpha(file);
+    if (OPAQUE_OUTPUTS.has(out) && alpha.minAlpha !== 255) {
+      console.error(`✗ ${out}: has transparent pixels (min alpha ${alpha.minAlpha}); a full-bleed icon must be opaque`);
+      bad++;
+      continue;
+    }
+    if (ROUNDED_PLATE_OUTPUTS.has(out)) {
+      if (alpha.centerAlpha !== 255) {
+        console.error(`✗ ${out}: the centre is transparent (alpha ${alpha.centerAlpha}); the plate must be opaque`);
+        bad++;
+        continue;
+      }
+      if (alpha.minCornerAlpha !== 0) {
+        console.error(`✗ ${out}: corners are not transparent (min corner alpha ${alpha.minCornerAlpha}); it is no longer the rounded plate icon.svg draws`);
+        bad++;
+        continue;
+      }
+    }
+    const alphaNote = OPAQUE_OUTPUTS.has(out) ? `opaque` : `plate-opaque, transparent rounded corners`;
+    console.log(`✓ ${out}: ${width}×${height} ${bytes}B colorType=${colorType} (${alphaNote})`);
   }
   for (const svg of [...new Set(TARGETS.map(({ src }) => src))]) {
     if (!fs.existsSync(path.join(ICONS, svg))) { console.error(`✗ ${svg}: missing`); bad++; }

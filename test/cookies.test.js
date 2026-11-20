@@ -829,3 +829,70 @@ test('clearJar removes plaintext first, preserves encrypted recovery on failure,
     fs.rmSync(missingDir, { recursive: true, force: true });
   }
 });
+
+// ── write ordering and the memoised verdict ─────────────────────────────
+// The encrypted row is the copy that survives a lost file, so it is written
+// first; and the "does this jar look usable" answer is cached per (mtime, size)
+// because it is recomputed on every download, but the cache must never outlive
+// the file it describes.
+
+test('saveJar stores the encrypted copy even when the plaintext write fails', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sonora-jar-order-'));
+  try {
+    const db = path.join(dir, 'unit.db');
+    const text = GOOD_JAR;
+    const out = await runIsolated(
+      { SONORA_DB: db, SONORA_SECRET: 'order-test' },
+      `import fs from 'node:fs'; const m = await import(${JSON.stringify(cookiesUrl)});`
+        + `const text = ${JSON.stringify(text)};`
+        // A directory where the jar file belongs makes the rename fail.
+        + 'fs.mkdirSync(m.storedCookiesPath(), { recursive: true });'
+        + 'let error = null;'
+        + 'try { await m.saveJar(m.parseNetscape(text), text); } catch (err) { error = err.code ?? err.message; }'
+        + 'const meta = m.dbGet("youtube_cookies_meta");'
+        + 'process.stdout.write(JSON.stringify({ error, secret: Boolean(m.dbGet("youtube_cookies")), meta }));',
+    );
+    const result = JSON.parse(lastLine(out));
+    assert.ok(result.error, 'a failed plaintext write is reported, not swallowed');
+    assert.equal(result.secret, true,
+      'the encrypted jar was committed before the file was attempted');
+    assert.equal(JSON.parse(result.meta).cookieCount, 5, 'and the import metadata came with it');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the cached verdict follows the file instead of remembering an old answer', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sonora-jar-cache-'));
+  try {
+    const db = path.join(dir, 'unit.db');
+    const envJar = path.join(dir, 'env-cookies.txt');
+    fs.writeFileSync(envJar, GOOD_JAR);
+    const out = await runIsolated(
+      { SONORA_DB: db, SONORA_SECRET: 'cache-test', SONORA_YTDLP_COOKIES: envJar },
+      `import fs from 'node:fs'; const m = await import(${JSON.stringify(cookiesUrl)});`
+        + `const good = ${JSON.stringify(GOOD_JAR)};`
+        + `const weak = ${JSON.stringify(NO_IDENTITY_JAR)};`
+        + 'const seen = {};'
+        // 1. An implausible stored jar steps aside for the env jar (and the
+        //    verdict for it is now cached).
+        + 'await m.saveJar(m.parseNetscape(weak), weak);'
+        + 'seen.implausible = m.activeCookiesPath();'
+        // 2. The file is replaced behind the module's back: a plausible jar with
+        //    a different size and mtime must be believed, not the cached "no".
+        + 'fs.writeFileSync(m.storedCookiesPath(), good);'
+        + 'seen.replaced = m.activeCookiesPath();'
+        // 3. clearJar/saveJar must forget the memo as well.
+        + 'await m.clearJar(); seen.cleared = m.activeCookiesPath();'
+        + 'await m.saveJar(m.parseNetscape(weak), weak); seen.saved = m.activeCookiesPath();'
+        + 'process.stdout.write(JSON.stringify({ seen, stored: m.storedCookiesPath() }));',
+    );
+    const { seen, stored } = JSON.parse(lastLine(out));
+    assert.equal(seen.implausible, envJar, 'an implausible import yields to SONORA_YTDLP_COOKIES');
+    assert.equal(seen.replaced, stored, 'a replaced, plausible jar is selected again');
+    assert.equal(seen.cleared, envJar, 'after a disconnect the env jar is the source');
+    assert.equal(seen.saved, envJar, 'and a fresh implausible import still yields');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

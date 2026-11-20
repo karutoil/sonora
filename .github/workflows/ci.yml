@@ -79,6 +79,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg
 
+      # queue-stream.test.js and the stream handoffs skip every ffmpeg case when
+      # the binary is missing. On a laptop that is right; in CI the job would go
+      # green having tested less, so fail here instead of skipping silently.
+      - name: Verify ffmpeg
+        run: |
+          set -euo pipefail
+          ffmpeg -version
+
       - name: Run offline tests
         env:
           SONORA_FOLLOWS_OFFLINE: '1'
@@ -188,6 +196,16 @@ jobs:
             import { CHROME } from './test/helpers/cdp.js';
             if (!CHROME) { console.error('::error::test/helpers/cdp.js found no Chromium'); process.exit(1); }
             console.log('cdp.js will launch:', CHROME);"
+
+      # ffmpeg cuts the hidden-queue fixtures and android-pwa's MPRIS check needs a
+      # D-Bus session bus. Both suites skip when the tool is absent, which on a
+      # laptop is correct and in CI means a release gate that tested nothing. Prove
+      # them executable here so a missing package fails loudly instead.
+      - name: Verify ffmpeg and D-Bus
+        run: |
+          set -euo pipefail
+          ffmpeg -version
+          dbus-daemon --version
 
       - name: Run browser tests
         run: |

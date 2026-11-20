@@ -590,3 +590,41 @@ test('CLI role changes are atomic, audited, last-admin safe, and revoke remember
   assert.equal(final.prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND disabled = 0").get().n, 1);
   final.close();
 });
+
+test('the admin CLI refuses a database that does not exist instead of creating one', () => {
+  // `npm run admin` used to open (and therefore create) whatever SONORA_DB said,
+  // so a wrong path produced a blank database and the cheerful answer "No users
+  // yet" — indistinguishable from a real, empty instance.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sonora-cli-'));
+  const missing = path.join(dir, 'not-here.db');
+  const ROOT = new URL('..', import.meta.url).pathname;
+  const baseEnv = {
+    ...process.env,
+    SONORA_DB: missing,
+    SONORA_AUDIO_DIR: path.join(dir, 'audio'),
+    SONORA_LOG_LEVEL: 'warn',
+  };
+  try {
+    const refused = spawnSync(process.execPath,
+      ['--no-warnings', 'scripts/set-role.js', 'list'], {
+        cwd: ROOT, env: baseEnv, encoding: 'utf8', timeout: 20_000,
+      });
+    assert.equal(refused.signal, null, refused.stderr);
+    assert.equal(refused.status, 1, `${refused.stdout}\n${refused.stderr}`);
+    assert.match(refused.stderr, /No database at /);
+    assert.ok(refused.stderr.includes(missing), 'the refusal names the file it was pointed at');
+    assert.equal(fs.existsSync(missing), false, 'and no empty database was created');
+
+    // --db wins over SONORA_DB, and the resolved path is printed before the work.
+    const listed = spawnSync(process.execPath,
+      ['--no-warnings', 'scripts/set-role.js', '--db', DB, 'list'], {
+        cwd: ROOT, env: baseEnv, encoding: 'utf8', timeout: 20_000,
+      });
+    assert.equal(listed.status, 0, `${listed.stdout}\n${listed.stderr}`);
+    assert.ok(listed.stdout.includes(`Database: ${DB}`), listed.stdout);
+    assert.match(listed.stdout, /cli-account/, 'and it lists the real accounts');
+    assert.equal(fs.existsSync(missing), false);
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
+  }
+});

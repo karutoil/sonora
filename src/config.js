@@ -127,6 +127,49 @@ function rpIdSetting(name) {
   return value;
 }
 
+/** pino levels, lower-cased: the same list the logger accepts. */
+const LOG_LEVELS = new Set(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']);
+
+/**
+ * The log level, validated here so a misspelled `SONORA_LOG_LEVEL=vervose` fails
+ * at boot with the variable's name instead of a pino error inside Fastify's
+ * constructor (or, worse, a level that silently filtered every line).
+ */
+function logLevelSetting(name) {
+  const value = (str(name) ?? 'info').toLowerCase();
+  if (!LOG_LEVELS.has(value)) {
+    invalid(name, process.env[name], 'one of fatal, error, warn, info, debug, trace or silent');
+  }
+  return value;
+}
+
+/**
+ * The artwork proxy's upstream origin.
+ *
+ * A bare host is the documented shorthand ("i.ytimg.com"), so it is completed
+ * with https rather than rejected; a full URL must be a plain http(s) origin.
+ * The value is concatenated into fetch URLs, so it may not carry credentials, a
+ * path, a query or a fragment — those would silently change which bytes are
+ * served, not where they come from.
+ */
+function ytimgHostSetting(name) {
+  const raw = str(name);
+  if (!raw) return 'https://i.ytimg.com';
+  if (/[\s\\]/.test(raw)) invalid(name, raw, 'an http(s) host without whitespace or backslashes');
+  const absolute = /^[a-z][a-z0-9+.-]*:/i.test(raw) ? raw : `https://${raw}`;
+  let url;
+  try {
+    url = new URL(absolute);
+  } catch {
+    invalid(name, raw, 'an http:// or https:// host, or a bare host name');
+  }
+  if (!['http:', 'https:'].includes(url.protocol) || !url.hostname
+    || url.username || url.password || !/^\/+$/.test(url.pathname) || url.search || url.hash) {
+    invalid(name, raw, 'an http(s) host with no credentials, path, query or fragment');
+  }
+  return url.origin;
+}
+
 function secureCookieSetting(name) {
   const value = (str(name) ?? 'auto').toLowerCase();
   if (!['auto', 'always', 'never'].includes(value)) {
@@ -195,10 +238,18 @@ export const config = {
   // with no way for the browser to give up (the request had no abort either).
   // Bounded, the request fails fast and the player moves on.
   queueTimeoutMs: positiveInt('SONORA_DOWNLOAD_QUEUE_TIMEOUT_MS', 20_000, { max: MAX_TIMER_MS }),
+  // How far ahead one hidden-playback queue stream is written before it stops
+  // repeating the plan (see src/queue-stream.js). Validated here so an operator
+  // reading the admin diagnostics sees the same number the stream uses, and a
+  // typo fails at boot instead of silently keeping 24 hours.
+  queueCoverMs: positiveInt('SONORA_QUEUE_COVER_MS', 24 * 60 * 60 * 1000, { max: MAX_TIMER_MS }),
   // Shared secret for session cookies. Required in production; generated
   // per-process in dev so a forgotten env var can never ship a fixed key.
   secret: configuredSecret || crypto.randomBytes(32).toString('hex'),
   isDev: !configuredSecret,
+  // Fastify/pino's level, validated above so a typo is a boot error naming the
+  // variable rather than a logger that quietly drops every line.
+  logLevel: logLevelSetting('SONORA_LOG_LEVEL'),
   // Access tokens are short-lived; a remembered device silently renews one with
   // its refresh token. Without "remember me" the cookie is session-scoped, so
   // closing the browser signs the device out.
@@ -238,8 +289,11 @@ export const config = {
   // person and hostile to a script; raise it for a household sharing one IP.
   loginRateMax: positiveInt('SONORA_LOGIN_RATE_MAX', 10),
   loginRateWindow: loginWindowSetting('SONORA_LOGIN_RATE_WINDOW'),
-  // Bootstrap user, created only when the users table is empty.
-  bootstrapUser: (process.env.SONORA_USER ?? 'admin').trim(),
+  // Bootstrap user, created only when the users table is empty. A blank value
+  // (SONORA_USER= or whitespace) keeps the default name: an empty account name
+  // cannot be typed into the sign-in form, and rejecting it at boot would make
+  // an accidentally blank setting look like a crash rather than a default.
+  bootstrapUser: str('SONORA_USER') ?? 'admin',
   bootstrapPass: process.env.SONORA_PASSPHRASE ?? '',
   // Stream URL lifetime, reported to the admin panel. The Innertube-resolved
   // URL cache this used to bound is gone: audio is fetched once into the local
@@ -261,6 +315,11 @@ export const config = {
     max: maxDateUnits(3_600_000), unitMs: 3_600_000,
   }),
   roomMaxMembers: positiveInt('SONORA_ROOM_MAX_MEMBERS', 50),
+  // Open rooms one account may host. Creating a room is cheap for the client and
+  // permanent for the server until housekeeping reaps it, so one signed-in
+  // visitor could otherwise fill the table (and the SSE hub's memory) with an
+  // arbitrary number of live playheads.
+  roomMaxPerHost: int('SONORA_ROOM_MAX_PER_HOST', 5, { min: 1, max: 1000 }),
 
   // Absolute origin used in share-card URLs (og:url, og:image, oEmbed). Behind
   // a tunnel the origin the crawler used is not the one the process sees, so
@@ -277,6 +336,10 @@ export const config = {
   ytdlpCookies: pathSetting('SONORA_YTDLP_COOKIES', null),
   // e.g. http://127.0.0.1:8118 (Privoxy) or socks5://127.0.0.1:1080
   ytdlpProxy: str('SONORA_YTDLP_PROXY'),
+  // Upstream for the id-based artwork proxy: a bare host or a full http(s) URL.
+  // Either form is validated down to a plain origin; a bare host is completed
+  // with https. Used by /api/img and the share-card image routes.
+  ytimgHost: ytimgHostSetting('SONORA_YTIMG_HOST'),
   // bgutil-ytdlp-pot-provider HTTP endpoint; blank whitespace disables it.
   potProviderUrl: str('SONORA_POT_PROVIDER')
     ?? (process.env.SONORA_POT_PROVIDER === undefined ? 'http://127.0.0.1:4416' : ''),
@@ -298,11 +361,11 @@ if (config.rpId && config.origin) {
 }
 
 // A blank account name is unreachable: nothing can be typed that signs into it,
-// and it is created as the instance's only admin. Fail at boot with the reason
-// instead of handing back an app nobody can log into.
-if (config.bootstrapPass && !config.bootstrapUser) {
-  throw new Error(
-    'SONORA_USER is blank but SONORA_PASSPHRASE is set. Set a name (e.g. SONORA_USER=you) '
-    + 'or unset the passphrase — an empty account name cannot be signed into.',
-  );
+// and it is created as the instance's only admin. config keeps the default name
+// for a blank/absent SONORA_USER (see bootstrapUser above); say so out loud,
+// because an operator who set it deliberately expects their own name.
+if (config.bootstrapPass && (process.env.SONORA_USER ?? '').trim() === ''
+  && process.env.SONORA_USER !== undefined) {
+  console.warn('[sonora] SONORA_USER is blank; using the default account name '
+    + `"${config.bootstrapUser}". Set SONORA_USER to choose another name.`);
 }

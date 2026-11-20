@@ -47,6 +47,7 @@ before(async () => {
       SONORA_DB: path.join(DIR, 'sonora.db'), SONORA_AUDIO_DIR: path.join(DIR, 'audio'),
       SONORA_SECRET: 'venue-secret', SONORA_PASSPHRASE: 'hunter2hunter2',
       SONORA_LOG_LEVEL: 'warn', SONORA_POT_PROVIDER: '', SONORA_JS_RUNTIME: '',
+      SONORA_ROOM_MAX_PER_HOST: '40',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });

@@ -11,15 +11,41 @@ import { spawn, spawnSync } from 'node:child_process';
 export const CHROME = process.env.CHROME_BIN || ['chromium', 'chromium-browser', 'google-chrome', 'google-chrome-stable']
   .find((bin) => spawnSync('sh', ['-c', `command -v ${bin}`], { encoding: 'utf8' }).status === 0);
 
+// Ports handed out by freePort() in this process. bind(0) picks a free port and
+// then closes its probe socket before the caller can bind, so two browsers
+// launched in the same test worker could be handed the same number (the kernel
+// has no memory of a port it never actually used). Keep a short cooldown so
+// concurrent launches in one worker cannot collide; ports are released after it,
+// and this is process-local — it cannot coordinate separate test files.
+const RECENT_PORTS = new Map();
+const PORT_COOLDOWN_MS = 10_000;
+
 /** A free port, so a leftover run can never poison this one. */
 export function freePort() {
   return new Promise((resolve, reject) => {
-    const srv = net.createServer();
-    srv.on('error', reject);
-    srv.listen(0, '127.0.0.1', () => {
-      const { port } = srv.address();
-      srv.close(() => resolve(port));
-    });
+    const attempt = (remaining) => {
+      const srv = net.createServer();
+      srv.once('error', (error) => {
+        if (remaining > 0) attempt(remaining - 1);
+        else reject(error);
+      });
+      srv.listen(0, '127.0.0.1', () => {
+        const { port } = srv.address();
+        srv.close(() => {
+          const now = Date.now();
+          for (const [used, at] of RECENT_PORTS) {
+            if (now - at >= PORT_COOLDOWN_MS) RECENT_PORTS.delete(used);
+          }
+          if (RECENT_PORTS.has(port) && remaining > 0) {
+            attempt(remaining - 1);
+            return;
+          }
+          RECENT_PORTS.set(port, now);
+          resolve(port);
+        });
+      });
+    };
+    attempt(50);
   });
 }
 

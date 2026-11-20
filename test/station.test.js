@@ -531,3 +531,66 @@ test('a non-finite station cursor is clamped instead of answering 500', async ()
     try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
   }
 });
+
+// ── song-level exclusion, empty pages and 0-weight lanes ────────────────
+// An extension is handed the ids it already delivered, and an id is only one
+// upload of a song: the recommender returns the other upload of it happily.
+
+test('an excluded song cannot return as a different upload', () => {
+  const delivered = {
+    videoId: 'delivrd0001', title: 'Blinding Lights (Official Video)', channel: 'The Weeknd',
+    durationS: 200,
+  };
+  const out = buildStation({
+    expansions: [[
+      track({ videoId: 'othrUpld001', title: 'Blinding Lights (Official Audio)', channel: 'The Weeknd' }),
+      track({ videoId: 'freshSong01', title: 'A Fresh Song', channel: 'Someone Else' }),
+    ]],
+    // The row itself, as the server passes it: buildStation derives the song key.
+    exclude: new Set([delivered, 'goneId00001']),
+    limit: 5,
+  });
+  assert.deepEqual(out.map((t) => t.videoId), ['freshSong01'],
+    'the same song from another upload is the same repeat');
+  // A bare id still excludes exactly that upload.
+  const byId = buildStation({
+    expansions: [[track({ videoId: 'othrUpld001', title: 'Blinding Lights', channel: 'The Weeknd' })]],
+    exclude: new Set(['othrUpld001']),
+    limit: 5,
+  });
+  assert.deepEqual(byId, []);
+});
+
+test('ranking zero seeds is an empty answer, not the best seed', () => {
+  const evidence = { likes: [like({ videoId: 'liked000001' })], plays: [] };
+  assert.deepEqual(rankSeeds(evidence, { limit: 0 }), []);
+  assert.deepEqual(rankSeeds(evidence, { limit: -3 }), []);
+  assert.deepEqual(rankSeeds(evidence, { limit: Number.NaN }), []);
+  assert.deepEqual(rankSeeds(evidence, { limit: 1 }).map((s) => s.videoId), ['liked000001']);
+});
+
+test('a lane with no plan weight still fills a short page', () => {
+  // The plan says "no trending on this page", but the other pools came back with
+  // one track between them. A 1-track page is worse than a trending one.
+  const expansions = [
+    { tracks: [track({ videoId: 'onlyFam0001', title: 'Familiar Only', channel: 'Known' })], lane: 'sameArtist' },
+    { tracks: [track({ videoId: 'onlyTrnd001', title: 'Trending Only', channel: 'Stranger' })], lane: 'trending' },
+  ];
+  const plan = { seed: 0, sameArtist: 3, adjacent: 0, trending: 0 };
+  const out = buildStation({
+    expansions,
+    plan,
+    limit: 3,
+    knownArtists: new Set(['Known']),
+  });
+  assert.equal(out.length, 2, `both pools must be used, got ${out.map((t) => t.videoId).join(',')}`);
+  assert.deepEqual(out.map((t) => t.videoId).sort(), ['onlyFam0001', 'onlyTrnd001']);
+  // And the planned limit is still a limit: a 4th candidate is not admitted.
+  const capped = buildStation({
+    expansions,
+    plan,
+    limit: 1,
+    knownArtists: new Set(['Known']),
+  });
+  assert.equal(capped.length, 1);
+});

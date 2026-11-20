@@ -701,19 +701,24 @@ const MIGRATIONS = [
     // A newer dislike has the same effect as toggleDislike(): remove the like's
     // play-log signal as well as its library row. Delete these before staleLikes
     // removes the rows that identify which play events belong to that action.
+    //
+    // `>=` throughout, matching staleDislikes: with a strict `>` an equal
+    // created_at left the two statements disagreeing about which action won,
+    // and a like row whose play-log signal depended on that ordering could be
+    // abandoned in `plays` as an orphan `kind='like'` row for a disliked track.
     const staleLikePlays = db.prepare(`
       DELETE FROM plays WHERE kind = 'like' AND EXISTS (
         SELECT 1 FROM likes l JOIN dislikes d
           ON d.user_id = l.user_id AND d.video_id = l.video_id
         WHERE l.user_id = plays.user_id AND l.video_id = plays.video_id
-          AND d.created_at > l.created_at
+          AND d.created_at >= l.created_at
       )
     `).run().changes;
     const staleLikes = db.prepare(`
       DELETE FROM likes WHERE EXISTS (
         SELECT 1 FROM dislikes d
         WHERE d.user_id = likes.user_id AND d.video_id = likes.video_id
-          AND d.created_at > likes.created_at
+          AND d.created_at >= likes.created_at
       )
     `).run().changes;
     // Station blobs are cached under `station:<user id>:…` and have no foreign
@@ -1474,11 +1479,36 @@ export function touchRoomRow(code) {
     .run(new Date().toISOString(), code).changes > 0;
 }
 
-export function updateRoomMeta(code, { visibility, control }) {
+/** The two enums the rooms table's CHECK-less TEXT columns accept. */
+const ROOM_VISIBILITIES = new Set(['public', 'private']);
+const ROOM_CONTROLS = new Set(['everyone', 'host']);
+
+/**
+ * Change a room's visibility/control policy.
+ *
+ * Validated here as well as in src/rooms.js: these are enum columns with no
+ * CHECK constraint, so one future caller (an admin repair, a migration, a test
+ * fixture) writing `privatee` or `anyone` would persist a value every reader
+ * then has to guess about — and `host`-only control failing open is a security
+ * answer, not a cosmetic one.
+ */
+export function updateRoomMeta(code, { visibility, control } = {}) {
   const sets = [];
   const values = [];
-  if (visibility) { sets.push('visibility = ?'); values.push(visibility); }
-  if (control) { sets.push('control = ?'); values.push(control); }
+  if (visibility != null && visibility !== '') {
+    if (!ROOM_VISIBILITIES.has(visibility)) {
+      throw new Error(`visibility must be public or private, not ${String(visibility)}`);
+    }
+    sets.push('visibility = ?');
+    values.push(visibility);
+  }
+  if (control != null && control !== '') {
+    if (!ROOM_CONTROLS.has(control)) {
+      throw new Error(`control must be everyone or host, not ${String(control)}`);
+    }
+    sets.push('control = ?');
+    values.push(control);
+  }
   if (!sets.length) return false;
   values.push(new Date().toISOString(), code);
   return db.prepare(`UPDATE rooms SET ${sets.join(', ')}, updated_at = ? WHERE code = ?`)
@@ -1759,6 +1789,36 @@ export function deleteTrack(videoId) {
     cacheDeletePrefix('station:');
     return info.changes > 0;
   });
+}
+
+/**
+ * Delete `tracks` rows nobody references any more.
+ *
+ * `tracks` is global metadata: a station page or a search upserts every row it
+ * renders, so the table grows with what the instance has *looked at*, not with
+ * what anyone kept. Nothing ever removed a row except an explicit delete, which
+ * means a long-lived install accumulates metadata for tracks that were never
+ * played, liked, disliked or added to a playlist — one row per browse, forever.
+ *
+ * A row is only removable when it is both old (`last_seen` older than
+ * `maxAgeMs`, default 180 days) and unreferenced: referencing it is exactly what
+ * makes it worth keeping. Deleting metadata is safe for playback — a track that
+ * comes back is re-upserted on the next render.
+ */
+export function pruneStaleTracks(maxAgeMs = 180 * 86_400_000) {
+  const age = Number(maxAgeMs);
+  if (!Number.isFinite(age) || age < 0) return 0;
+  const cutoff = new Date(Date.now() - age).toISOString();
+  // `last_seen` is an ISO-8601 UTC stamp, so the string comparison is the date
+  // comparison (and can use an index if one is ever added for it).
+  return db.prepare(`
+    DELETE FROM tracks
+    WHERE last_seen < ?
+      AND NOT EXISTS (SELECT 1 FROM plays p WHERE p.video_id = tracks.video_id)
+      AND NOT EXISTS (SELECT 1 FROM likes l WHERE l.video_id = tracks.video_id)
+      AND NOT EXISTS (SELECT 1 FROM dislikes d WHERE d.video_id = tracks.video_id)
+      AND NOT EXISTS (SELECT 1 FROM playlist_items i WHERE i.video_id = tracks.video_id)
+  `).run(cutoff).changes;
 }
 
 export function clearUserHistory(userId) {
@@ -2112,13 +2172,18 @@ export function topArtists(userId, limit = 18) {
   `).all(userId, limit);
 }
 
+/**
+ * Read a cached value, or null once it has expired.
+ *
+ * An expired row is *not* deleted here: this is the read path — a station draw
+ * asks for a dozen keys per request — and a write on it (plus its WAL frame and
+ * the fsync behind it) for a row the expiry sweep removes anyway is pure cost.
+ * `pruneExpiredCache()` owns that deletion, and it runs on the expiry index.
+ */
 export function cacheGet(key) {
   const row = stmt('SELECT value, expires_at FROM upstream_cache WHERE key = ?').get(key);
   if (!row) return null;
-  if (row.expires_at < Date.now()) {
-    stmt('DELETE FROM upstream_cache WHERE key = ?').run(key);
-    return null;
-  }
+  if (row.expires_at < Date.now()) return null;
   try { return JSON.parse(row.value); } catch { return null; }
 }
 
@@ -2160,10 +2225,11 @@ export function cacheDeletePrefix(prefix) {
 }
 
 /**
- * Sweep expired rows. Nothing but a cacheGet for the exact same key ever deletes
- * one, so a value nobody asks for again (a `?fresh=1` station draw, a one-off
- * search) lived for as long as the process did. Housekeeping calls this; the
- * expiry index makes it a range delete instead of a full scan.
+ * Sweep expired rows. `cacheGet` no longer deletes an expired row it happens to
+ * read — a read path must not write — so this is the one owner of that deletion
+ * besides the integrity repair. Housekeeping calls it; the expiry index makes it
+ * a range delete instead of a full scan, which is why a value nobody asks for
+ * again does not live for as long as the process does.
  */
 export function pruneExpiredCache(now = Date.now()) {
   return db.prepare('DELETE FROM upstream_cache WHERE expires_at < ?').run(now).changes;
@@ -2269,9 +2335,28 @@ export function followArtist(userId, { artistId, name = null, thumb = null }) {
   return isFollowing(userId, artistId);
 }
 
+/**
+ * Stop following an artist.
+ *
+ * When this was the artist's last follower, the release bookkeeping for that
+ * artist goes too: `artist_releases` and `artist_release_state` are keyed by
+ * artist, not by user, so nothing else ever removes them — an unfollowed artist
+ * used to leave a permanent row set (and, worse, an "initialized" marker that
+ * would make a future follower's first sweep silent).
+ */
 export function unfollowArtist(userId, artistId) {
-  return db.prepare('DELETE FROM artist_follows WHERE user_id = ? AND artist_id = ?')
-    .run(userId, artistId).changes > 0;
+  return transaction(() => {
+    const removed = db.prepare('DELETE FROM artist_follows WHERE user_id = ? AND artist_id = ?')
+      .run(userId, artistId).changes > 0;
+    if (!removed) return false;
+    const remaining = db.prepare('SELECT COUNT(*) AS n FROM artist_follows WHERE artist_id = ?')
+      .get(artistId).n;
+    if (remaining === 0) {
+      db.prepare('DELETE FROM artist_releases WHERE artist_id = ?').run(artistId);
+      db.prepare('DELETE FROM artist_release_state WHERE artist_id = ?').run(artistId);
+    }
+    return true;
+  });
 }
 
 export function listFollows(userId) {

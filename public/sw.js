@@ -21,7 +21,7 @@
 // build a worker reports, so the worker reports one — a hash of its own bytes,
 // which changes exactly when the browser decides this is a new build (see
 // buildId()).
-const VERSION = 'v27';
+const VERSION = 'v28';
 const SHELL_CACHE = `sonora-shell-${VERSION}`;
 const RUNTIME_CACHE = `sonora-runtime-${VERSION}`;
 // Install precaches into this cache; activate promotes it into SHELL_CACHE.
@@ -92,6 +92,22 @@ const PRECACHE = [
   '/icons/icon-192.png',
   '/icons/icon-512.png',
   '/icons/icon-maskable-512.png',
+];
+
+// The four launcher-shortcut tiles from manifest.webmanifest.
+//
+// Fetched at install like the rest of the shell, but deliberately *not* in
+// PRECACHE and not in REQUIRED_SHELL: a shortcut's icon is drawn by the OS, and
+// the only thing a missing one costs is a blank tile in the launcher menu of a
+// phone that is offline the first time it opens it. A required entry, by
+// contrast, refuses the whole install when it 404s after a rename — a cosmetic
+// bitmap must not be able to do that (the same reasoning as notifications.* and
+// listen.js). One list, one best-effort pass, each URL on its own.
+const PRECACHE_OPTIONAL = [
+  '/icons/shortcuts/wave.png',
+  '/icons/shortcuts/search.png',
+  '/icons/shortcuts/heart.png',
+  '/icons/shortcuts/radio.png',
 ];
 
 // The boot set. Anything here missing from the shell means the app cannot
@@ -313,6 +329,15 @@ self.addEventListener('install', (event) => {
     // Learn the build id now, while the network is warm and an install is
     // allowed to take a moment: it is the identity pwa.js shows a prompt for.
     await buildId();
+    // Optional extras, and after the check above: a slow or missing icon can
+    // neither fail this install nor delay the answer to "is the boot set here".
+    await Promise.all(PRECACHE_OPTIONAL.map(async (url) => {
+      try {
+        await cache.add(new Request(url, { cache: 'reload' }));
+      } catch {
+        // A blank tile in an offline launcher menu, nothing more.
+      }
+    }));
   })());
 });
 

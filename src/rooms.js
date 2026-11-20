@@ -29,7 +29,7 @@ import {
   deleteRoomRow, parseRoomState, listRoomMembers, getRoomMember, addRoomMember,
   removeRoomMember, countRoomMembers, touchRoomMember, addRoomInvite, removeRoomInvite,
   getRoomInvite, listRoomInvites, searchUsers, listRoomsToPrune, getUser, upsertTrack,
-  setRoomHost, setRoomMemberRole,
+  listRoomsForUser, setRoomHost, setRoomMemberRole,
   transaction,
 } from './db.js';
 
@@ -42,6 +42,17 @@ const VIDEO_ID = /^[A-Za-z0-9_-]{11}$/;
 /** The same window `/api/now` stores; a room queue is not a playlist. */
 const MAX_QUEUE = 60;
 const MAX_STREAMS_PER_ROOM = 200;
+/**
+ * Live room streams this process will hold at once.
+ *
+ * The per-room cap bounds one popular room; nothing bounded the *number* of
+ * rooms. A room per code is a socket plus a 15-second ticker, and a public
+ * listener needs no account, so an anonymous visitor could hold thousands of
+ * them and grow the process's memory without limit. Past this ceiling a new
+ * stream is refused with the same frame a full room sends, which the client
+ * already renders as "too many listeners".
+ */
+export const MAX_STREAMS_TOTAL = 2000;
 /**
  * How much unwritten data a subscriber may hold before it is dropped.
  *
@@ -91,12 +102,25 @@ export class RoomError extends Error {
 export function normaliseTrack(t) {
   const videoId = String(t?.videoId ?? '');
   if (!VIDEO_ID.test(videoId)) return null;
+  // A duration is either a number or a numeric string. The string form arrives
+  // from clients that echo back a parsed row (`"durationS": "214"`), and dropping
+  // it to null made a known-length track look unmeasurable — which the room then
+  // ends at its 15-minute ceiling instead of at the real end. Blank, non-numeric,
+  // zero and negative strings stay unknown rather than becoming a length; a
+  // *number* keeps its old meaning (0 is a known-bad length, not an unknown one).
+  let durationS = null;
+  if (typeof t?.durationS === 'string') {
+    const parsed = Number(t.durationS);
+    if (Number.isFinite(parsed) && parsed > 0) durationS = Math.round(parsed);
+  } else if (Number.isFinite(t?.durationS)) {
+    durationS = Math.max(0, Math.round(t.durationS));
+  }
   return {
     videoId,
     title: String(t?.title ?? '').slice(0, 300) || videoId,
     channel: String(t?.channel ?? '').slice(0, 200),
     thumb: String(t?.thumb ?? '').slice(0, 500) || null,
-    durationS: Number.isFinite(t?.durationS) ? Math.max(0, Math.round(t.durationS)) : null,
+    durationS,
   };
 }
 
@@ -228,6 +252,13 @@ export function snapshotFor(row, { userId = null, includeActor = true } = {}) {
 // this holds who is connected right now.
 
 const hub = new Map(); // code -> { subs: Set<sub>, ticker }
+
+/** Every live SSE consumer in this process, across every room. */
+function totalStreams() {
+  let total = 0;
+  for (const entry of hub.values()) total += entry.subs.size;
+  return total;
+}
 
 const frame = (event, data) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 
@@ -390,11 +421,20 @@ function publicSnapshotData(code) {
   const row = mustGetRoom(code);
   return {
     ...snapshotFor(row, { userId: null, includeActor: false }),
+    // An account id is not a public-room resource. A guest page renders the name
+    // and nothing else, and the id is the handle every member-scoped API route
+    // takes, so the anonymous shape carries the name alone.
+    host: { name: guestHostName(row) },
     joined: true,
     guest: true,
     members: [],
     listeners: listenerCount(code),
   };
+}
+
+/** The host as an anonymous listener may see them: a name, never an account id. */
+function guestHostName(row) {
+  return getUser(row.hostId)?.name ?? 'Someone';
 }
 
 /** Every member, with the ones holding a live stream marked online. */
@@ -444,7 +484,8 @@ export function openStream(code, identity, res) {
   // empty `{subs:0, ticker:null}` map entry behind on every refused connection
   // (only dropSub ever deletes an empty entry), a slow leak in exactly the
   // situation — 200 streams — where the process is already at its ceiling.
-  if ((hub.get(code)?.subs.size ?? 0) >= MAX_STREAMS_PER_ROOM) {
+  if (totalStreams() >= MAX_STREAMS_TOTAL
+    || (hub.get(code)?.subs.size ?? 0) >= MAX_STREAMS_PER_ROOM) {
     res.write(frame('room', { ended: false, error: 'This room has too many listeners.' }));
     res.end();
     return null;
@@ -545,6 +586,16 @@ const CONTROLS = new Set(['everyone', 'host']);
 export function createRoom({ host, visibility = 'public', control = 'everyone', queue, index = 0, positionMs = 0, playing = false }) {
   if (!VISIBILITIES.has(visibility)) throw new RoomError(400, 'BAD_INPUT', 'Visibility must be public or private.');
   if (!CONTROLS.has(control)) throw new RoomError(400, 'BAD_INPUT', 'Control must be everyone or host.');
+  // A room lives until it is ended or reaped, and creating one is a single POST.
+  // Without a per-host ceiling one account could fill the table (and hold open
+  // that many live playheads) with a loop. Rooms the account merely joined or
+  // was invited to do not count — this is about the ones they own.
+  const hosted = listRoomsForUser(host.id, 100)
+    .filter((room) => room.hostId === host.id).length;
+  if (hosted >= config.roomMaxPerHost) {
+    throw new RoomError(429, 'TOO_MANY_ROOMS',
+      `You are already hosting ${hosted} rooms. End one before starting another.`);
+  }
   const tracks = normaliseQueue(queue);
   // A room with nothing to play has no playhead to share; the UI asks for a
   // track first, which is one honest step instead of an empty page.
@@ -1034,6 +1085,9 @@ export function publicSnapshot(code) {
   }
   const snapshot = {
     ...snapshotFor(row, { userId: null, includeActor: false }),
+    // Same rule as publicSnapshotData: a guest gets the host's name, not their
+    // account id (the id is what every member-scoped route takes).
+    host: { name: guestHostName(row) },
     joined: true,
     guest: true,
     // Names of account members are not a public-room resource: a guest gets the

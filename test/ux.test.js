@@ -1647,3 +1647,248 @@ test('AA: a late lyrics failure cannot mark the new track as lyric-less', async 
     await dispose();
   }
 });
+
+// ── signing out, damaged links, and the queue drawer ─────────────────────
+//
+// Three failures a user meets at the end of a session rather than at the start:
+// the previous account's settings left in the browser, a half-copied share link
+// that froze the router, and a queue drawer that jumped back to the top under
+// the reader every time a track rolled over.
+
+/** Put the shared browser back into a signed-in session for whatever runs next. */
+async function signBackIn() {
+  const ok = await browser.eval(`fetch('/api/auth/login', { method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }) }).then((r) => r.ok)`);
+  assert.equal(ok, true, 'could not sign the shared browser back in');
+  await browser.goto(`${BASE}/?ux=${Date.now()}`);
+  await browser.waitFor(
+    `!!document.querySelector('#mobile-nav button') && document.getElementById('auth-overlay').hidden === true`,
+    20_000,
+  );
+}
+
+test('AB: "Sign out here" clears the account-scoped keys and keeps the device ones', async (t) => {
+  if (!needBrowser(t)) return;
+
+  await browser.viewport(VIEW.desktop);
+  await browser.goto(`${BASE}/?ux=${Date.now()}#/security`);
+  await browser.waitFor(`!!document.querySelector('[data-action="signout-here"]')`, 20_000);
+
+  try {
+    // What a signed-in session has written by the time it signs out: the raw
+    // search queries, the settings, and the two view preferences.
+    const seeded = await browser.eval(`(() => {
+      localStorage.setItem('sonora.searchRecent', JSON.stringify(['lofi chill']));
+      localStorage.setItem('sonora.prefs', JSON.stringify({ queueFillList: true }));
+      localStorage.setItem('sonora.sort', JSON.stringify('title'));
+      localStorage.setItem('sonora.libraryTab', JSON.stringify('Albums'));
+      localStorage.setItem('sonora.deviceId', JSON.stringify('ux-device-0001'));
+      window.__beforeSignOut = true;
+      return {
+        recent: localStorage.getItem('sonora.searchRecent'),
+        tab: localStorage.getItem('sonora.libraryTab'),
+      };
+    })()`);
+    assert.ok(seeded.recent && seeded.tab, 'the account keys were not written, so this test would prove nothing');
+
+    await browser.eval(`document.querySelector('[data-action="signout-here"]').click()`);
+    await browser.waitFor(`!!document.querySelector('#form-content [data-action="confirm-form"]')`, 8000);
+    await browser.eval(`document.querySelector('#form-content [data-action="confirm-form"]').click()`);
+
+    // A window marker cannot survive a document load, so its disappearance is
+    // the proof that the sign-out reached its reload — and that the cleanup
+    // before it did not throw. Reaching this line at all is half the assertion.
+    await browser.waitFor(`window.__beforeSignOut === undefined`, 20_000);
+    // The reload's own boot still has to ask /api/me before it knows it is
+    // signed out, so wait for the overlay rather than reading its pre-boot state.
+    await browser.waitFor(`document.getElementById('auth-overlay').hidden === false`, 20_000);
+    const after = await browser.eval(`(() => {
+      const keys = {};
+      for (const key of ['searchRecent', 'prefs', 'sort', 'libraryTab', 'deviceId']) {
+        keys[key] = localStorage.getItem('sonora.' + key);
+      }
+      return { keys, overlay: document.getElementById('auth-overlay').hidden };
+    })()`);
+    assert.equal(after.overlay, false, 'signing out here did not land on the sign-in screen');
+    for (const key of ['searchRecent', 'prefs', 'sort', 'libraryTab']) {
+      assert.equal(after.keys[key], null,
+        `sonora.${key} survived the sign-out: the next account inherits it`);
+    }
+    assert.equal(after.keys.deviceId, JSON.stringify('ux-device-0001'),
+      'a device-scoped key was cleared with the account (the device list row would be lost)');
+  } finally {
+    // However this test ended, the shared browser is signed out by now, and every
+    // later test in this file needs a session.
+    await signBackIn().catch(() => {});
+  }
+});
+
+test('AC: a malformed share link is not a route, and the router survives it', async (t) => {
+  if (!needBrowser(t)) return;
+
+  // `#/c/50%` is what a half-copied link looks like, and decodeURIComponent
+  // throws a URIError on it. A cold load used to report that as a failed boot;
+  // in-app it escaped the popstate handler, so the address bar changed and the
+  // app stopped navigating at all.
+  await browser.viewport(VIEW.desktop);
+  await browser.goto(`${BASE}/?ux=${Date.now()}#/c/50%`);
+  await browser.waitFor(`!!document.querySelector('#mobile-nav button')`, 25_000);
+  await browser.waitFor(`!!document.querySelector('#page-root .page-title')`, 10_000);
+  const cold = await browser.eval(`({
+    hash: location.hash,
+    errors: (window.__ux?.errors ?? []).filter((e) => /URI|decode|boot route/i.test(e)),
+    title: document.querySelector('#page-root .page-title')?.textContent?.trim(),
+  })`);
+  assert.deepEqual(cold.errors, [], `a damaged link was reported as a boot failure: ${JSON.stringify(cold.errors)}`);
+  // The home page greets by time of day ("Good morning."), so the assertion is
+  // that a real page painted, not one particular headline.
+  assert.match(cold.title ?? '', /good morning|afternoon|evening|sound|discover/i,
+    'the app painted a page instead of nothing');
+  // Boot repairs the address bar rather than leaving a route it cannot read.
+  assert.notEqual(cold.hash, '#/c/50%', 'the unreadable hash was left in the address bar');
+
+  // And the in-app path: the same hash in the running document, then a route
+  // that must still work afterwards.
+  await browser.eval(`(() => {
+    location.hash = '#/c/50%';
+    window.dispatchEvent(new PopStateEvent('popstate', { state: null }));
+    return true;
+  })()`);
+  await new Promise((r) => setTimeout(r, 400));
+  assert.deepEqual(await browser.eval(`(window.__ux?.errors ?? []).slice()`), [],
+    'the popstate handler threw on a malformed hash');
+  await browser.eval(`(() => {
+    location.hash = '#/library';
+    window.dispatchEvent(new PopStateEvent('popstate', { state: null }));
+    return true;
+  })()`);
+  await browser.waitFor(`!!document.querySelector('#page-root [data-library-tab]')`, 10_000);
+});
+
+test('AD: an open, scrolled queue drawer keeps its place and its focus on a track change', async (t) => {
+  if (!needBrowser(t)) return;
+
+  const tracks = Array.from({ length: 30 }, (_, i) => ({
+    videoId: `uxq${String(i).padStart(8, '0')}`,
+    title: `Drawer Fill ${i + 1}`,
+    channel: 'UX Queue Channel',
+    durationS: 200 + i,
+    thumb: null,
+  }));
+  const list = await makePlaylist(`Drawer List ${Date.now().toString(36)}`, tracks);
+
+  await withPage(browser, BASE, { viewport: VIEW.mobile390, page: 'playlist', playlistId: list }, async () => {
+    // Queue the whole list, then open the drawer over it.
+    const queued = await browser.waitFor(
+      `!!document.querySelector('#page-root [data-action="play-collection"]')`, 10_000,
+    ).then(() => true, () => false);
+    assert.ok(queued, `the playlist page has no Play control: ${await browser.eval(
+      `document.getElementById('page-root')?.innerText?.replace(/\\s+/g, ' ').slice(0, 200)`,
+    )}`);
+    await browser.eval(`document.querySelector('#page-root [data-action="play-collection"]').click()`);
+    await playingUI();
+    await browser.eval(`document.querySelector('#player [data-action="queue"]').click()`);
+    await browser.waitFor(
+      `!document.getElementById('drawer-overlay').hidden
+        && document.querySelectorAll('#queue-drawer [data-queue-row]').length >= 8`, 10_000,
+    );
+
+    // Park focus on a row near the top of "Up next" (one a single advance cannot
+    // push out of the window) and scroll the drawer away from the top.
+    const marked = await browser.eval(`(() => {
+      const row = document.querySelectorAll('#queue-drawer [data-queue-row]')[3];
+      row.querySelector('[data-action="play-track"]').focus();
+      const drawer = document.getElementById('queue-drawer');
+      drawer.scrollTop = Math.round(drawer.scrollHeight * 0.4);
+      return {
+        video: row.dataset.video,
+        focused: document.activeElement?.getAttribute('data-id'),
+        scroll: drawer.scrollTop,
+        scrollable: drawer.scrollHeight - drawer.clientHeight,
+      };
+    })()`);
+    assert.equal(marked.focused, marked.video, 'the queue row could not take focus (nothing to restore)');
+    assert.ok(marked.scrollable > 0, 'the drawer does not scroll, so this test would prove nothing');
+    assert.ok(marked.scroll > 0, `the drawer could not be scrolled (${JSON.stringify(marked)})`);
+
+    // The queue advance that used to rebuild the drawer under the reader.
+    await browser.eval(`document.querySelector('#player [data-action="next"]').click()`);
+    await browser.waitFor(`document.querySelector('#queue-drawer .drawer-count')?.textContent.startsWith('30')`, 8000);
+    await browser.waitFor(`document.querySelector('#queue-drawer .queue-row.current')?.dataset.video !== ${JSON.stringify(marked.video)}`, 8000);
+    const after = await browser.eval(`(() => {
+      const drawer = document.getElementById('queue-drawer');
+      const row = drawer.querySelector('[data-queue-row][data-video="${marked.video}"]');
+      return {
+        scroll: drawer.scrollTop,
+        focused: document.activeElement?.getAttribute('data-id'),
+        focusedInDrawer: Boolean(document.activeElement?.closest?.('#queue-drawer')),
+        rowAlive: !!row,
+      };
+    })()`);
+    assert.equal(after.rowAlive, true, 'the focused row left the drawer window, so this test cannot judge it');
+    assert.ok(after.scroll > marked.scroll * 0.5,
+      `the drawer jumped back to the top on a track change (${marked.scroll} -> ${after.scroll})`);
+    assert.equal(after.focusedInDrawer, true, 'focus was thrown out of the drawer by the rebuild');
+    assert.equal(after.focused, marked.video, 'and it did not land back on the row the reader was on');
+  });
+});
+
+test('AE: an expired session inside a room leaves the room, then asks for a sign-in', async (t) => {
+  if (!needBrowser(t)) return;
+
+  try {
+    await withPage(browser, BASE, { viewport: VIEW.desktop, page: 'home' }, async () => {
+      const room = await browser.eval(`(async () => {
+        const r = await fetch('/api/rooms', { method: 'POST', credentials: 'same-origin',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ visibility: 'public', control: 'everyone', playing: true,
+            positionMs: 0, queue: [${JSON.stringify(SEED_TRACK)}] }) });
+        return { status: r.status, body: await r.json() };
+      })()`);
+      assert.equal(room.status, 200, 'the room could not be created');
+      const code = room.body.code;
+
+      await browser.goto(`${BASE}/?ux=${Date.now()}#/room/${code}`);
+      await browser.waitFor(`!!document.querySelector('[data-room="${code}"]')`, 25_000);
+      const live = await browser.eval(`({
+        pill: !document.getElementById('room-pill').hidden,
+        stream: document.getElementById('audio').getAttribute('data-ux-blocked-stream') ?? '',
+      })`);
+      assert.equal(live.pill, true, 'the room pill is not showing, so the tab is not in the room');
+      assert.match(live.stream, /\/api\/stream\//, 'the room never loaded its shared track');
+
+      // The session dies while the room is live, and the next authenticated call
+      // is what notices. (The cookie is HttpOnly, so the server-side sign-out is
+      // the only honest way to expire it from inside the page.)
+      const gone = await browser.eval(`fetch('/api/auth/logout', { method: 'POST',
+        credentials: 'same-origin' }).then((r) => r.status)`);
+      assert.equal(gone, 200, 'the session could not be expired for this test');
+      await browser.eval(`document.querySelector('#desktop-nav [data-page="library"]').click()`);
+
+      await browser.waitFor(`document.getElementById('auth-overlay').hidden === false`, 20_000);
+      const after = await browser.eval(`({
+        pill: document.getElementById('room-pill').hidden,
+        roomPage: !!document.querySelector('.room-page'),
+        roomUi: !!document.querySelector('[data-room-sync]'),
+      })`);
+      assert.equal(after.pill, true, 'the sign-in form is up but the room pill still says this tab is in a room');
+      assert.equal(after.roomPage, false, 'the room page survived the sign-out');
+      assert.equal(after.roomUi, false, 'a room surface is still painted behind the sign-in form');
+    });
+  } finally {
+    // The session this test killed is the one every other test in this file
+    // uses: put it back however this ended.
+    await signBackIn().catch(() => {});
+  }
+
+  // The shared playhead is not reachable in this harness (media playback is
+  // stubbed, and this tab has now left its room), so the two guards that keep a
+  // room from starting audio *behind* the sign-in form are pinned at the source:
+  // both run before the element is touched.
+  const source = fs.readFileSync(APP_JS, 'utf8');
+  assert.match(source, /play: \(\) => \{[\s\S]{0,400}?if \(!\$\('auth-overlay'\)\.hidden\) return;[\s\S]{0,120}?claimAudioSession\(\)/,
+    'rooms.play() may start audio while the sign-in form is up');
+  assert.match(source, /function loadRoomTrack\(snapshot\) \{[\s\S]{0,400}?if \(!\$\('auth-overlay'\)\.hidden\) return;/,
+    'loadRoomTrack() may load a shared track while the sign-in form is up');
+});

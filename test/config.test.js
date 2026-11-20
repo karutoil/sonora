@@ -68,6 +68,8 @@ const NUMERIC_DEFAULTS = {
   SONORA_UPSTREAM_TIMEOUT_MS: ['upstreamTimeoutMs', 20_000],
   SONORA_ROOM_HOURS: ['roomHours', 12],
   SONORA_ROOM_MAX_MEMBERS: ['roomMaxMembers', 50],
+  SONORA_ROOM_MAX_PER_HOST: ['roomMaxPerHost', 5],
+  SONORA_QUEUE_COVER_MS: ['queueCoverMs', 86_400_000],
 };
 const NUMERIC_NAMES = Object.keys(NUMERIC_DEFAULTS);
 const MAX_TIMER_MS = 2_147_483_647;
@@ -97,7 +99,7 @@ test('ports, timer delays, scaled cache sizes and Date-based lifetimes reject ov
   for (const value of ['0', '65536']) assertInvalid('PORT', value);
   for (const name of [
     'SONORA_DOWNLOAD_TIMEOUT_MS', 'SONORA_DOWNLOAD_QUEUE_TIMEOUT_MS',
-    'SONORA_REFRESH_GRACE_MS', 'SONORA_URL_TTL_MS',
+    'SONORA_REFRESH_GRACE_MS', 'SONORA_URL_TTL_MS', 'SONORA_QUEUE_COVER_MS',
     'SONORA_RESOLVE_TIMEOUT_MS', 'SONORA_UPSTREAM_TIMEOUT_MS',
   ]) assertInvalid(name, String(MAX_TIMER_MS + 1));
 
@@ -122,7 +124,7 @@ test('intentional zeros survive; legacy nonfunctional zeroes clamp to one unit',
     SONORA_DOWNLOAD_TIMEOUT_MS: '0', SONORA_MAX_DOWNLOADS: '0',
     SONORA_DOWNLOAD_QUEUE_TIMEOUT_MS: '0', SONORA_LOGIN_RATE_MAX: '0',
     SONORA_RESOLVE_TIMEOUT_MS: '0', SONORA_UPSTREAM_TIMEOUT_MS: '0',
-    SONORA_ROOM_MAX_MEMBERS: '0',
+    SONORA_ROOM_MAX_MEMBERS: '0', SONORA_QUEUE_COVER_MS: '0',
   });
   assert.equal(zero.cacheBytes, 0);
   assert.equal(zero.refreshGraceMs, 0);
@@ -130,7 +132,12 @@ test('intentional zeros survive; legacy nonfunctional zeroes clamp to one unit',
   for (const key of [
     'sessionMinutes', 'refreshDays', 'sessionDays', 'downloadTimeoutMs', 'maxDownloads',
     'queueTimeoutMs', 'loginRateMax', 'resolveTimeoutMs', 'upstreamTimeoutMs', 'roomMaxMembers',
+    'queueCoverMs',
   ]) assert.equal(zero[key], 1, `${key} legacy zero clamp`);
+  // A per-host room cap of zero would mean "nobody may host", which is not a
+  // meaningful deployment: it is a bad setting, not a clampable zero.
+  assertInvalid('SONORA_ROOM_MAX_PER_HOST', '0');
+  assert.equal(loadConfig({ SONORA_ROOM_MAX_PER_HOST: '12' }).roomMaxPerHost, 12);
 
   const valid = loadConfig({
     PORT: ' 8131 ', SONORA_CACHE_MB: '1', SONORA_SESSION_DAYS: '14',
@@ -251,6 +258,41 @@ test('the login rate window is a validated duration compatible with the installe
   for (const value of ['soon', '1 fortnight', '0', '0ms', '-1 minute', '1e3ms', `${MAX_TIMER_MS + 1}ms`]) {
     assertInvalid('SONORA_LOGIN_RATE_WINDOW', value);
   }
+});
+
+test('a blank bootstrap user keeps the default name, and log level and artwork host are validated', () => {
+  const defaults = loadConfig();
+  // An empty account name cannot be typed into the sign-in form, so a blank
+  // setting keeps the documented default instead of creating an unreachable
+  // admin (or refusing to boot over an accidental trailing space).
+  assert.equal(defaults.bootstrapUser, 'admin');
+  for (const blank of ['', '   ', '\t\r\n']) {
+    assert.equal(loadConfig({ SONORA_USER: blank }).bootstrapUser, 'admin', JSON.stringify(blank));
+  }
+  assert.equal(loadConfig({ SONORA_USER: ' alice ' }).bootstrapUser, 'alice');
+  assert.equal(loadConfig({ SONORA_USER: 'alice', SONORA_PASSPHRASE: 'hunter2hunter2' }).bootstrapUser,
+    'alice', 'a real name and passphrase boot normally');
+
+  assert.equal(defaults.logLevel, 'info');
+  for (const [value, expected] of [
+    ['FATAL', 'fatal'], [' error ', 'error'], ['Warn', 'warn'], ['debug', 'debug'],
+    ['TRACE', 'trace'], ['silent', 'silent'],
+  ]) assert.equal(loadConfig({ SONORA_LOG_LEVEL: value }).logLevel, expected, value);
+  assert.equal(loadConfig({ SONORA_LOG_LEVEL: '  ' }).logLevel, 'info', 'a blank level keeps info');
+  for (const value of ['verbose', 'warning', '0', 'info,debug']) assertInvalid('SONORA_LOG_LEVEL', value);
+
+  assert.equal(defaults.ytimgHost, 'https://i.ytimg.com');
+  assert.equal(loadConfig({ SONORA_YTIMG_HOST: '' }).ytimgHost, 'https://i.ytimg.com');
+  assert.equal(loadConfig({ SONORA_YTIMG_HOST: ' i.ytimg.com ' }).ytimgHost, 'https://i.ytimg.com',
+    'the documented bare host is completed with https');
+  assert.equal(loadConfig({ SONORA_YTIMG_HOST: 'http://127.0.0.1:8139' }).ytimgHost,
+    'http://127.0.0.1:8139');
+  assert.equal(loadConfig({ SONORA_YTIMG_HOST: 'https://Img.Example.com:8443///' }).ytimgHost,
+    'https://img.example.com:8443');
+  for (const value of [
+    'ftp://i.ytimg.com', 'https://user:pw@i.ytimg.com', 'https://i.ytimg.com/covers',
+    'https://i.ytimg.com?x=1', 'https://i.ytimg.com/#x', 'i.yt img.com', 'https://i.ytimg.com:99999',
+  ]) assertInvalid('SONORA_YTIMG_HOST', value);
 });
 
 test('proxy trust accepts only direct, loopback alias or explicit validated allowlists', () => {

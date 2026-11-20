@@ -17,6 +17,22 @@ let identityGeneration = 0;
 // real session".
 let sessionOverride = null;
 
+// Every cache and in-flight map resetYT() clears is declared here, above the
+// functions that touch it: they used to be declared far below, so resetYT() —
+// which the module-level seams `setSessionOverride()` and getYT()'s failure path
+// can reach — threw a TDZ ReferenceError instead of resetting.
+/** id -> { at, ttl, stats }. Insertion order is eviction order (FIFO). */
+const playlistStatsCache = new Map();
+const playlistStatsInFlight = new Map();
+/** videoId -> { value, expiresAt }, a hit or a miss but never a failure. */
+const albumOfCache = new Map();
+const albumInFlight = new Map();
+/** The moods/genres shelf, resolved once per identity. */
+let genreTilesPromise = null;
+/** videoId -> { at, live }. */
+const liveCache = new Map();
+const liveInFlight = new Map();
+
 /**
  * Replace the session every public function talks to. `null` restores the real,
  * lazily-created one. A function is treated as a session factory, which is how
@@ -116,6 +132,7 @@ export function resetYT() {
   upstreamFailures = 0;
   blockedUntil = 0;
   blockStreak = 0;
+  blockedIsBotGate = false;
   genreTilesPromise = null;
   liveCache.clear();
   liveInFlight.clear();
@@ -245,15 +262,39 @@ const BACKOFF_BASE_MS = 2_000;
 const BACKOFF_MAX_MS = 60_000;
 let blockedUntil = 0;
 let blockStreak = 0;
+/**
+ * Was the block that is armed a bot gate rather than a rate limit?
+ *
+ * They are different facts about the IP: a 429 is "too fast", a bot gate is
+ * "sign in first", and a caller that is told the wrong one retries for the wrong
+ * reason. The flag is reported by blockedError() and cleared with the backoff.
+ */
+let blockedIsBotGate = false;
 
 /** Milliseconds until upstream calls may be attempted again. */
 const blockedForMs = () => Math.max(0, blockedUntil - Date.now());
 
+/**
+ * Is this answer YouTube's bot gate (LOGIN_REQUIRED / "sign in to confirm you
+ * are not a bot") rather than a rate limit?
+ *
+ * Deliberately message-based as well as code-based: youtubei.js surfaces the
+ * gate as a plain InnertubeError whose only distinguishing feature is its text.
+ */
+function isBotGate(err) {
+  if (!err) return false;
+  if (err.code === 'YT_BOT_GATED') return true;
+  return /LOGIN_REQUIRED|sign in to confirm|not a bot/i.test(String(err?.message ?? ''));
+}
+
 function blockedError(ms) {
-  const err = new Error(`YouTube is rate-limiting this IP; retry in ${Math.ceil(ms / 1000)}s.`);
-  err.code = 'YT_BLOCKED';
+  const seconds = Math.ceil(ms / 1000);
+  const err = blockedIsBotGate
+    ? new Error(`YouTube is asking for a sign-in: sign in to confirm you are not a bot; retry in ${seconds}s.`)
+    : new Error(`YouTube is rate-limiting this IP; retry in ${seconds}s.`);
+  err.code = blockedIsBotGate ? 'YT_BOT_GATED' : 'YT_BLOCKED';
   err.retryAfterMs = ms;
-  err.retryAfter = Math.ceil(ms / 1000);
+  err.retryAfter = seconds;
   return err;
 }
 
@@ -269,7 +310,9 @@ function blockedError(ms) {
  * with the work that was actually wanted.
  */
 function isSessionFailure(err) {
-  if (err?.code === 'YT_BLOCKED') return false;
+  // An armed block is a fact about the IP, not the session; armPolicyBlock
+  // counts bot gates itself.
+  if (err?.code === 'YT_BLOCKED' || err?.code === 'YT_BOT_GATED') return false;
   const netCode = String(err?.code ?? '');
   if (['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT'].includes(netCode)) return true;
   // AbortSignal.timeout (boundedFetch) and our own race both surface as these.
@@ -287,7 +330,9 @@ function isSessionFailure(err) {
 
 /** A 429 or a policy answer, as opposed to a broken session. */
 function isPolicyBlock(err) {
-  if (err?.code === 'YT_BLOCKED') return false;
+  // Both armed errors mean the block is already counted; re-arming would turn
+  // one upstream answer into two strikes.
+  if (err?.code === 'YT_BLOCKED' || err?.code === 'YT_BOT_GATED') return false;
   const status = Number(err?.response?.status ?? err?.status ?? err?.statusCode);
   if (status === 429) return true;
   const msg = String(err?.message ?? '');
@@ -296,7 +341,8 @@ function isPolicyBlock(err) {
 
 // The existing-process backoff error must short-circuit fallbacks too, but is
 // deliberately not passed back to armPolicyBlock and counted as a second 429.
-const isPolicyFailure = (err) => err?.code === 'YT_BLOCKED' || isPolicyBlock(err);
+const isPolicyFailure = (err) => err?.code === 'YT_BLOCKED'
+  || err?.code === 'YT_BOT_GATED' || isPolicyBlock(err);
 
 function responseHeader(err, name) {
   for (const headers of [err?.response?.headers, err?.headers]) {
@@ -329,6 +375,7 @@ function retryAfterFrom(err) {
 }
 
 function armPolicyBlock(err, generation) {
+  const botGate = isBotGate(err);
   const requested = retryAfterFrom(err);
   let wait = requested ?? BACKOFF_BASE_MS;
   if (generation === identityGeneration) {
@@ -336,14 +383,32 @@ function armPolicyBlock(err, generation) {
     const backoff = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** (blockStreak - 1));
     wait = Math.max(backoff, requested ?? 0);
     blockedUntil = Date.now() + wait;
-    // Deliberately not a rebuild: a fresh session from the same IP is blocked
-    // too, so rebuilding only adds a retry to the storm.
-    upstreamFailures = 0;
+    blockedIsBotGate = botGate;
+    if (botGate) {
+      // A gate is also evidence about the *session*: rotated visitor data, an
+      // invalidated jar or a client build YouTube stopped accepting all answer
+      // with it. The backoff is kept (asking again immediately is the storm),
+      // but the failure counter keeps counting, so SESSION_FAILURE_LIMIT still
+      // rebuilds the session instead of re-using a session that is the reason
+      // for the gate. resetYT clears the backoff, so the rebuilt identity gets
+      // its one honest attempt.
+      upstreamFailures += 1;
+      if (upstreamFailures >= SESSION_FAILURE_LIMIT) {
+        upstreamFailures = 0;
+        resetYT();
+      }
+    } else {
+      // Deliberately not a rebuild: a fresh session from the same IP is blocked
+      // too, so rebuilding only adds a retry to the storm.
+      upstreamFailures = 0;
+    }
   }
   if (err && (typeof err === 'object' || typeof err === 'function')) {
     err.retryAfterMs = wait;
     err.retryAfter = Math.ceil(wait / 1000);
-    err.code ??= 'YT_RATE_LIMIT';
+    // Report the accurate condition: a bot gate is not a rate limit, and the
+    // routes classify (and label) the two differently.
+    err.code ??= botGate ? 'YT_BOT_GATED' : 'YT_RATE_LIMIT';
   }
   return err;
 }
@@ -354,17 +419,45 @@ function armPolicyBlock(err, generation) {
 // extreme overload into an error rather than an ever-growing array of closures.
 const UPSTREAM_CONCURRENCY = 4;
 const UPSTREAM_QUEUE_MAX = 256;
+/**
+ * How long one slot may stay occupied, whatever the task does.
+ *
+ * `withTimeout` already races every operation against its own deadline, but a
+ * non-cooperative promise (a mock, an MP4 parse after the fetch, a future
+ * transport that ignores its signal) can outlive that race, and a task that
+ * never settles holds one of the four slots forever — which ends with every
+ * screen stuck behind an operation that will never finish.
+ */
+const UPSTREAM_SLOT_MAX_MS = (() => {
+  // Overridable so a test can prove the slot is released without waiting 45 s.
+  const raw = Number(process.env.SONORA_YT_SLOT_MAX_MS);
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  return config.resolveTimeoutMs + 20_000;
+})();
 let upstreamActive = 0;
 const upstreamQueue = [];
 
 function pumpUpstream() {
   while (upstreamActive < UPSTREAM_CONCURRENCY && upstreamQueue.length) {
     const task = upstreamQueue.shift();
+    // Queued work removes itself on abort (see scheduleUpstream); this covers
+    // an abort that raced the shift.
+    task.signal.removeEventListener('abort', task.onQueuedAbort);
     if (task.signal.aborted) {
       task.reject(task.signal.reason);
       continue;
     }
     upstreamActive += 1;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      upstreamActive = Math.max(0, upstreamActive - 1);
+      pumpUpstream();
+    };
+    // The watchdog frees the slot for the queue even if the task never settles.
+    const watchdog = setTimeout(release, UPSTREAM_SLOT_MAX_MS);
+    watchdog.unref?.();
     let rejectAbort;
     const aborted = new Promise((_, reject) => { rejectAbort = reject; });
     const onAbort = () => rejectAbort(task.signal.reason);
@@ -376,9 +469,9 @@ function pumpUpstream() {
     // MP4 parse after fetch; real transports are aborted through boundedFetch.
     running.catch(() => {});
     Promise.race([running, aborted]).then(task.resolve, task.reject).finally(() => {
+      clearTimeout(watchdog);
       task.signal.removeEventListener('abort', onAbort);
-      upstreamActive -= 1;
-      pumpUpstream();
+      release();
     });
   }
 }
@@ -391,7 +484,17 @@ function scheduleUpstream(work, signal) {
       err.code = 'YT_OVERLOADED';
       return reject(err);
     }
-    upstreamQueue.push({ work, signal, resolve, reject });
+    const task = { work, signal, resolve, reject, onQueuedAbort: null };
+    // A caller that goes away must stop occupying a queue slot. Left in place,
+    // aborted entries accumulated until MAX_QUEUE refused every new operation
+    // (a page that navigates away mid-search aborts its whole fan-out at once).
+    task.onQueuedAbort = () => {
+      const i = upstreamQueue.indexOf(task);
+      if (i !== -1) upstreamQueue.splice(i, 1);
+      reject(signal.reason);
+    };
+    signal.addEventListener('abort', task.onQueuedAbort, { once: true });
+    upstreamQueue.push(task);
     pumpUpstream();
   });
 }
@@ -665,9 +768,6 @@ async function playlistHits(query) {
 const PLAYLIST_STATS_TTL_MS = 6 * 60 * 60_000;
 const PLAYLIST_STATS_FAIL_TTL_MS = 10 * 60_000;
 const PLAYLIST_STATS_MAX = 500;
-/** id -> { at, ttl, stats }. Insertion order is eviction order (FIFO). */
-const playlistStatsCache = new Map();
-const playlistStatsInFlight = new Map();
 
 function cachedPlaylistStats(id) {
   const hit = playlistStatsCache.get(id);
@@ -992,8 +1092,6 @@ export async function albumPage(albumId) {
 // videoId -> { value, expiresAt }. Neither a hit nor a miss is permanent: a
 // title can be re-released on an album, and a lookup that ran on stale metadata
 // must not disable "Open album" for the life of the process.
-const albumOfCache = new Map();
-const albumInFlight = new Map();
 const ALBUM_TTL = 6 * 60 * 60_000;
 const ALBUM_MISS_TTL = 10 * 60_000;
 const ALBUM_CACHE_MAX = 500;
@@ -1104,7 +1202,6 @@ async function findAlbumForVideo(videoId, meta, generation) {
  * from YouTube rather than guessed: the same tiles the app's mood page shows.
  * Cached for the session — the list changes about as often as the site does.
  */
-let genreTilesPromise = null;
 export function genreTiles() {
   if (genreTilesPromise) return genreTilesPromise;
   const generation = identityGeneration;
@@ -1245,8 +1342,6 @@ export async function exploreTrending(limit = 12) {
  */
 const LIVE_CACHE_TTL_MS = 5 * 60_000;
 const LIVE_CACHE_MAX = 500;
-const liveCache = new Map(); // videoId -> { at, live }
-const liveInFlight = new Map();
 
 export function isLive(videoId) {
   const hit = liveCache.get(videoId);

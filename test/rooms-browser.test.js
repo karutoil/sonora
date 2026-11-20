@@ -51,6 +51,13 @@ const startServer = async () => {
       SONORA_AUDIO_DIR: path.join(DIR, 'audio'),
       SONORA_SECRET: 'rooms-browser-secret', SONORA_PASSPHRASE: 'hunter2hunter2',
       SONORA_LOG_LEVEL: 'warn', SONORA_POT_PROVIDER: '', SONORA_JS_RUNTIME: '',
+      // A room per scenario, and most of them are never ended (the suite is about
+      // what a browser sees, not about cleanup), so this file ran right at the
+      // production per-host ceiling of five and the sixth create answered
+      // TOO_MANY_ROOMS — a 429 that surfaced later as a mysterious missing
+      // button. The ceiling is a server rule with its own tests; this suite
+      // should not be measuring it.
+      SONORA_ROOM_MAX_PER_HOST: '40',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -637,6 +644,10 @@ test('a guest on the polling fallback reaches a terminal state when the room clo
       const room = await createRoom(host, {
         visibility: 'public', control: 'everyone', playing: true, positionMs: 3000, queue: [QUEUE[0]],
       });
+      // Assert it: an unchecked create that answers 429 used to reach the page as
+      // `/l/undefined/live`, and the failure then surfaced 30 s later as a missing
+      // button — a mysterious timeout for a rate limit.
+      assert.equal(room.status, 200, `the room could not be created (${JSON.stringify(room.body)})`);
       const code = room.body.code;
       await guest.goto(`${BASE}/l/${code}/live`);
       await guest.waitFor(`!!document.getElementById('listen-start')`, 30_000);
@@ -681,6 +692,7 @@ test('a guest on the polling fallback reaches a terminal state when the room clo
       const room2 = await createRoom(host, {
         visibility: 'public', control: 'everyone', playing: true, positionMs: 3000, queue: [QUEUE[0]],
       });
+      assert.equal(room2.status, 200, `the second room could not be created (${JSON.stringify(room2.body)})`);
       await guest.goto(`${BASE}/l/${room2.body.code}/live`);
       await guest.waitFor(`window.__stateFetches >= 2`, 20_000);
       await guest.send('Network.enable');
@@ -1020,4 +1032,121 @@ test('the sync engine survives refused commands, dead streams and stale events',
     assert.equal(out.capacityClosed, true, 'the unanswered stream is closed instead of retried');
     assert.ok(out.capacityPolls >= 1, `and the room is followed by polling (${out.capacityPolls} state reads)`);
     assert.match(out.capacityError ?? '', /too many listeners/i, `the badge carries the reason (${out.capacityError})`);
+  });
+
+// Handing the seat over.
+//
+// `control: 'host'` makes a room unskippable, unpausable and unendable for
+// everyone but the host, so a host who walks off leaves a group with no way
+// out. "Make host" is that way out, and it is a host-only control: it is only
+// built for somebody else, only by the host, and the hand-over must flip the
+// controls on the *other* person's page — which is the whole point.
+test('the host hands the room over, and the new host gets the controls',
+  { skip: !CHROME && 'chromium not installed' }, async (t) => {
+    const login = await signIn(host, 'admin', 'hunter2hunter2', 'host-browser');
+    assert.equal(login.status, 200);
+
+    // ben exists from the private-room test; the create is idempotent enough
+    // that a duplicate is just a status nobody reads.
+    await apiIn(host, `
+      await fetch('/api/admin/users', { method: 'POST', credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'ben', passphrase: 'ben-pass-123', role: 'user' }) });
+      return true;
+    `);
+    const benLogin = await signIn(other, 'ben', 'ben-pass-123', 'ben-browser');
+    assert.equal(benLogin.status, 200, 'the second account signs in');
+
+    const created = await createRoom(host, {
+      visibility: 'public', control: 'host', playing: false, positionMs: 0, queue: [QUEUE[0]],
+    });
+    assert.equal(created.status, 200);
+    const code = created.body.code;
+
+    // ben joins the room as a member (not a guest).
+    await other.goto(`${BASE}/#/room/${code}`);
+    await other.waitFor(`!!document.querySelector('[data-action="room-join"]')`, 20_000);
+    await other.eval(`document.querySelector('[data-action="room-join"]').click()`);
+    await other.waitFor(`!!document.querySelector('[data-room="${code}"]')`, 25_000);
+    const before = await other.eval(`({
+      host: document.querySelectorAll('[data-room="${code}"] [data-action="room-end"]').length,
+      locked: !!document.querySelector('[data-room="${code}"] .room-locked'),
+    })`);
+    assert.equal(before.host, 0, 'a member is offered the host-only "End room" control');
+    assert.equal(before.locked, true, 'a host-controlled room does not lock a member out of the transport');
+
+    // The host's own page, and then the room sheet — the only surface that
+    // renders the hand-over control.
+    await host.goto(`${BASE}/#/room/${code}`);
+    await host.waitFor(`!!document.querySelector('[data-room="${code}"] [data-action="room-end"]')`, 25_000);
+    await host.eval(`document.querySelector('#player [data-action="room"]').click()`);
+    await host.waitFor(`!!document.querySelector('#form-content [data-action="room-make-host"]')`, 15_000);
+    const promote = await host.eval(`(() => {
+      const btn = document.querySelector('#form-content [data-action="room-make-host"]');
+      const chip = btn.previousElementSibling;
+      return {
+        label: btn.textContent.trim(),
+        user: btn.dataset.user,
+        chip: chip?.textContent?.trim() ?? '',
+        count: document.querySelectorAll('#form-content [data-action="room-make-host"]').length,
+      };
+    })()`);
+    assert.equal(promote.label, 'Make host', 'the hand-over control is not labelled for what it does');
+    assert.match(promote.chip, /ben/i, `"Make host" is not attached to the other person (${JSON.stringify(promote)})`);
+    assert.equal(promote.count, 1, 'the host is offered a hand-over to themselves');
+
+    await host.eval(`document.querySelector('#form-content [data-action="room-make-host"]').click()`);
+
+    // The server first: the hand-over is one PATCH, and it must land even if the
+    // old host's sheet then paints something unhelpful.
+    const server = await apiIn(other, `
+      const r = await fetch('/api/rooms/${code}/state', { credentials: 'same-origin' });
+      const body = await r.json();
+      return { status: r.status, host: body.host?.name ?? null, control: body.control ?? null };
+    `);
+    const clicked = await host.eval(`({
+      label: document.querySelector('#form-content [data-action="room-make-host"]')?.textContent?.trim() ?? null,
+      toast: document.getElementById('toast-text')?.textContent ?? '',
+      kind: document.getElementById('toast')?.dataset.kind ?? '',
+      pill: !document.getElementById('room-pill').hidden,
+      errors: window.__errors ?? [],
+    })`);
+    assert.equal(server.status, 200);
+    assert.equal(server.host, 'ben',
+      `the server did not hand the room over (${JSON.stringify(server)}; on the host's page: ${JSON.stringify(clicked)})`);
+
+    // The other side of the promise: ben's page gains the host-only controls,
+    // and the old host loses them, without either page being reloaded.
+    const gained = await other.waitFor(
+      `!!document.querySelector('[data-room="${code}"] [data-action="room-end"]')`, 25_000,
+    ).then(() => true, () => false);
+    const hostLost = await host.waitFor(
+      `!document.querySelector('[data-room="${code}"] [data-action="room-end"]')`, 25_000,
+    ).then(() => true, () => false);
+    const view = await other.eval(`({
+      page: !!document.querySelector('[data-room="${code}"]'),
+      title: document.querySelector('[data-room="${code}"] .room-title')?.textContent ?? null,
+      roster: [...document.querySelectorAll('[data-room="${code}"] .room-person-name')].map((n) => n.textContent.trim()),
+      tags: [...document.querySelectorAll('[data-room="${code}"] .room-host-tag')].length,
+      ended: !!document.querySelector('.room-ended, [data-room-ended]'),
+      bodyText: document.getElementById('page-root')?.innerText?.replace(/\\s+/g, ' ').slice(0, 160),
+    })`);
+    assert.ok(gained, `the new host's page never gained the host controls (${JSON.stringify(view)})`);
+    assert.ok(hostLost, 'the old host is still offered the host-only "End room" control');
+
+    const after = await other.eval(`({
+      hostName: document.querySelector('[data-room="${code}"] .room-title')?.textContent ?? '',
+      locked: !!document.querySelector('[data-room="${code}"] .room-locked'),
+      panel: !!document.querySelector('[data-room="${code}"] .room-host'),
+    })`);
+    assert.match(after.hostName, /ben/i, 'the room page still names the old host');
+    assert.equal(after.locked, false, 'the new host is still locked out of the transport');
+    assert.equal(after.panel, true, 'the new host has no room-settings panel');
+
+    // ben can now do the thing only a host can do: end it.
+    const ended = await apiIn(other, `
+      const r = await fetch('/api/rooms/${code}', { method: 'DELETE', credentials: 'same-origin' });
+      return r.status;
+    `);
+    assert.equal(ended, 200, 'the new host cannot end the room');
   });

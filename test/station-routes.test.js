@@ -391,3 +391,94 @@ test('genre votes include their neighbours and reuse the cached winning shelf ro
   assert.equal(logEntries().filter((e) => e.op === 'genreSongs').length, initialBrowseCalls,
     'changing the vote still must not refetch the winning song shelf');
 });
+
+// ── the routes around the station ─────────────────────────────────────
+// Radio, Browse and "open this song's album" are the three nearest neighbours
+// of the station, and each one has a distinct failure story: radio may be
+// filtered by taste, browse falls back between history and catalogue, and the
+// album lookup is allowed to answer "no album" but never to invent one.
+
+test('radio answers from the recommender and honours the caller’s dislikes', async () => {
+  const user = await newUser('radio');
+  const seed = track('radioseed01', 'Radio Seed', 'Radio Artist');
+  setControl({
+    defaultUpNext: [
+      track('radioone001', 'Radio One', 'Radio Artist'),
+      track('radiotwo002', 'Radio Two', 'Radio Artist'),
+    ],
+  });
+
+  const anonymous = await request(`/api/radio?seed=${seed.videoId}`);
+  assert.equal(anonymous.status, 401);
+  assert.equal((await request('/api/radio?seed=nope', { cookie: user.cookie })).status, 400);
+
+  const radio = await request(`/api/radio?seed=${seed.videoId}`, { cookie: user.cookie });
+  assert.equal(radio.status, 200, JSON.stringify(radio.body));
+  assert.deepEqual(radio.body.tracks.map((t) => t.videoId), ['radioone001', 'radiotwo002']);
+  assert.ok(!radio.body.tracks.some((t) => t.videoId === seed.videoId), 'the seed is not its own recommendation');
+
+  // A dislike is a standing instruction, including here.
+  await dislikeSong(user.cookie, track('radioone001', 'Radio One', 'Radio Artist'));
+  const filtered = await request(`/api/radio?seed=${seed.videoId}`, { cookie: user.cookie });
+  assert.equal(filtered.status, 200);
+  assert.deepEqual(filtered.body.tracks.map((t) => t.videoId), ['radiotwo002']);
+
+  // An upstream failure is an upstream failure: not a 500, and not a 404.
+  setControl({ failUpNext: true });
+  const failed = await request(`/api/radio?seed=${seed.videoId}`, { cookie: user.cookie });
+  assert.equal(failed.status, 502, JSON.stringify(failed.body));
+  assert.equal(failed.body.code, 'UPSTREAM_FAILED');
+  setControl();
+});
+
+test('browse reads history first, the catalogue second, and refuses unknown kinds', async () => {
+  const user = await newUser('browse');
+  const artist = channel('q');
+  setControl({ artistIds: { 'Fixture Query': artist }, searchSongs: {} });
+
+  assert.equal((await request('/api/browse/genres', { cookie: user.cookie })).status, 400);
+  assert.equal((await request('/api/browse/playlists', { cookie: user.cookie })).status, 400,
+    'a mood needs the words for it');
+
+  // No history yet: the artist shelf comes from the catalogue and says so.
+  const searched = await request('/api/browse/artists?q=Fixture%20Query', { cookie: user.cookie });
+  assert.equal(searched.status, 200, JSON.stringify(searched.body));
+  assert.equal(searched.body.items.length, 1);
+  assert.equal(searched.body.items[0].id, artist);
+  assert.equal(searched.body.items[0].source, 'search');
+
+  // Once something has been played, the tab is built from this listener's own
+  // history rather than from a random "music" search.
+  await event(user.cookie, track('browsePlay1', 'Browser Play', 'Fixture Query'), 'start');
+  const fromHistory = await request('/api/browse/artists', { cookie: user.cookie });
+  assert.equal(fromHistory.status, 200);
+  assert.ok(fromHistory.body.items.some((a) => a.source === 'history' && a.title === 'Fixture Query'),
+    JSON.stringify(fromHistory.body));
+
+  // An empty album shelf is an empty list, not an error.
+  const albums = await request('/api/browse/albums', { cookie: user.cookie });
+  assert.equal(albums.status, 200);
+  assert.deepEqual(albums.body.items, []);
+  setControl();
+});
+
+test('an album lookup answers "no album" instead of inventing one', async () => {
+  const user = await newUser('albumfor');
+  setControl({ searchSongs: {} });
+  assert.equal((await request('/api/album/for/nope', { cookie: user.cookie })).status, 400);
+
+  // A track the library knows: the lookup may still find nothing, and the
+  // answer is then three explicit nulls rather than an error or a guess.
+  await event(user.cookie, track('albumKnown1', 'Known Song', 'Known Artist'), 'start');
+  const known = await request('/api/album/for/albumKnown1', { cookie: user.cookie });
+  assert.equal(known.status, 200, JSON.stringify(known.body));
+  assert.deepEqual(known.body, { albumId: null, title: null, author: null });
+
+  // A track the library has never seen is resolved from the row's own metadata
+  // and answers the same way.
+  const unknown = await request('/api/album/for/albumFresh1', { cookie: user.cookie });
+  assert.equal(unknown.status, 200);
+  assert.deepEqual(unknown.body, { albumId: null, title: null, author: null });
+  assert.equal((await request('/api/album/for/albumKnown1')).status, 401);
+  setControl();
+});

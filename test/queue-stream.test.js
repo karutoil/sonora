@@ -1,12 +1,16 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { startServer, loginCookie } from './helpers/ux.js';
 import { planIds, planTrackIds, planStarts, planTotalMs, locate, planOffsetFor, streamSrc, freezesWhenHidden } from '../public/queue-stream.js';
-import { concatSlice } from '../src/queue-stream.js';
+import {
+  concatSlice, openQueueStream, ensureSegment, maybeReposition, closeQueueStreams,
+} from '../src/queue-stream.js';
 import { audioPath } from '../src/audio.js';
+import { config } from '../src/config.js';
 
 // The queue as one continuous stream.
 //
@@ -475,4 +479,198 @@ test('the server survives a listener that hangs up mid-stream', async (t) => {
   const again = await fetch(`${server.base}/api/queue-stream/${token}/live.m3u8?at=0`, { headers: { cookie } });
   assert.equal(again.status, 200);
   await again.text();
+});
+
+// ── the audit fixes: bounded children, bounded disk, bounded plans ───────
+
+// A fake pair of binaries, so the cut/eviction tests do not depend on ffmpeg:
+// the cut writes a token file to whatever path it was given, and the probe
+// reports five seconds for it.
+const fixtures = fs.mkdtempSync(path.join(os.tmpdir(), 'sonora-queue-fixtures-'));
+const fakeFfmpeg = path.join(fixtures, 'fake-ffmpeg.sh');
+const fakeFfprobe = path.join(fixtures, 'fake-ffprobe.sh');
+const hangFfmpeg = path.join(fixtures, 'hang-ffmpeg.sh');
+fs.writeFileSync(fakeFfmpeg, '#!/bin/sh\nfor last; do :; done\nprintf "fake-ts" > "$last"\n', { mode: 0o755 });
+fs.writeFileSync(fakeFfprobe, '#!/bin/sh\necho 5.0\n', { mode: 0o755 });
+fs.writeFileSync(hangFfmpeg, '#!/bin/sh\necho $$ >> "$SONORA_TEST_PIDFILE"\nsleep 60\n', { mode: 0o755 });
+after(() => { try { fs.rmSync(fixtures, { recursive: true, force: true }); } catch {} });
+
+const withBins = async (bins, fn) => {
+  const previous = { FFMPEG_BIN: process.env.FFMPEG_BIN, FFPROBE_BIN: process.env.FFPROBE_BIN };
+  Object.assign(process.env, bins);
+  try {
+    return await fn();
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+};
+
+const oneTrack = [{ videoId: 'aaaaaaaaaaa', durationMs: 30_000 }];
+
+test('the cover window comes from config.queueCoverMs, with the env default retained', async () => {
+  // A deployment profile can set the cover window without the process
+  // environment; the module's own default must survive when it is undefined.
+  const previousConfig = config.queueCoverMs;
+  const previousEnv = process.env.SONORA_QUEUE_COVER_MS;
+  try {
+    config.queueCoverMs = 120_000;
+    const covered = await openQueueStream(oneTrack, 0, 901);
+    try {
+      assert.equal(covered.session.coverEnd, 120_000, 'the configured window wins');
+    } finally { await covered.cleanup(); }
+
+    delete config.queueCoverMs;
+    process.env.SONORA_QUEUE_COVER_MS = '60000';
+    const fromEnv = await openQueueStream(oneTrack, 0, 901);
+    try {
+      assert.equal(fromEnv.session.coverEnd, 60_000, 'the environment fallback still works');
+    } finally { await fromEnv.cleanup(); }
+
+    delete process.env.SONORA_QUEUE_COVER_MS;
+    const fallback = await openQueueStream(oneTrack, 0, 901);
+    try {
+      assert.equal(fallback.session.coverEnd, 24 * 60 * 60_000, 'the built-in day-long default remains');
+    } finally { await fallback.cleanup(); }
+  } finally {
+    if (previousConfig === undefined) delete config.queueCoverMs;
+    else config.queueCoverMs = previousConfig;
+    if (previousEnv === undefined) delete process.env.SONORA_QUEUE_COVER_MS;
+    else process.env.SONORA_QUEUE_COVER_MS = previousEnv;
+  }
+});
+
+test('a session keeps its segment files bounded however far the client scrubs', async () => {
+  await withBins({ FFMPEG_BIN: fakeFfmpeg, FFPROBE_BIN: fakeFfprobe }, async () => {
+    const { session, cleanup } = await openQueueStream(oneTrack, 0, 902);
+    try {
+      // Pretend the listener scrubbed all over a day-long plan: the segment map
+      // used to grow with how far it went, not with how long it listened.
+      for (let seq = 1000; seq < 1246; seq += 1) {
+        session.segMeta.set(seq, { startMs: seq * 6000, endMs: seq * 6000 + 6000 });
+      }
+      session.nowMs = 166 * 6000;
+      const meta = await ensureSegment(session, 100);
+      assert.ok(meta, 'the segment the listener actually wants is still produced');
+      assert.ok(session.segMeta.size <= 240, `the session kept ${session.segMeta.size} segments`);
+      assert.equal(session.segMeta.has(1245), false, 'the segment farthest from the playhead went first');
+      assert.equal(session.segMeta.has(100), true, 'the segment just produced is kept');
+    } finally { await cleanup(); }
+  });
+});
+
+test('a cut that finishes during a seek cannot revive a stale segment', async () => {
+  await withBins({ FFMPEG_BIN: fakeFfmpeg, FFPROBE_BIN: fakeFfprobe }, async () => {
+    const { session, cleanup } = await openQueueStream(oneTrack, 0, 903);
+    const fsp = (await import('node:fs/promises')).default;
+    const original = fsp.rename;
+    let repositioned = 0;
+    try {
+      // The seek lands exactly in the window the old code could not see: after
+      // the pre-rename generation check, before the file has its serving name.
+      fsp.rename = async (from, to) => {
+        if (!repositioned) {
+          repositioned += 1;
+          maybeReposition(session, 20_000, 'seek-after-cut');
+        }
+        return original(from, to);
+      };
+      const meta = await ensureSegment(session, 20);
+      assert.equal(repositioned, 1, 'the seek really did interrupt the cut');
+      assert.equal(meta, null, 'a cut from the old anchor is not served');
+      assert.equal(session.segMeta.has(20), false, 'and it is not remembered as available');
+      assert.equal(fs.existsSync(path.join(session.dir, 'seg000020.ts')), false,
+        'the stale segment file was unlinked after the rename');
+    } finally {
+      fsp.rename = original;
+      await cleanup();
+    }
+  });
+});
+
+test('a hung ffmpeg is killed, its cut slot released, and shutdown cleans up', async () => {
+  // A wedged child used to hold one of the six takeCutSlot() permits (and its
+  // temp dir) forever: six of them stopped every stream on the host. The
+  // deadline and the process-group kill are module-level settings, so this runs
+  // in its own process, like the migration tests.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sonora-queue-hang-'));
+  const pidFile = path.join(dir, 'pids');
+  const strayDir = path.join(os.tmpdir(), `sonora-queue-stray-${process.pid}-${Date.now()}`);
+  const code = `
+    import fs from 'node:fs';
+    const qs = await import('./src/queue-stream.js');
+    const tracks = [{ videoId: 'aaaaaaaaaaa', durationMs: 30000 }];
+    const t0 = Date.now();
+    const first = await qs.openQueueStream(tracks, 0, 1);
+    const elapsed = Date.now() - t0;
+    // A second session must still get cut permits: none may stay wedged.
+    const t1 = Date.now();
+    const second = await qs.openQueueStream(tracks, 0, 2);
+    const elapsed2 = Date.now() - t1;
+    const pids = fs.readFileSync(process.env.SONORA_TEST_PIDFILE, 'utf8').trim().split('\\n').filter(Boolean).map(Number);
+    const reaped = (pid) => {
+      try { process.kill(pid, 0); } catch { return true; }
+      // A zombie still answers kill(0) until Node reaps it; it is dead either way.
+      try { return /^\\d+ \\(.*\\) Z/.test(fs.readFileSync('/proc/' + pid + '/stat', 'utf8')); } catch { return true; }
+    };
+    const alive = pids.filter((pid) => !reaped(pid));
+    const before = [first.dir, second.dir].every((d) => fs.existsSync(d));
+    fs.mkdirSync(process.env.SONORA_TEST_STRAY, { recursive: true });
+    await qs.closeQueueStreams();
+    const after = [first.dir, second.dir].map((d) => fs.existsSync(d));
+    console.log('@@' + JSON.stringify({
+      elapsed, elapsed2, pids: pids.length, alive, before, after,
+      stray: fs.existsSync(process.env.SONORA_TEST_STRAY),
+    }));
+  `;
+  const res = spawnSync(process.execPath, ['--no-warnings', '-e', code], {
+    cwd: new URL('..', import.meta.url).pathname,
+    env: {
+      ...process.env,
+      SONORA_DB: path.join(dir, 'queue.db'),
+      SONORA_SECRET: 'queue-hang-test',
+      SONORA_QUEUE_CHILD_TIMEOUT_MS: '250',
+      FFMPEG_BIN: hangFfmpeg,
+      SONORA_TEST_PIDFILE: pidFile,
+      SONORA_TEST_STRAY: strayDir,
+    },
+    encoding: 'utf8',
+  });
+  assert.equal(res.status, 0, `child failed:\n${res.stdout}\n${res.stderr}`);
+  const line = res.stdout.split('\n').find((l) => l.startsWith('@@'));
+  assert.ok(line, `no @@ marker:\n${res.stdout}`);
+  const got = JSON.parse(line.slice(2));
+  assert.ok(got.pids > 0, 'the hung children really were spawned');
+  assert.deepEqual(got.alive, [], 'every hung child was killed by the deadline');
+  assert.ok(got.elapsed < 10_000, `a hung cut must not wedge the open for ${got.elapsed} ms`);
+  assert.ok(got.elapsed2 < 10_000, `the permits were not released: second open took ${got.elapsed2} ms`);
+  assert.equal(got.before, true);
+  assert.deepEqual(got.after, [false, false], 'closeQueueStreams removed the session temp dirs');
+  assert.equal(got.stray, false, 'and swept a leftover sonora-queue-* directory');
+  assert.equal(fs.existsSync(strayDir), false);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('a re-planning client cannot evict a live stream, only its own stale plans', async () => {
+  // The plan map used to evict the globally oldest token, so a client that
+  // re-planned in a loop could delete another listener's plan — including the
+  // one its own playing stream was opened from.
+  const planToken = async () => (await (await plan(['qqq00000001', 'qqq00000002'])).json()).token;
+  const status = async (token) => (await fetch(`${server.base}/api/queue-stream/${token}/live.m3u8?at=0`, { headers: { cookie } })).status;
+  const live = await planToken();
+  assert.equal(await status(live), 200, 'the first plan opens');
+  const stale = [];
+  for (let i = 0; i < 5; i++) stale.push(await planToken());
+  // Creating one more plan runs the ceiling: the live plan must be skipped and
+  // the oldest stale one evicted instead.
+  const newest = await planToken();
+  assert.equal(await status(live), 200, 'a live session’s plan survives re-planning elsewhere');
+  assert.equal(await status(newest), 200, 'the newest plan is usable');
+  const gone = await status(stale[0]);
+  assert.equal(gone, 404, 'the oldest stale plan of the same account was reclaimed');
+  for (const token of [live, newest]) {
+    await fetch(`${server.base}/api/queue-stream/${token}/live.m3u8`, { method: 'DELETE', headers: { cookie } });
+  }
 });

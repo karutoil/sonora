@@ -299,6 +299,9 @@ function rotateFrom(list, cursor) {
  * search results is still something this person wants to hear).
  */
 export function rankSeeds({ plays = [], likes = [], disliked = new Set(), dislikedSongs = new Set() } = {}, { limit = SEED_LIMIT } = {}) {
+  // A page that asked for no seeds needs none. Without this a caller asking for
+  // zero still paid for the full ranking and got its best seed back.
+  if (!(Number(limit) > 0)) return [];
   const byId = new Map();
   const base = (videoId) => ({
     videoId, title: null, channel: null, channelId: null, thumb: null, durationS: null,
@@ -506,6 +509,23 @@ export function buildStation({
   const seenVideo = new Set();
   const seenSong = new Set();
   const out = [];
+  // `exclude` is what the listener has already been handed. It may hold ids, or
+  // whole rows (a caller that still has them), so the same *song* under another
+  // upload is refused too: an extension that re-offers "Blinding Lights" from the
+  // lyric channel after the official video was delivered is the same repeat as
+  // handing back the identical id.
+  const excludedIds = new Set();
+  const excludedSongs = new Set();
+  for (const item of exclude ?? []) {
+    if (typeof item === 'string' || typeof item === 'number') {
+      excludedIds.add(String(item));
+      continue;
+    }
+    if (!item || typeof item !== 'object') continue;
+    if (item.videoId) excludedIds.add(String(item.videoId));
+    const key = songKey(item);
+    if (key) excludedSongs.add(key);
+  }
   const perArtist = new Map();
   // Recommendations only, and only ever consulted for a seed's artist: this is
   // what makes MAX_PER_SEED_ARTIST mean "one more from that band" instead of
@@ -565,7 +585,7 @@ export function buildStation({
     // `exclude` is what the listener has already been handed: their queue, and
     // everything an earlier page of the station returned. Without it an
     // extension would re-offer the same recommendations forever.
-    if (exclude.has(track.videoId)) return false;
+    if (excludedIds.has(track.videoId)) return false;
     if (seenVideo.has(track.videoId)) return false;
     if (isCompilation(track)) return false;
     // A 15-second teaser is not a station track, and a known over-long upload is
@@ -574,6 +594,7 @@ export function buildStation({
     if (!isSongDuration(track)) return false;
     const key = songKey(track);
     if (key && dislikedSongs.has(key)) return false;
+    if (key && excludedSongs.has(key)) return false;
     if (key && seenSong.has(key)) return false;
     // One name cannot own the station, and the seed's own artist is capped
     // hardest: it gets MAX_PER_SEED_ARTIST *recommendations* where anyone else
@@ -644,12 +665,22 @@ export function buildStation({
   // page instead of stacking them at the front.
   if (seedPool.tracks.length && out.length < limit) fill('seed');
 
+  // The fallback order. Lanes the plan gave weight to keep their interleaved
+  // order, and a lane this page has a pool for but the plan weighted 0 (a
+  // `plan` handed in by a caller, or a weight that rounded away) is appended
+  // rather than dropped: a 0-weight lane still beats a short page. Appending,
+  // not re-sorting, is what keeps an ordinary page's delivery order unchanged.
+  const lanePriority = [...new Set([
+    ...laneOrder,
+    ...pools.map((p) => p.lane).filter((lane) => !laneOrder.includes(lane)),
+  ])];
+
   for (const wanted of laneOrder) {
     if (out.length >= limit) break;
-    // Wanted lane first, then every other lane in the same interleaved order:
-    // a lane that ran dry hands its turn on rather than leaving a hole, so a
-    // page is never short while a pool has something usable.
-    for (const lane of [...new Set([wanted, ...laneOrder])]) {
+    // Wanted lane first, then every other lane a pool exists for: a lane that ran
+    // dry hands its turn on rather than leaving a hole, so a page is never short
+    // while a pool has something usable.
+    for (const lane of [...new Set([wanted, ...lanePriority])]) {
       if (fill(lane)) break;
     }
   }

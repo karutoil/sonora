@@ -86,6 +86,9 @@ before(async () => {
       SONORA_LOGIN_RATE_MAX: '1000',
       // A small cap makes the "room is full" rule testable without 50 accounts.
       SONORA_ROOM_MAX_MEMBERS: '2',
+      // This suite opens dozens of rooms as the same host; the per-host cap has
+      // its own test below, with a lower number than the suite's own usage.
+      SONORA_ROOM_MAX_PER_HOST: '50',
       SONORA_LOG_LEVEL: 'warn', SONORA_POT_PROVIDER: '', SONORA_JS_RUNTIME: '',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -1324,4 +1327,175 @@ test('going private evicts the guests with a single roster broadcast', async () 
     }
     assert.ok(g.buf.includes('"removed":true'), 'each guest is told they were removed');
   }
+});
+
+// ── handing the room over ──────────────────────────────────────────────
+// A `control: 'host'` room used to be unskippable, unpausable and unendable for
+// everyone but the host, and the seat could not move: a host who walked away
+// stranded the room until housekeeping deleted it. Only the host may give the
+// seat away, and only to someone who is actually in the room.
+
+test('the host seat moves only on the host’s word, and only to a member', async () => {
+  const { body: room } = await create(ana, { control: 'host' });
+  await req(`/api/rooms/${room.code}/join`, { jar: ben, method: 'POST' });
+  assert.equal(room.host.name, 'ana');
+  assert.ok(Number.isInteger(room.host.id), 'a member snapshot still carries the host id');
+
+  const noRoom = await req('/api/rooms/zzzzzzzzzz/host', {
+    jar: ana, method: 'PATCH', body: { userId: 1 },
+  });
+  assert.equal(noRoom.status, 404);
+  assert.equal(noRoom.body.code, 'NO_ROOM');
+
+  const noTarget = await req(`/api/rooms/${room.code}/host`, { jar: ana, method: 'PATCH', body: {} });
+  assert.equal(noTarget.status, 400);
+  assert.equal(noTarget.body.code, 'BAD_USER');
+  const fractional = await req(`/api/rooms/${room.code}/host`, {
+    jar: ana, method: 'PATCH', body: { userId: 1.5 },
+  });
+  assert.equal(fractional.status, 400, 'a fractional id is not a person');
+  assert.equal(fractional.body.code, 'BAD_USER');
+
+  const byMember = await req(`/api/rooms/${room.code}/host`, {
+    jar: ben, method: 'PATCH', body: { userId: room.host.id },
+  });
+  assert.equal(byMember.status, 403);
+  assert.equal(byMember.body.code, 'HOST_ONLY', 'a member cannot seize the room');
+
+  const benView = await req(`/api/rooms/${room.code}`, { jar: ben });
+  const benId = benView.body.members.find((m) => m.name === 'ben')?.id;
+  assert.ok(Number.isInteger(benId), 'ben is in the roster');
+
+  const self = await req(`/api/rooms/${room.code}/host`, {
+    jar: ana, method: 'PATCH', body: { userId: room.host.id },
+  });
+  assert.equal(self.status, 409);
+  assert.equal(self.body.code, 'ALREADY_HOST');
+
+  // An account that is not in the room cannot take it over: the room would end
+  // up with a host who cannot see it.
+  const outsider = await req(`/api/rooms/${room.code}/host`, {
+    jar: ana, method: 'PATCH', body: { userId: 999_999 },
+  });
+  assert.equal(outsider.status, 400);
+  assert.equal(outsider.body.code, 'NOT_MEMBER');
+  assert.equal(outsider.body.state, undefined, 'not a stale-state answer: the room did not move');
+
+  const handed = await req(`/api/rooms/${room.code}/host`, {
+    jar: ana, method: 'PATCH', body: { userId: benId },
+  });
+  assert.equal(handed.status, 200, JSON.stringify(handed.body));
+  assert.equal(handed.body.host.name, 'ben');
+  assert.equal(handed.body.host.id, benId);
+  const roster = handed.body.members;
+  assert.equal(roster.find((m) => m.id === benId)?.role, 'host', 'the new host is drawn as host');
+  assert.equal(roster.find((m) => m.id === room.host.id)?.role, 'member',
+    'the old host keeps their seat, without it');
+
+  // The seat really moved: under host-only control the old host is refused and
+  // the new one is obeyed.
+  const oldHost = await req(`/api/rooms/${room.code}/command`, {
+    jar: ana, method: 'POST', body: { type: 'pause' },
+  });
+  assert.equal(oldHost.status, 403);
+  assert.equal(oldHost.body.code, 'HOST_ONLY');
+  const newHost = await req(`/api/rooms/${room.code}/command`, {
+    jar: ben, method: 'POST', body: { type: 'pause' },
+  });
+  assert.equal(newHost.status, 200, JSON.stringify(newHost.body));
+});
+
+test('a guest snapshot names the host but never their account id', async () => {
+  const { body: room } = await create(ana, { visibility: 'public' });
+  assert.ok(Number.isInteger(room.host.id), 'members see the id they need for room policy');
+
+  const { jar, status, body } = await guestJoin(room.code);
+  assert.equal(status, 200);
+  assert.equal(body.host.name, 'ana');
+  assert.equal('id' in body.host, false, 'an account id is not a public-room resource');
+
+  const state = await req(`/api/public/rooms/${room.code}/state`, { jar });
+  assert.equal(state.status, 200);
+  assert.deepEqual(state.body.host, { name: 'ana' });
+  const viewed = await req(`/api/public/rooms/${room.code}`, { jar });
+  assert.equal(viewed.status, 200);
+  assert.deepEqual(viewed.body.host, { name: 'ana' });
+});
+
+test('a stranger’s snapshot poll does not keep a room alive', async () => {
+  const { body: room } = await create(ana, { visibility: 'public', playing: false, positionMs: 0 });
+  const baseline = (await req(`/api/rooms/${room.code}`, { jar: ana })).body.updatedAt;
+
+  await new Promise((r) => setTimeout(r, 20));
+  const stranger = await req(`/api/rooms/${room.code}/state`, { jar: carl });
+  assert.equal(stranger.status, 200, 'a signed-in non-member may read a public room');
+  assert.equal(stranger.body.joined, false);
+  const afterStranger = (await req(`/api/rooms/${room.code}`, { jar: ana })).body.updatedAt;
+  assert.equal(afterStranger, baseline, 'a non-member poll must not refresh presence');
+
+  await new Promise((r) => setTimeout(r, 20));
+  const member = await req(`/api/rooms/${room.code}/state`, { jar: ana });
+  assert.equal(member.body.joined, true);
+  const afterMember = (await req(`/api/rooms/${room.code}`, { jar: ana })).body.updatedAt;
+  assert.ok(afterMember > baseline, 'a member poll is presence');
+});
+
+test('malformed room ids are refused and numeric durations still count', async () => {
+  const { body: room } = await create(ana);
+  const badInvite = await req(`/api/rooms/${room.code}/invite/not-a-number`, {
+    jar: ana, method: 'DELETE',
+  });
+  assert.equal(badInvite.status, 400, JSON.stringify(badInvite.body));
+  const zeroInvite = await req(`/api/rooms/${room.code}/invite/0`, { jar: ana, method: 'DELETE' });
+  assert.equal(zeroInvite.status, 400);
+  const realInvite = await req(`/api/rooms/${room.code}/invite/${room.host.id}`, {
+    jar: ana, method: 'DELETE',
+  });
+  assert.equal(realInvite.status, 200, 'a well-formed id still round-trips');
+
+  // A client that echoes a parsed row sends `"durationS": "214"`. Dropping that
+  // made a known-length track look unmeasurable, so the room ended it at the
+  // 15-minute ceiling instead of at its real end.
+  const numeric = await create(ana, {
+    queue: [{ videoId: 'dQw4w9WgXcQ', title: 'Room One', channel: 'Room Test', durationS: '214' }],
+    positionMs: 0,
+    playing: true,
+  });
+  assert.equal(numeric.status, 200);
+  assert.equal(numeric.body.track.durationS, 214);
+});
+
+test('one account cannot open unbounded rooms', async () => {
+  // The cap under test is the suite's own SONORA_ROOM_MAX_PER_HOST (50): the
+  // other tests open dozens of rooms as ana, so the limit is exercised with a
+  // fresh account instead of a second server.
+  const created = await req('/api/admin/users', {
+    jar: admin, method: 'POST',
+    body: { name: 'dana', passphrase: 'dana-passphrase', role: 'user' },
+  });
+  assert.ok(created.status < 300, JSON.stringify(created.body));
+  const dana = await login('dana', 'dana-passphrase');
+
+  const cap = 50;
+  let last = null;
+  for (let i = 0; i < cap; i += 1) {
+    last = await create(dana);
+    assert.equal(last.status, 200, `room ${i + 1}: ${JSON.stringify(last.body)}`);
+  }
+  const refused = await create(dana);
+  assert.equal(refused.status, 429, JSON.stringify(refused.body));
+  assert.equal(refused.body.code, 'TOO_MANY_ROOMS');
+  assert.match(refused.body.error, /already hosting 50 rooms/);
+
+  // Rooms the account merely joined are not rooms it hosts.
+  const hosted = await req('/api/rooms', { jar: dana });
+  assert.ok(hosted.body.rooms.length > 0);
+  assert.ok(hosted.body.rooms.every((r) => r.hostName === 'dana'),
+    'the listing shows only rooms dana hosts, which is what the cap counts');
+
+  // Ending one frees exactly one slot.
+  const ended = await req(`/api/rooms/${last.body.code}`, { jar: dana, method: 'DELETE' });
+  assert.equal(ended.status, 200);
+  assert.equal((await create(dana)).status, 200, 'ending a room frees a slot');
+  assert.equal((await create(dana)).status, 429);
 });

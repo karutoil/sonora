@@ -13,7 +13,7 @@ import assert from 'node:assert/strict';
 import {
   normalizeTitle, parseVideoTitle, isCompilation, isOfficialChannel,
   parsePlaylistStats, rankTracks, rankPlaylists, MAX_SONG_SECONDS, songKey,
-  cardMetadata, isSongDuration, trackVersion,
+  cardMetadata, isSongDuration, trackVersion, toCount,
 } from '../src/search-rank.js';
 // The station reuses these keys to cap one artist, so the non-Latin fixture is
 // checked from both sides: the search page and the queue it feeds.
@@ -493,4 +493,48 @@ test('the explicit badge on a catalogue row wins over a clean title', () => {
   assert.equal(out.length, 1);
   assert.equal(out[0].videoId, 'verBadgeWins');
   assert.equal(out[0].version, 'explicit');
+});
+
+// ── missing rows, non-finite counts, caller-owned objects ────────────────
+// These are the three "the parser handed us something odd" cases that used to
+// throw or silently corrupt a page: a null row, a NaN metric and a row the
+// caller still owns.
+
+test('a missing row is unknown metadata, not a crash', () => {
+  assert.equal(isSongDuration(null), true);
+  assert.equal(isSongDuration(undefined), true);
+  assert.equal(isSongDuration(), true);
+  assert.equal(isCompilation(null), false);
+  assert.equal(isCompilation(undefined), false);
+  assert.equal(isCompilation(), false);
+  // And a real short row keeps its verdict.
+  assert.equal(isSongDuration({ durationS: 5 }), false);
+});
+
+test('non-finite metrics count as zero instead of poisoning a sort', () => {
+  assert.equal(toCount(NaN), 0);
+  assert.equal(toCount(Infinity), 0);
+  assert.equal(toCount(-Infinity), 0);
+  assert.equal(toCount(1e400), 0);
+  assert.equal(toCount(0), 0, 'a real zero stays zero');
+  assert.equal(toCount(1250), 1250);
+  assert.equal(toCount('1.2M views'), 1_200_000);
+  assert.equal(toCount('junk'), 0);
+});
+
+test('ranking never writes a version marker onto the caller’s row', () => {
+  const clean = { videoId: 'ownedClean01', title: 'Creep (Clean)', artist: 'Radiohead', itemType: 'video' };
+  const out = rankTracks([clean], { query: 'creep' });
+  assert.equal(out.length, 1);
+  assert.equal('version' in clean, false, 'the caller’s object must not gain a version');
+  assert.equal(out[0].version, 'clean', 'the returned copy still carries its version');
+  assert.notEqual(out[0], clean, 'and it is a copy when there is something to add');
+  // A row that already has its version is returned as it is.
+  const stamped = { videoId: 'ownedKnown01', title: 'Creep (Clean)', artist: 'Radiohead', version: 'clean' };
+  assert.equal(rankTracks([stamped], { query: 'creep' })[0], stamped);
+  // The all-filtered fallback path must not mutate either.
+  const tease = { videoId: 'ownedTeaser1', title: 'Snip (Clean)', artist: 'Someone', durationS: 5 };
+  const fallback = rankTracks([tease], { query: 'snip' });
+  assert.equal(fallback.length, 1);
+  assert.equal('version' in tease, false);
 });

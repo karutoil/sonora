@@ -120,8 +120,21 @@ export function proxiedThumb(raw) {
 }
 
 // Artists already warned about an empty catalogue, so a sweep every twenty
-// minutes logs once per artist instead of on every pass.
+// minutes logs once per artist instead of on every pass. Entries are dropped as
+// soon as the artist is readable or has no followers left, so this stays a cache
+// of current trouble rather than a list of every channel that ever misparsed.
 const warnedEmptyCatalogue = new Set();
+
+/**
+ * Forget the empty-catalogue warning for one artist.
+ *
+ * Called when an artist is unfollowed: the entry exists to keep a log line from
+ * repeating, and an artist nobody follows is never checked again, so keeping it
+ * would leak one string per abandoned follow for the life of the process.
+ */
+export function forgetEmptyCatalogueWarning(artistId) {
+  if (artistId) warnedEmptyCatalogue.delete(String(artistId));
+}
 
 /**
  * Check one artist and atomically record its releases and their notifications.
@@ -173,7 +186,11 @@ export async function checkArtist(artistId, {
     // the backoff ladder keeps it off the front of the queue). The cost of a
     // re-check is a fetch; the cost of the other mistake is the user's trust.
     if (!initialized && releases.length === 0) {
-      if (!warnedEmptyCatalogue.has(artistId)) {
+      if (!followers.length) {
+        // Nobody is waiting for this artist, so there is no reason to remember
+        // that it misparsed: the entry would outlive the follow itself.
+        warnedEmptyCatalogue.delete(artistId);
+      } else if (!warnedEmptyCatalogue.has(artistId)) {
         warnedEmptyCatalogue.add(artistId);
         console.warn(`[sonora] no readable release shelf for ${artistId}; leaving it uninitialized so the next check looks again`);
       }

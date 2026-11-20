@@ -801,3 +801,52 @@ test('prunes coalesce duplicates and one trailing stricter pass', { timeout: 5_0
     fsp.readdir = originalReadDir;
   }
 });
+
+test('a salvaged cancelled download still enforces the cache budget', { timeout: 5_000 }, async () => {
+  // A cancelled download that already produced a complete file is kept (see the
+  // salvage test above), but every other path that leaves bytes in the cache
+  // prunes on the way out. This one used to throw before reaching the prune, so
+  // an aborted-but-complete download was the one write that never counted
+  // against the documented ceiling.
+  const victim = path.join(audioDir, 'salvage-victim.m4a');
+  fs.writeFileSync(victim, Buffer.alloc(1_500_000)); // the ceiling here is 1 MiB
+  backdate(victim, 20 * 60_000); // past the 10-minute eviction grace
+  const id = 'ssssssssss1';
+  const file = audio.audioPath(id);
+  process.env.SONORA_TEST_HANG_AFTER_WRITE = '1';
+  const controller = new AbortController();
+  try {
+    const pending = audio.ensureAudio(id, { signal: controller.signal });
+    const rejection = rejectsAborted(pending);
+    await waitFor(() => fs.existsSync(file), 'fake final-file rename');
+    controller.abort();
+    await rejection;
+  } finally {
+    delete process.env.SONORA_TEST_HANG_AFTER_WRITE;
+    controller.abort();
+  }
+  // The joined waiter is rejected as soon as the signal aborts; the salvage
+  // cleanup (and its prune) continues behind it, so wait for that work. Before
+  // the fix this path threw first and the ceiling was never enforced, so the
+  // victim survived until some later download pruned.
+  await waitFor(() => !fs.existsSync(victim), 'post-abort cache prune');
+  assert.ok(fs.existsSync(file), 'the salvaged file itself is inside the grace window');
+  fs.rmSync(file, { force: true });
+});
+
+test('a cache hit refreshes its LRU touch at most once a minute', async () => {
+  // Every range request goes through cachedAudio(), so an utimes() per hit is a
+  // metadata write per 1 MiB chunk of every track. The identity cache already
+  // stays valid across the skip, which is what makes the skip safe.
+  const id = 'tttttttttt1';
+  const meta = await audio.ensureAudio(id);
+  const file = meta.file;
+  backdate(file, 120_000); // invalidate the identity so the next hit revalidates
+  assert.equal((await audio.cachedAudio(id)).size, 8192);
+  const touched = fs.statSync(file).mtimeMs;
+  assert.ok(Date.now() - touched < 5_000, 'the first hit performed the LRU touch');
+  await delay(30);
+  assert.equal((await audio.cachedAudio(id)).size, 8192);
+  assert.equal(fs.statSync(file).mtimeMs, touched, 'a second hit inside the window must not write mtime');
+  fs.rmSync(file, { force: true });
+});

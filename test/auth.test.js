@@ -843,18 +843,22 @@ test('a Secure cookie is decided per request, so LAN sign-in over plain HTTP wor
   }
 });
 
-test('a blank account name with a passphrase refuses to boot', async () => {
-  // An empty name cannot be typed, so the instance would come up with an
-  // unreachable admin account and no error anywhere.
+test('a blank account name falls back to the default admin and says so', async () => {
+  // An empty account name cannot be typed into the sign-in form, so a blank
+  // SONORA_USER (`SONORA_USER=` in a .env, or a line of spaces) keeps the
+  // documented default. The alternative — creating an unreachable admin, or
+  // refusing to boot over an accidental space — was the original hazard; the
+  // contract now is "the app comes up and the default name is signable".
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sonora-blankuser-'));
   const port = await freePort();
+  const base = `http://127.0.0.1:${port}`;
   const child = spawn(process.execPath, ['--no-warnings', 'src/server.js'], {
     cwd: new URL('..', import.meta.url).pathname,
     env: {
       ...process.env,
       PORT: String(port), HOST: '127.0.0.1',
       SONORA_DB: path.join(dir, 'blank.db'), SONORA_AUDIO_DIR: path.join(dir, 'audio'),
-      SONORA_SECRET: 'blank-user-secret', SONORA_USER: '', SONORA_PASSPHRASE: 'hunter2hunter2',
+      SONORA_SECRET: 'blank-user-secret', SONORA_USER: '   ', SONORA_PASSPHRASE: 'hunter2hunter2',
       SONORA_LOG_LEVEL: 'warn', SONORA_POT_PROVIDER: '', SONORA_JS_RUNTIME: '',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -863,15 +867,147 @@ test('a blank account name with a passphrase refuses to boot', async () => {
   child.stdout.on('data', (d) => logs.push(String(d)));
   child.stderr.on('data', (d) => logs.push(String(d)));
   try {
-    const code = await new Promise((resolve) => {
-      child.on('exit', (exitCode) => resolve(exitCode));
-      setTimeout(() => { child.kill('SIGKILL'); resolve('timeout'); }, 15_000);
+    let up = false;
+    for (let i = 0; i < 160 && child.exitCode === null; i++) {
+      try {
+        const r = await fetch(`${base}/api/health`);
+        const health = r.ok ? await r.json() : null;
+        if (health?.pid === child.pid) { up = true; break; }
+      } catch {}
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    assert.ok(up, `the server must come up with a signable default name:\n${logs.join('')}`);
+    assert.match(logs.join(''), /SONORA_USER is blank/,
+      'a deliberately blank name is reported instead of silently ignored');
+    const signedIn = await fetch(`${base}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'admin', passphrase: 'hunter2hunter2' }),
     });
-    assert.notEqual(code, 'timeout', 'the server must exit instead of serving an unreachable account');
-    assert.notEqual(code, 0, 'a blank bootstrap account is a fatal misconfiguration');
-    assert.match(logs.join(''), /SONORA_USER/);
+    assert.equal(signedIn.status, 200, 'the default name is the account that was created');
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
     try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
+  }
+});
+
+test('SONORA_ORIGIN is an accepted request origin and nothing else is', async () => {
+  // A TLS-terminating proxy makes the process see http://127.0.0.1 while the
+  // browser sends https://music.example.com. Every mutation then looked
+  // cross-site and answered 403, so the deployment could read but not act.
+  const fixture = await bootFixture({ SONORA_ORIGIN: 'https://music.example.com' });
+  try {
+    const jar = new Jar();
+    const signedIn = await fixtureReq(fixture, '/api/auth/login', {
+      jar, method: 'POST',
+      body: { name: 'admin', passphrase: 'hunter2hunter2', deviceId: 'csrf-origin' },
+    });
+    assert.equal(signedIn.status, 200);
+
+    const read = () => fixtureReq(fixture, '/api/notifications/read', {
+      jar, method: 'POST', body: {},
+    });
+
+    assert.equal((await read()).status, 200, 'no Origin header stays supported for non-browser clients');
+    const sameOrigin = await fixtureReq(fixture, '/api/notifications/read', {
+      jar, method: 'POST', body: {}, headers: { origin: fixture.base },
+    });
+    assert.equal(sameOrigin.status, 200, 'the request’s own origin is still accepted');
+    const configured = await fixtureReq(fixture, '/api/notifications/read', {
+      jar, method: 'POST', body: {}, headers: { origin: 'https://music.example.com' },
+    });
+    assert.equal(configured.status, 200, 'SONORA_ORIGIN is this deployment’s own origin');
+
+    for (const origin of ['https://evil.example', 'https://music.example.com.evil.example',
+      'http://music.example.com', 'null']) {
+      const refused = await fixtureReq(fixture, '/api/notifications/read', {
+        jar, method: 'POST', body: {}, headers: { origin },
+      });
+      assert.equal(refused.status, 403, `${origin} must not be treated as this origin`);
+    }
+    // Fetch Metadata still refuses a sibling-site frame outright.
+    const crossSite = await fixtureReq(fixture, '/api/notifications/read', {
+      jar, method: 'POST', body: {}, headers: { 'sec-fetch-site': 'cross-site' },
+    });
+    assert.equal(crossSite.status, 403);
+  } finally {
+    fixture.stop();
+  }
+});
+
+test('a passkey can be renamed by its owner and by nobody else', async () => {
+  const jar = new Jar();
+  await login(jar, { remember: false, deviceId: 'passkey-rename' });
+  const me = await req('/api/me', { jar });
+  const adminId = me.body.user.id;
+
+  // Registration needs a real authenticator, so the row is written directly;
+  // the route under test is the rename, not the ceremony.
+  const created = await req('/api/admin/users', {
+    jar, method: 'POST',
+    body: { name: 'passkey-other', passphrase: 'other-passphrase', role: 'user' },
+  });
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const otherId = created.body.user.id;
+  const database = new DatabaseSync(DB);
+  const now = new Date().toISOString();
+  try {
+    const insert = database.prepare(`
+      INSERT INTO passkeys (user_id, credential_id, public_key, counter, name, created_at)
+      VALUES (?, ?, 'public-key', 0, ?, ?)
+    `);
+    insert.run(adminId, 'rename-cred-admin', 'Laptop', now);
+    insert.run(otherId, 'rename-cred-other', 'Phone', now);
+  } finally {
+    database.close();
+  }
+
+  const anonymous = await req('/api/auth/passkeys/1', { method: 'PATCH', body: { name: 'x' } });
+  assert.equal(anonymous.status, 401);
+
+  const blank = await req('/api/auth/passkeys/1', { jar, method: 'PATCH', body: { name: '   ' } });
+  assert.equal(blank.status, 400);
+  assert.match(blank.body.error, /name/i);
+
+  const missing = await req('/api/auth/passkeys/999999', { jar, method: 'PATCH', body: { name: 'Gone' } });
+  assert.equal(missing.status, 404);
+
+  const list = await req('/api/auth/passkeys', { jar });
+  const mine = list.body.passkeys.find((p) => p.credentialId === 'rename-cred-admin');
+  const theirs = list.body.passkeys.find((p) => p.credentialId === 'rename-cred-other');
+  assert.ok(mine, 'the owner sees their passkey');
+  assert.equal(theirs, undefined, 'and not someone else’s');
+
+  const foreign = await req(`/api/auth/passkeys/${otherId}`, {
+    jar, method: 'PATCH', body: { name: 'Seized' },
+  });
+  assert.equal(foreign.status, 404, 'an unrelated id is just not found');
+  const otherRow = new DatabaseSync(DB, { readOnly: true });
+  let otherPasskeyId;
+  try {
+    otherPasskeyId = otherRow.prepare("SELECT id FROM passkeys WHERE credential_id = 'rename-cred-other'").get().id;
+  } finally {
+    otherRow.close();
+  }
+  // The real target is another account's passkey row: renaming it must fail and
+  // must leave it alone.
+  const stolen = await req(`/api/auth/passkeys/${otherPasskeyId}`, {
+    jar, method: 'PATCH', body: { name: 'Seized' },
+  });
+  assert.equal(stolen.status, 404, 'another account’s passkey is not found either');
+
+  const renamed = await req(`/api/auth/passkeys/${mine.id}`, {
+    jar, method: 'PATCH', body: { name: '  Studio laptop  ' },
+  });
+  assert.equal(renamed.status, 200, JSON.stringify(renamed.body));
+  assert.equal(renamed.body.passkeys.find((p) => p.id === mine.id).name, 'Studio laptop',
+    'the name is trimmed and stored');
+  assert.equal(renamed.body.passkeys.some((p) => p.id === otherPasskeyId), false);
+  const check = new DatabaseSync(DB, { readOnly: true });
+  try {
+    assert.equal(check.prepare("SELECT name FROM passkeys WHERE credential_id = 'rename-cred-other'").get().name,
+      'Phone', 'the other account’s passkey was not touched');
+  } finally {
+    check.close();
   }
 });

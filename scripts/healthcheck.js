@@ -14,8 +14,7 @@
 // tunnel or the bind mount while the cause is sitting in the response body, so
 // whatever /api/health said about the failing check goes into the log line that
 // `podman logs` / `docker compose logs` shows.
-const port = process.env.PORT || 8130;
-const url = `http://127.0.0.1:${port}/api/health`;
+import { pathToFileURL } from 'node:url';
 
 function fail(reason) {
   console.error(`health: ${reason}`);
@@ -43,7 +42,7 @@ const REASONS = {
  * verbatim instead of being swallowed, because a health failure with no
  * explanation is the problem this file exists to fix.
  */
-function explain(body) {
+export function explain(body) {
   if (!body || typeof body !== 'object') return '';
 
   const summary = [];
@@ -92,25 +91,39 @@ function explain(body) {
   return parts.length ? parts.join('; ') : JSON.stringify(body);
 }
 
-try {
-  const res = await fetch(url, { signal: AbortSignal.timeout(4000) });
-  // Read the body on a non-200 too: an unhealthy instance may answer 503 with its
-  // verdict attached, and "health: HTTP 503" alone is the message this file
-  // exists to avoid.
-  let body = null;
-  let parsed = false;
+export async function main() {
+  // Read PORT at call time, not import time: importing explain() for a unit test
+  // must not depend on (or capture) the ambient environment.
+  const port = process.env.PORT || 8130;
+  const url = `http://127.0.0.1:${port}/api/health`;
+
   try {
-    body = await res.json();
-    parsed = true;
-  } catch {}
-  // "Not JSON at all" is its own answer: it means something else is listening on
-  // PORT (a stale container, another dev server), not that sonora is unhealthy.
-  const why = explain(body) || (parsed ? '' : 'the response was not JSON');
-  if (!res.ok) fail(`HTTP ${res.status} from ${url}${why ? ` — ${why}` : ''}`);
-  if (body?.ok !== true) fail(`${url} reports this instance is not healthy${why ? ` — ${why}` : ''}`);
-  process.exit(0);
-} catch (err) {
-  // A refused connection and a timeout are different stories and the message says
-  // which: still booting (start_period covers that), wedged, or dead.
-  fail(`could not reach ${url}: ${err.message}`);
+    const res = await fetch(url, { signal: AbortSignal.timeout(4000) });
+    // Read the body on a non-200 too: an unhealthy instance may answer 503 with its
+    // verdict attached, and "health: HTTP 503" alone is the message this file
+    // exists to avoid.
+    let body = null;
+    let parsed = false;
+    try {
+      body = await res.json();
+      parsed = true;
+    } catch {}
+    // "Not JSON at all" is its own answer: it means something else is listening on
+    // PORT (a stale container, another dev server), not that sonora is unhealthy.
+    const why = explain(body) || (parsed ? '' : 'the response was not JSON');
+    if (!res.ok) fail(`HTTP ${res.status} from ${url}${why ? ` — ${why}` : ''}`);
+    if (body?.ok !== true) fail(`${url} reports this instance is not healthy${why ? ` — ${why}` : ''}`);
+    process.exit(0);
+  } catch (err) {
+    // A refused connection and a timeout are different stories and the message says
+    // which: still booting (start_period covers that), wedged, or dead.
+    fail(`could not reach ${url}: ${err.message}`);
+  }
+}
+
+// Only run when executed as a program (`node scripts/healthcheck.js`, including
+// the image's HEALTHCHECK): importing explain() for tests must not probe a port
+// or call process.exit.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  await main();
 }
